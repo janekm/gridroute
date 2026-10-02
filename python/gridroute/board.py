@@ -1239,10 +1239,14 @@ class Board:
         """Remove the tracks and vias of `nets` logged since op index `since`: clear the region they painted and
         replay the remaining operations that touch it, in their original order (so the rasters are exactly what
         they would be had the copper never been added). Returns the number of items removed."""
-        self.spec_clear()
-        self._dropped = set()
         nets = set(nets)
         gone = [k for k in range(since, len(self.ops)) if self.ops[k][3] is not None and self.ops[k][3]['net'] in nets]
+        return self._rip_ops(gone)
+
+    def _rip_ops(self, gone):
+        """Remove the logged operations with indices `gone` (tracks / vias) and repaint their region."""
+        self.spec_clear()
+        self._dropped = set()
         if not gone:
             return 0
         i0 = min(self.ops[k][2][0] for k in gone)
@@ -1265,6 +1269,161 @@ class Board:
             if w[0] <= i1 and i0 <= w[2] and w[1] <= j1 and j0 <= w[3]:
                 getattr(self, '_do_' + kind)(*args)
         return len(gone)
+
+    # ------------------------------------------------------------------ relaxation
+    @staticmethod
+    def _cost(items, via_cost):
+        """Track length (mm) plus via_cost mm per via of a list of track / via dicts."""
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for t in items if 'pts' in t for a, b in zip(t['pts'], t['pts'][1:])) + \
+            via_cost * sum(1 for v in items if 'pts' not in v)
+
+    def _net_complete(self, net):
+        pads = self.pads_of(net)
+        if len(pads) < 2:
+            return True
+        nid = self.net_id[net]
+        xs, ys = [p['x'] for p in pads], [p['y'] for p in pads]
+        w = self._win(min(xs) - 15, min(ys) - 15, max(xs) + 15, max(ys) + 15)
+        isl = self._island(nid, self._pad_seeds(pads[0], w), w)
+        return all(any(isl[s] for s in self._pad_seeds(pd, w)) for pd in pads[1:])
+
+    def relax(self, nets=None, since=0, passes=3, via_cost=1.0, turn=0.05, margin=3.0, gain=0.2, layers=None):
+        """Rip-up-and-reroute relaxation, run once the whole board is routed.
+
+        Routes found early are shaped by copper that later moved or never came, by layer direction preferences and
+        by the weighted / field-guided search; the result is detours. Here every net with copper logged since op
+        index `since` is ripped (that copper only: hand-drawn breakouts and anything before `since` stay) and
+        re-routed against the finished board with an unweighted search and no direction preferences. The new route
+        is kept if the net is complete and it is at least `gain` mm cheaper (track length plus `via_cost` mm per
+        via); otherwise the old copper goes back. Plane nets are skipped. Passes repeat, in net order, until
+        one improves nothing. Returns [(net, mm saved)]."""
+        if nets is None:
+            nets = sorted({op[3]['net'] for op in self.ops[since:] if op[3] is not None})
+        nets = [n for n in nets if n not in PLANES]
+        saved = []
+        for _ in range(passes):
+            better = 0
+            for n in nets:
+                old = [op[3] for op in self.ops[since:] if op[3] is not None and op[3]['net'] == n]
+                if not old:
+                    continue
+                before = self._cost(old, via_cost)
+                nf = len(self.failed)
+                self.rip([n], since)
+                k0 = len(self.ops)
+                ok = self.connect(n, layers=layers, via_cost=via_cost, turn=turn, margin=margin, weight=1.0)
+                new = [op[3] for op in self.ops[k0:] if op[3] is not None and op[3]['net'] == n]
+                after = self._cost(new, via_cost)
+                del self.failed[nf:]
+                if ok and after < before - gain and self._net_complete(n):
+                    saved.append((n, before - after))
+                    better += 1
+                    continue
+                self.rip([n], k0)                               # put the old copper back
+                for it in old:
+                    if 'pts' in it:
+                        self.add_track(it['net'], it['layer'], [tuple(p) for p in it['pts']], it['width'])
+                    else:
+                        self.add_via(it['net'], it['x'], it['y'], d=it['d'], drill=it['drill'])
+            if not better:
+                break
+        return saved
+
+    def pull_tight(self, since=0, nets=None, gain=0.05):
+        """Octilinear string pulling of the tracks logged since op index `since`.
+
+        Within each track polyline, a run of vertices between two of its vertices is replaced by a straight
+        octilinear link or a one-bend link (diagonal then straight, or straight then diagonal) when that link is
+        clear of other nets' copper and keep-outs at the track's width and clearance, at least `gain` mm shorter,
+        and no other copper of the net (track ends, vias, pads) attaches to the replaced run. Repeats until nothing
+        shortens. Returns the mm saved."""
+        total = 0.0
+        while True:
+            changed = False
+            for k in range(since, len(self.ops)):
+                if k >= len(self.ops):
+                    break
+                kind, args, w, t = self.ops[k]
+                if kind != 'track' or t is None or len(t['pts']) < 3 or (nets and t['net'] not in nets):
+                    continue
+                pts = self._pull(t, gain)
+                if pts is None:
+                    continue
+                old = self._cost([t], 0.0)
+                self._rip_ops([k])
+                self.add_track(t['net'], t['layer'], pts, t['width'])
+                total += old - self._cost([{'pts': pts}], 0.0)
+                changed = True
+            if not changed:
+                return total
+
+    def _anchors(self, t):
+        """Points where other copper of t's net may attach: other tracks' ends and every vertex, vias, pads."""
+        net, out = t['net'], []
+        for o in self.tracks:
+            if o['net'] == net and o is not t:
+                out += [(p[0], p[1], o['width'] / 2) for p in o['pts']]
+        out += [(v['x'], v['y'], v['d'] / 2) for v in self.vias if v['net'] == net]
+        out += [(p['x'], p['y'], max(p['w'], p['h']) / 2) for p in self.pads_of(net)]
+        return out
+
+    def _pull(self, t, gain=0.05):
+        """A shorter vertex list for track t (see pull_tight), or None."""
+        pts = [tuple(p) for p in t['pts']]
+        half = t['width'] / 2
+        anchors = self._anchors(t)
+        # which segments each anchor touches; a run may only be replaced if every anchor touching it sits at one
+        # of the run's two kept vertices (the pad or via the track starts / ends on, a branch at a kept vertex)
+        touch = [(x, y, r, {s for s, (a, b) in enumerate(zip(pts, pts[1:])) if _seg_dist(x, y, a, b) < r + half + 0.02})
+                 for x, y, r in anchors]
+        touch = [a for a in touch if a[3]]
+        L = LAYERS.index(t['layer'])
+        nid = self.net_id[t['net']]
+        reach = self._reach(t['net'], half)
+
+        def free(i, j):
+            for x, y, r, segs in touch:
+                if any(i <= s < j for s in segs) and not any(math.hypot(x - pts[k][0], y - pts[k][1]) < r + half + 0.02
+                                                              for k in (i, j)):
+                    return False
+            return True
+        for i in range(len(pts) - 2):
+            for j in range(len(pts) - 1, i + 1, -1):
+                if not free(i, j):
+                    continue
+                run = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts[i:j], pts[i + 1:j + 1]))
+                for link in self._links(pts[i], pts[j]):
+                    ln = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(link, link[1:]))
+                    if ln < run - gain and self._clear(link, L, nid, reach):
+                        return pts[:i] + link + pts[j + 1:]
+        return None
+
+    @staticmethod
+    def _links(p, q):
+        """Octilinear links from p to q: straight if p-q is at 0/45/90 degrees, else the two one-bend links."""
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        ax, ay = abs(dx), abs(dy)
+        if ax < 1e-6 or ay < 1e-6 or abs(ax - ay) < 1e-6:
+            return [[p, q]]
+        m = min(ax, ay)
+        sx, sy = math.copysign(1, dx), math.copysign(1, dy)
+        c1 = (p[0] + sx * m, p[1] + sy * m)
+        c2 = (q[0] - sx * m, q[1] - sy * m)
+        return [[p, c1, q], [p, c2, q]]
+
+    def _clear(self, link, L, nid, reach):
+        xs = [p[0] for p in link]
+        ys = [p[1] for p in link]
+        win = self._win(min(xs) - 1, min(ys) - 1, max(xs) + 1, max(ys) + 1)
+        blk = self._blocked(L, nid, win, reach)
+        for a, b in zip(link, link[1:]):
+            n = max(int(math.hypot(b[0] - a[0], b[1] - a[1]) / (G / 2)), 1)
+            for s in range(n + 1):
+                x, y = a[0] + (b[0] - a[0]) * s / n, a[1] + (b[1] - a[1]) * s / n
+                i, j = int(round(y / G)) - win[0], int(round(x / G)) - win[1]
+                if not (0 <= i < blk.shape[0] and 0 <= j < blk.shape[1]) or blk[i, j]:
+                    return False
+        return True
 
     # ------------------------------------------------------------------ replication
     def mark(self):

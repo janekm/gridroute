@@ -46,6 +46,7 @@ Geometry comes from `python3 -m gridroute.kicad footprints project.xml footprint
 - **Rip-up.** Every rasterising operation is logged. `rip(nets)` clears the region those nets painted and replays the remaining operations there in order, so the rasters are exactly as if that copper had never been added. A blocked net can rip its neighbours, route first, and let them re-route.
 - **Speculation.** Upcoming searches can run on worker threads (`speculate()`, `speculate_connect()`). A result is used only if no copper painted since touches its window, so it is always the sequential result.
 - **Cache.** Routes, plane drops, clearance checks and cleanup are memoised on disk (`~/Library/Caches/gridroute/`), keyed by the board content around them through incremental tile hashes. A re-run repeats only what an edit touched. Searches are also memoised by their inputs and stay valid while the tiles they read are unchanged.
+- **Relaxation.** Routes found early are shaped by copper that later moved, by layer direction preferences and by the weighted, field-guided search, so they take detours. `relax(since=k)` rips each net's copper logged since op index `k` and re-routes it against the finished board with an unweighted search and no direction preferences; the new route stays only if the net is complete and it is shorter (track length plus a via cost), otherwise the old copper goes back. Copper logged before `k` (hand-drawn breakouts, plane drops) is never touched. `pull_tight(since=k)` then string-pulls each track polyline: a run of vertices is replaced by a straight or one-bend 45-degree link when the link is clear and no other copper of the net attaches to the run.
 - **Checking.** `accel='verify'` runs the numpy paths and the reference A* alongside the native kernels and asserts identical results. `check()` reports raster clearance clashes; KiCad DRC remains the final word.
 
 Options default from the environment: `GRIDROUTE_SEARCH`, `GRIDROUTE_BUDGET`, `GRIDROUTE_FIELD`, `GRIDROUTE_ACCEL`, `GRIDROUTE_SPEC` and `GRIDROUTE_CACHE`. See `configure()`.
@@ -57,6 +58,7 @@ These are lessons from the board above:
 - **Place plane drops before a stage's signal routes.** Draw hand-made copper that is added unchecked (`add_track`, `add_via`) before the drops.
 - **Use local rip-up on failure.** Rip the nets around the blocked net's pads, route it first, and promote any ripped net that then fails. Re-running a whole stage in a new order should be the last resort.
 - **Print problems loudly.** Clashes, plane pads without a drop and incomplete nets should all reach the output.
+- **Relax at the end.** Mark the op index before the router stage (`k = len(bd.ops)`), route, then `bd.relax(since=k)` and `bd.pull_tight(since=k)`. Pass `layers=` to keep a class (for example power) on its layers.
 - **Stress the script by varying the search budget.** It is a cheap way to push the router into other configurations.
 
 ## Kernels (Python binding)

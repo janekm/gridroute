@@ -52,9 +52,13 @@ bd.place('U2', 30.0, 15.0, 180)
 bd.place('R1', 20.0, 6.0)
 bd.place('R2', 20.0, 24.0, 90)
 bd.fanout_all(['U1', 'U2'])                       # GND pads: a short stub and a via to the plane
+k = len(bd.ops)                                   # router copper starts here
 for net in ('SDA', 'SCL', 'EN', 'VCC'):
     ok = bd.connect(net, margin=4.0)
     print('%-4s %s' % (net, 'routed' if ok else 'FAILED'))
+saved = bd.relax(since=k)                         # re-route each net against the finished board, keep shorter
+print('relaxed: %s, pulled tight %.2f mm' % (', '.join('%s -%.2f mm' % s for s in saved) or 'nothing shorter',
+                                            bd.pull_tight(since=k)))
 print('clearance check:', bd.check() or 'clean')
 out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'demo_layout.json')
 bd.save(out, [40.0, 30.0])
