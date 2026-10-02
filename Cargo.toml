@@ -27,3 +27,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+[lints.rust]
+# the objc crate's msg_send! expands cfg(feature = "cargo-clippy")
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
