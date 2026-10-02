@@ -575,8 +575,10 @@ class Board:
         assert pa['net'] == net and pb['net'] == net, (net, a, b, pa['net'], pb['net'])
         return self._route(net, [pa], [pb], **kw)
 
-    def connect(self, net, layers=None, only=None, **kw):
-        """Route every placed pad of the net into one tree (nearest pad first). only: restrict to these refs."""
+    def connect(self, net, layers=None, only=None, strict=False, **kw):
+        """Route every placed pad of the net into one tree (nearest pad first). only: restrict to these refs.
+        A connection that fails on `layers` is retried with a wider window on every layer, or on `layers` again
+        when strict=True (e.g. a board whose bottom layer is a plane that tracks must not use)."""
         pads = [p for p in self.pads_of(net) if not only or p['ref'] in only]
         if len(pads) < 2:
             return True
@@ -598,7 +600,8 @@ class Board:
                 tree.append(p)
                 continue
             if not self._route(net, [p], tree, layers=layers, **kw):
-                if not self._route(net, [p], tree, layers=None, margin=kw.get('margin', 3.0) * 3,
+                wide = kw.get('margin', 3.0) * 3
+                if not self._route(net, [p], tree, layers=layers if strict else None, margin=wide,
                                    **{k: v for k, v in kw.items() if k != 'margin'}):
                     self.failed.append((net, p['ref'], p['num']))
                     ok = False
@@ -1311,7 +1314,8 @@ class Board:
                 nf = len(self.failed)
                 self.rip([n], since)
                 k0 = len(self.ops)
-                ok = self.connect(n, layers=layers, via_cost=via_cost, turn=turn, margin=margin, weight=1.0)
+                ok = self.connect(n, layers=layers, strict=layers is not None, via_cost=via_cost, turn=turn,
+                                  margin=margin, weight=1.0)
                 new = [op[3] for op in self.ops[k0:] if op[3] is not None and op[3]['net'] == n]
                 after = self._cost(new, via_cost)
                 del self.failed[nf:]

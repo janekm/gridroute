@@ -58,7 +58,7 @@ These are lessons from the board above:
 - **Place plane drops before a stage's signal routes.** Draw hand-made copper that is added unchecked (`add_track`, `add_via`) before the drops.
 - **Use local rip-up on failure.** Rip the nets around the blocked net's pads, route it first, and promote any ripped net that then fails. Re-running a whole stage in a new order should be the last resort.
 - **Print problems loudly.** Clashes, plane pads without a drop and incomplete nets should all reach the output.
-- **Relax at the end.** Mark the op index before the router stage (`k = len(bd.ops)`), route, then `bd.relax(since=k)` and `bd.pull_tight(since=k)`. Pass `layers=` to keep a class (for example power) on its layers.
+- **Relax at the end.** Mark the op index before the router stage (`k = len(bd.ops)`), route, then `bd.relax(since=k)` and `bd.pull_tight(since=k)`. Pass `layers=` to keep a class (for example power) on its layers. `connect(..., layers=..., strict=True)` keeps the wide-window retry of a failed connection on those layers too (by default it retries on every layer); `relax(layers=...)` is always strict, so a board whose bottom layer is a plane never gets tracks on it from either.
 - **Stress the script by varying the search budget.** It is a cheap way to push the router into other configurations.
 
 ## Kernels (Python binding)
