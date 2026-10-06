@@ -139,11 +139,56 @@ independent, deepcopy-compatible static geometry. Custom methods must operate on
 
 Hole masks use local bounding boxes, blocker tests reject distant object/segment
 boxes before exact distances, pad flood seeds are compact, and native component
-labels avoid repeated full-board floods. Native Rust/Metal kernels are unchanged.
-Numerical safety still requires the native CAD gate: a grid result alone is not a
+labels avoid repeated full-board floods. The A* kernel accepts an optional
+per-state entry cost (`gr_astar_hybrid_cost`), used by negotiated routing. Numerical safety still requires the native CAD gate: a grid result alone is not a
 continuous-geometry clearance proof.
 
 ```sh
 PYTHONPATH=python GRIDROUTE_NO_BUILD=1 python3 -m unittest discover -s tests -p 'test_*.py'
 cargo test --release
 ```
+
+## Planes, neck-down and escapes
+
+Plane nets (`configure(planes={net: layer})`) are connected by a short stub and a
+via to their plane, not routed; `unrouted()`, the controller score and the
+continuous checker treat every via or plated pad of a plane net as joined. The
+AMOLED `_planes` profile carries GND on In1 and VCC3V3 on In4, like the source
+design, and keeps signals off those layers. KiCad refills the zones on export.
+
+Neck-down rules (a CAD rule letting power tracks touching a fine-pitch courtyard
+be thinner) are `Board.add_neck(polygon, width, nets, layers)` regions. The search
+may use the thin width inside them, and a straight escape stub at the permitted
+width runs from each such pad to the nearest grid point where the class width
+fits. Nets with neck pads are routed before plane drops. Boards without neck
+regions are unaffected.
+
+Controller options (all default off unless stated):
+
+- `escape_reserve_mm`: reserve an outward corridor at every connected pin of
+  fine-pitch packages (`fine_pitch_mm`) during the first pass, as in
+  TraceMaker's escape reservations; released before recovery.
+- `negotiate`: PathFinder-style recovery. Other nets' copper becomes passable at
+  `soft_cost_mm` per cell plus a contention history; the crossed objects are
+  ripped and rerouted, and the best state is kept. Experimental: on AMOLED it
+  did not beat transactional repair yet.
+- `join_components` (on): when `connect` leaves three or more components, join them
+  to the largest instead of failing everything behind a boxed-in first pad.
+- `fix_clearances` (on): the continuous checker's clearance findings are ripped
+  and rerouted with a wider raster margin; if that fails, the offending track is
+  dropped (one open connection instead of a DRC error).
+- `polish_via_cost_mm`: post-pass that reroutes complete nets with that via
+  cost and keeps cheaper routes (`Board.relax`), within `polish_seconds`.
+- `seed`: deterministic jitter of the net order, for portfolios.
+
+The raster margin (`margin_factor`, default 0.5 x pitch) is below the worst-case
+discretisation error of painting plus dilation (about 0.71 x pitch), so rare µm
+near-misses are possible; the continuous checker finds them and `fix_clearances`
+repairs or removes them. 0.75 x pitch is exact but costs routability on dense
+boards.
+
+`portfolio.py CASE --out DIR [--variants-json ...]` runs option variants as
+parallel processes and keeps the best by the in-process check (findings, then
+deficit, then vias). Deadlines are wall-clock, so parallel load changes how far
+each variant gets. `render.py RESULT_DIR [--box x0 y0 x1 y1] [--layers ...]`
+draws per-layer copper with unrouted pads ringed in red.
