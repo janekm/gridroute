@@ -551,21 +551,34 @@ class Board:
             self._paint(self.no_via, None, win, mask, 1)
 
     def reserve(self, net, layer, a, b, r):
-        """Reserve the capsule a-b (radius r, mm) on `layer` for `net`: other nets keep their clearance from it, as
-        from copper, but it carries no connectivity (e.g. an escape corridor of a fine-pitch pin). Not copper:
-        replace_copper() keeps it; release_reservations() removes all of them."""
-        self._op('reserve', (net, LAYERS.index(layer), tuple(a), tuple(b), r), None)
+        """Reserve the capsule a-b (radius r, mm) for `net` on `layer` (a name, a list of names, or None for every
+        layer): other nets keep their clearance from it, as from copper, but it carries no connectivity (e.g. an
+        escape corridor or a planned via site of a fine-pitch pin). Not copper: replace_copper() keeps it;
+        release_reservations() removes it."""
+        Ls = list(range(NL)) if layer is None else [LAYERS.index(l) for l in ([layer] if isinstance(layer, str) else layer)]
+        self._op('reserve', (net, tuple(Ls), tuple(a), tuple(b), r), None)
 
-    def _do_reserve(self, net, L, a, b, r):
+    def _do_reserve(self, net, Ls, a, b, r):
         nid = self.net_id[net]
         win, m = self._mask_seg(a[0], a[1], b[0], b[1], r)
         i0, j0, i1, j1 = win
         self._touch(win)
-        w = self.occ[L, i0:i1 + 1, j0:j1 + 1]
-        w[m & (w == 0)] = nid      # never marks a clash: a reservation must not block anything already there
+        if self.__dict__.get('rsv') is None:
+            self.rsv = np.zeros_like(self.core)
+        for L in ([Ls] if isinstance(Ls, int) else Ls):
+            w = self.occ[L, i0:i1 + 1, j0:j1 + 1]
+            w[m & (w == 0)] = nid      # never marks a clash: a reservation must not block anything already there
+            # like true copper (core), but without connectivity: _blocked enforces surplus class clearances on it
+            v = self.rsv[L, i0:i1 + 1, j0:j1 + 1]
+            v[m & (v == 0)] = nid
 
-    def release_reservations(self):
-        return self._rip_ops([k for k, op in enumerate(self.ops) if op[0] == 'reserve'])
+    def reservations(self, nets=None):
+        """Logged reservation operations (kind, args, ...) of `nets` (all when None)."""
+        return [op for op in self.ops if op[0] == 'reserve' and (nets is None or op[1][0] in nets)]
+
+    def release_reservations(self, nets=None):
+        """Remove the reservations of `nets` (all when None); returns how many were removed."""
+        return self._rip_ops([k for k, op in enumerate(self.ops) if op[0] == 'reserve' and (nets is None or op[1][0] in nets)])
 
     def add_neck(self, points, width, nets, layers=None, inset=None):
         """Neck-down region: tracks of `nets` may use `width` (narrower than their class) on `layers` inside the
@@ -657,13 +670,18 @@ class Board:
             out |= _GR.dilate(self.core,Ls,win,_GR.disc_span((r+PAD_GROW)/G),excl=excluded,
                               extra=self.phantom if ph else None,extra_on=[1]+[0]*(NL-1) if ph else None,
                               reduce_or=reduce_or)
+            rsv=self.__dict__.get('rsv')
+            if rsv is not None and rsv[:,win[0]:win[2]+1,win[1]:win[3]+1].any():
+                out |= _GR.dilate(rsv,Ls,win,_GR.disc_span(r/G),excl=excluded,reduce_or=reduce_or)
         return out
 
     def _blocked_np(self, L, nid, win, r):
         excluded=nid if isinstance(nid,tuple) else (nid,)
         own=max([CLEAR,LAYER_CLEARANCES.get(LAYERS[L],0.)]+[self._id_clearance.get(n,CLEAR) for n in excluded])
         out=self._dilate_np(self.occ,L,nid,win,r-max(0.,own-CLEAR))
-        if own>CLEAR:out|=self._dilate_np(self.core,L,nid,win,r+PAD_GROW)
+        if own>CLEAR:
+            out|=self._dilate_np(self.core,L,nid,win,r+PAD_GROW)
+            if self.__dict__.get('rsv') is not None:out|=self._dilate_np(self.rsv,L,nid,win,r)
         return out
 
     def _dilate_np(self, source, L, nid, win, r):
@@ -1769,7 +1787,7 @@ class Board:
         self.ops = [op for k, op in enumerate(self.ops) if k not in drop]
         self.tracks = [t for t in self.tracks if id(t) not in ids]
         self.vias = [v for v in self.vias if id(v) not in ids]
-        for a in (self.occ, self.core):
+        for a in (self.occ, self.core) + ((self.rsv,) if self.__dict__.get('rsv') is not None else ()):
             a[:, i0:i1 + 1, j0:j1 + 1] = 0
         for a in (self.thru, self.smd, self.no_via):
             a[i0:i1 + 1, j0:j1 + 1] = 0

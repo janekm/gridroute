@@ -34,10 +34,21 @@ def dense_packages(bd, fine_pitch=.65, min_pads=6):
     for ref, ps in groups.items():
         if len(ps) < min_pads:
             continue
-        pitch = min(min(math.hypot(a['x'] - b['x'], a['y'] - b['y']) for b in ps if b is not a) for a in ps)
+        # coincident pads (e.g. a USB-C connector's paired A/B pins) are one position
+        gaps = [math.hypot(a['x'] - b['x'], a['y'] - b['y']) for a in ps for b in ps if b is not a]
+        gaps = [g for g in gaps if g > 1e-6]
+        pitch = min(gaps) if gaps else 0.
         if 0 < pitch <= fine_pitch:
             out[ref] = (ps, pitch)
     return out
+
+
+def package_centre(bd, ref):
+    """Centre of all of a package's pads, plated ones included: a single row of SMD pins (a connector) then
+    still has an inside (towards its shell / body) and an outside."""
+    ps = [q for part in bd.parts.values() if part.placed for q in part.pads() if q['original_ref'] == ref]
+    xs = sorted(q['x'] for q in ps);ys = sorted(q['y'] for q in ps)
+    return (xs[0] + xs[-1]) / 2, (ys[0] + ys[-1]) / 2
 
 
 def _clusters(values, tol=.3):
@@ -145,37 +156,62 @@ def _needs_via(bd, p):
 
 
 class _Site:
-    __slots__ = ('pad', 'via', 'pts', 'width', 'vd', 'drill', 'clear', 'length', 'layer')
+    """One planned escape of a pin: copper capsules (a, b, radius, layer) and optionally a via at the end.
+    kind 'via': a dog-bone (stub + via); kind 'neck': a neck-down stub to where the class width fits,
+    with a class-width landing capsule at its end."""
+    __slots__ = ('pad', 'kind', 'capsules', 'via', 'vd', 'drill', 'clear', 'length', 'stub', 'width')
 
-    def __init__(self, pad, pts, width, vd, drill, clear, layer):
-        self.pad, self.pts, self.width, self.vd, self.drill, self.clear = pad, pts, width, vd, drill, clear
-        self.layer = layer
-        self.via = pts[-1]
+    def __init__(self, pad, kind, pts, width, clear, layer, via=None, vd=0., drill=0., landing=0.):
+        self.pad, self.kind, self.clear, self.width, self.stub = pad, kind, clear, width, pts
+        self.capsules = [(a, b, width / 2, layer) for a, b in zip(pts, pts[1:])]
+        if landing:
+            self.capsules.append((pts[-1], pts[-1], landing / 2, layer))
+        self.via, self.vd, self.drill = via, vd, drill
         self.length = sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
-
-    def segs(self):
-        return list(zip(self.pts, self.pts[1:]))
 
     def conflicts(self, o, rules, slack):
         """Copper clearance (class, and per-layer minimums wherever both objects exist), drill to copper and
         drill to drill, as the native rules apply them; slack covers the raster margin."""
         cls = max(self.clear, o.clear)
         lc = rules['layer_clearances']
-        via_via = max([cls] + list(lc.values()))
-        d = math.dist(self.via, o.via)
-        if d < max((self.vd + o.vd) / 2 + via_via, self.drill / 2 + o.vd / 2 + rules['hole_clear'],
-                   o.drill / 2 + self.vd / 2 + rules['hole_clear'],
-                   (self.drill + o.drill) / 2 + rules['hole_to_hole']) + slack:
-            return True
-        for a, b in ((self, o), (o, self)):      # a's via against b's stub (on b's layer)
-            need = max(a.vd / 2 + b.width / 2 + max(cls, lc.get(b.layer, 0.)),
-                       a.drill / 2 + b.width / 2 + rules['hole_clear']) + slack
-            if any(geometry._seg_dist(*a.via, *s) < need for s in b.segs()):
+        for a, b, r, L in self.capsules:
+            for c, d, q, M in o.capsules:
+                if L == M and _seg_seg(a, b, c, d) < r + q + max(cls, lc.get(L, 0.)) + slack:
+                    return True
+        for x, y in ((self, o), (o, self)):
+            if x.via is None:
+                continue
+            for c, d, q, M in y.capsules:       # x's via against y's copper (on y's layer)
+                need = max(x.vd / 2 + q + max(cls, lc.get(M, 0.)), x.drill / 2 + q + rules['hole_clear']) + slack
+                if geometry._seg_dist(*x.via, c, d) < need:
+                    return True
+        if self.via is not None and o.via is not None:
+            via_via = max([cls] + list(lc.values()))
+            held = lambda v: max(v.vd / 2, v.drill / 2 + rules['hole_clear'] - v.clear)   # reserved disk radius
+            if math.dist(self.via, o.via) < max(held(self) + o.vd / 2 + via_via, held(o) + self.vd / 2 + via_via,
+                                                self.drill / 2 + o.vd / 2 + rules['hole_clear'],
+                                                o.drill / 2 + self.vd / 2 + rules['hole_clear'],
+                                                (self.drill + o.drill) / 2 + rules['hole_to_hole']) + slack:
                 return True
-        if self.layer != o.layer:
-            return False
-        need = (self.width + o.width) / 2 + max(cls, lc.get(self.layer, 0.)) + slack
-        return any(_seg_seg(*s, *t) < need for s in self.segs() for t in o.segs())
+        return False
+
+
+def _masks(bd, masks, net, L, width, via=False):
+    key = (net, L, width, via)
+    if key not in masks:
+        masks[key] = bd.via_ok(net, masks['win']) if via else bd.track_ok(net, L, width, masks['win'])
+    return masks[key]
+
+
+def _free(bd, masks, mask, x, y):
+    G = bd.pitch
+    i, j = int(round(y / G)) - masks['win'][0], int(round(x / G)) - masks['win'][1]
+    return 0 <= i < mask.shape[0] and 0 <= j < mask.shape[1] and bool(mask[i, j])
+
+
+def _clear_line(bd, masks, mask, a, b):
+    n = max(int(math.dist(a, b) / (bd.pitch / 2)), 1)
+    return all(_free(bd, masks, mask, a[0] + (b[0] - a[0]) * t / n, a[1] + (b[1] - a[1]) * t / n) for t in range(n + 1))
 
 
 def _sites(bd, p, pitch, cx, cy, inward, masks):
@@ -189,21 +225,8 @@ def _sites(bd, p, pitch, cx, cy, inward, masks):
         return []                       # a central (exposed) pad: the plane drop handles it in the pad
     vd, drill = bd.via_size(net)
     width = min(p.get('escape_width') or bd.width(net, geometry.LAYERS[L]), short)
-    key = (net, width)
-    if key not in masks:
-        win = masks['win']
-        masks[key] = (bd.via_ok(net, win), bd.track_ok(net, L, width, win))
-    vok, tok = masks[key]
-    i0, j0 = masks['win'][0], masks['win'][1]
-
-    def free(mask, x, y):
-        i, j = int(round(y / G)) - i0, int(round(x / G)) - j0
-        return 0 <= i < mask.shape[0] and 0 <= j < mask.shape[1] and bool(mask[i, j])
-
-    def clear_line(a, b):
-        n = max(int(math.dist(a, b) / (G / 2)), 1)
-        return all(free(tok, a[0] + (b[0] - a[0]) * t / n, a[1] + (b[1] - a[1]) * t / n) for t in range(n + 1))
-
+    vok = _masks(bd, masks, net, L, width, via=True)
+    tok = _masks(bd, masks, net, L, width)
     out = []
     start = (p['x'], p['y'])
     for sign in ((1., -1.) if inward else (1.,)):
@@ -213,7 +236,7 @@ def _sites(bd, p, pitch, cx, cy, inward, masks):
             for lat in LATERAL:
                 x = round((p['x'] + ux * along - uy * lat * pitch) / G) * G
                 y = round((p['y'] + uy * along + ux * lat * pitch) / G) * G
-                if not free(vok, x, y):
+                if not _free(bd, masks, vok, x, y):
                     continue
                 if lat == 0.:
                     # straight on the pad axis: keep the via on the pad's centre line, off-grid if need be
@@ -224,13 +247,52 @@ def _sites(bd, p, pitch, cx, cy, inward, masks):
                     k = half + min(gap, .15)
                     knee = (p['x'] + ux * k, p['y'] + uy * k)
                     pts = [start, knee, (x, y)]
-                if all(clear_line(a, b) for a, b in zip(pts, pts[1:])):
-                    out.append(_Site(p, pts, width, vd, drill, bd.clearance(net), geometry.LAYERS[L]))
+                if all(_clear_line(bd, masks, tok, a, b) for a, b in zip(pts, pts[1:])):
+                    out.append(_Site(p, 'via', pts, width, bd.clearance(net), geometry.LAYERS[L],
+                                     via=(x, y), vd=vd, drill=drill))
+    return out
+
+
+def _needs_neck(bd, p):
+    """A pad whose net may only leave it at a neck-down width (Board.add_neck rules) and has no stub yet."""
+    net = p['net']
+    if not p.get('escape_width') or not bd.__dict__.get('necks') or not net or net in bd.config['planes']:
+        return False
+    if len(bd.pads_of(net)) < 2 or bd._net_complete(net):
+        return False
+    return p['escape_width'] < bd.width(net, geometry.LAYERS[_side(p)])
+
+
+def _neck_sites(bd, p, cx, cy, masks, reach=1.5):
+    """Straight neck-down stubs from the pad centre (outwards, then 45 degrees either side) to the first
+    grid point where the class width fits, each with a class-width landing for the continuation."""
+    net = p['net']
+    G = bd.pitch
+    L = _side(p)
+    layer = geometry.LAYERS[L]
+    ew, full = p['escape_width'], bd.width(net, layer)
+    thin = _masks(bd, masks, net, L, ew)
+    fat = _masks(bd, masks, net, L, full)
+    d, half, short, edge = _outward(p, cx, cy)
+    c, s_ = math.cos(math.pi / 4), math.sin(math.pi / 4)
+    dirs = [d, (d[0] * c - d[1] * s_, d[0] * s_ + d[1] * c), (d[0] * c + d[1] * s_, -d[0] * s_ + d[1] * c)]
+    out = []
+    for ux, uy in dirs:
+        for k in range(1, int((reach + half) / (G / 2)) + 1):
+            x, y = p['x'] + ux * k * G / 2, p['y'] + uy * k * G / 2
+            if not _free(bd, masks, thin, x, y):
+                break
+            ex, ey = round(x / G) * G, round(y / G) * G
+            if not _free(bd, masks, fat, ex, ey):
+                continue
+            if _clear_line(bd, masks, thin, (p['x'], p['y']), (ex, ey)):
+                out.append(_Site(p, 'neck', [(p['x'], p['y']), (ex, ey)], ew, bd.clearance(net), layer, landing=full))
+            break
     return out
 
 
 def _assign(pins, options, rules, slack):
-    """Beam search: at most one site per pin, no two chosen sites in conflict; most vias, then shortest stubs."""
+    """Beam search: at most one site per pin, no two chosen sites in conflict; most escapes, then shortest."""
     order = sorted((p for p in pins if options[_key(p)]), key=lambda p: (len(options[_key(p)]), _key(p)))
     beam = [((), 0., ())]                       # (chosen sites, total length, skipped pins)
     for p in order:
@@ -246,10 +308,16 @@ def _assign(pins, options, rules, slack):
     return list(best[0]), list(best[2]) + [p for p in pins if not options[_key(p)]]
 
 
-def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2):
-    """Commit stub + via for every pin of the dense packages that must change layer. Returns
-    (number placed, [(ref, pin, net) without a site]). Two-row packages with at least `inward_gap` mm
-    between the rows also get sites between the rows."""
+def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2, commit=True):
+    """Plan the escapes of every dense package's pins together: dog-bones (stub + via) for pins that must
+    change layer and, on boards with neck-down rules, the neck-down stubs of power pins. Returns
+    (number placed, [(ref, pin, net) without an escape]). Two-row packages with at least `inward_gap` mm
+    between the rows also get via sites between the rows.
+
+    Neck-down stubs and plane pins' dog-bones are copper at once (they are final). Signal dog-bones are
+    copper when commit=True; with commit=False their stub and a via-sized disk on every layer are reserved
+    instead (Board.reserve), so the net keeps its way out until it is routed, and later stages (power nets,
+    plane drops, other signals) must route around them. A neck stub's landing is always reserved."""
     placed = 0
     unplaced = []
     rules = dict(hole_to_hole=geometry.HOLE_TO_HOLE, hole_clear=geometry.HOLE_CLEAR,
@@ -258,20 +326,134 @@ def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2):
     for ref, (ps, pitch) in sorted(packages.items()):
         if not time_left():
             break
-        pins = [p for p in ps if _needs_via(bd, p)]
+        necks = [p for p in ps if _needs_neck(bd, p)]
+        vias = [p for p in ps if _needs_via(bd, p) and not any(_key(q) == _key(p) for q in necks)]
+        pins = necks + vias
         if not pins:
             continue
-        cx, cy = sum(q['x'] for q in ps) / len(ps), sum(q['y'] for q in ps) / len(ps)
+        cx, cy = package_centre(bd, ref)
         xs, ys = [q['x'] for q in ps], [q['y'] for q in ps]
         inward = any(len(c) == 2 and c[1] - c[0] >= inward_gap for c in (_clusters(ys), _clusters(xs)))
         r = 3.5
         masks = {'win': bd._win(min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r)}
-        options = {_key(p): _sites(bd, p, pitch, cx, cy, inward, masks) for p in pins}
+        options = {_key(p): _neck_sites(bd, p, cx, cy, masks) for p in necks}
+        options.update({_key(p): _sites(bd, p, pitch, cx, cy, inward, masks) for p in vias})
         chosen, skipped = _assign(pins, options, rules, slack)
         for s in chosen:
             p = s.pad
-            bd.add_track(p['net'], geometry.LAYERS[_side(p)], s.pts, s.width)
-            bd.add_via(p['net'], *s.via)
+            layer = geometry.LAYERS[_side(p)]
+            if s.kind == 'neck':
+                bd.add_track(p['net'], layer, s.stub, s.width)
+                a, b, rad, L = s.capsules[-1]
+                bd.reserve(p['net'], layer, a, b, rad)
+            elif commit or p['net'] in bd.config['planes']:
+                bd.add_track(p['net'], layer, s.stub, s.width)
+                bd.add_via(p['net'], *s.via)
+            else:
+                for a, b, rad, L in s.capsules:
+                    bd.reserve(p['net'], L, a, b, rad)
+                # big enough that others also keep the drill-to-copper clearance of the future via
+                rad = max(s.vd / 2, s.drill / 2 + geometry.HOLE_CLEAR - s.clear)
+                bd.reserve(p['net'], None, s.via, s.via, rad)
             placed += 1
         unplaced += [(ref, p['original_pin'], p['net']) for p in skipped]
     return placed, unplaced
+
+
+def _flood(free, seed):
+    """Cells of `free` connected to `seed` with the A* move set (8 neighbours; a diagonal needs both orthogonal
+    neighbours free)."""
+    import numpy as np
+    reach = seed & free
+    while True:
+        n = reach.copy()
+        n[1:, :] |= reach[:-1, :]
+        n[:-1, :] |= reach[1:, :]
+        n[:, 1:] |= reach[:, :-1]
+        n[:, :-1] |= reach[:, 1:]
+        orth = n & free
+        d = np.zeros_like(reach)
+        d[1:, 1:] |= reach[:-1, :-1] & orth[:-1, 1:] & orth[1:, :-1]
+        d[1:, :-1] |= reach[:-1, 1:] & orth[:-1, :-1] & orth[1:, 1:]
+        d[:-1, 1:] |= reach[1:, :-1] & orth[1:, 1:] & orth[:-1, :-1]
+        d[:-1, :-1] |= reach[1:, 1:] & orth[1:, :-1] & orth[:-1, 1:]
+        n = orth | (d & free)
+        if (n == reach).all():
+            return reach
+        reach = n
+
+
+def audit_escapes(bd, refs=None, margin=.3, reach_mm=3.):
+    """Check that every connected SMD pin can escape its package on the current board.
+
+    For each pin of a routed net: 'exit' if a track of the net's width (its permitted escape width at a
+    neck-down pad) reaches beyond the package outline + margin on the pin's layer within reach_mm;
+    'via' if, where the net must change layer, such a track also reaches a legal via site. Then the
+    dense packages' via-needing pins are assigned sites jointly (plan_dogbones, nothing committed) to
+    find pins whose individual escapes exist but cannot all be used at once. Returns a report dict:
+    {'pins': n, 'no_exit': [...], 'no_via': [...], 'joint_unplaced': [...], 'packages': {...}}."""
+    import numpy as np
+    G = bd.pitch
+    groups = {}
+    for part in bd.parts.values():
+        if part.placed:
+            for q in part.pads():
+                groups.setdefault(q['original_ref'], []).append(q)
+    report = dict(pins=0, no_exit=[], no_via=[], joint_unplaced=[], packages={})
+    for ref, ps in sorted(groups.items()):
+        if refs and ref not in refs:
+            continue
+        x0, x1 = min(q['x'] - q['w'] / 2 for q in ps) - margin, max(q['x'] + q['w'] / 2 for q in ps) + margin
+        y0, y1 = min(q['y'] - q['h'] / 2 for q in ps) - margin, max(q['y'] + q['h'] / 2 for q in ps) + margin
+        stats = dict(pins=0, exit=0, via_needed=0, via=0)
+        for p in ps:
+            net = p['net']
+            if p['layers'] == 'all' or not net or net.startswith('unconnected-'):
+                continue
+            if len(bd.pads_of(net)) < 2 and net not in bd.config['planes']:
+                continue
+            if net in bd.config['planes'] and (bd.plane_reached(p) or not _outward(p, *package_centre(bd, ref))[3]):
+                continue        # already on its plane, or a central (exposed) pad: a via in the pad serves it
+            stats['pins'] += 1
+            report['pins'] += 1
+            L = _side(p)
+            width = p.get('escape_width') or bd.width(net, geometry.LAYERS[L])
+            win = bd._win(p['x'] - reach_mm, p['y'] - reach_mm, p['x'] + reach_mm, p['y'] + reach_mm)
+            free = bd.track_ok(net, L, width, win)
+            pw, pm = bd._pad_mask(p, 0.)
+            seed = np.zeros_like(free)
+            a0, b0, a1, b1 = max(pw[0], win[0]), max(pw[1], win[1]), min(pw[2], win[2]), min(pw[3], win[3])
+            seed[a0 - win[0]:a1 - win[0] + 1, b0 - win[1]:b1 - win[1] + 1] = \
+                pm[a0 - pw[0]:a1 - pw[0] + 1, b0 - pw[1]:b1 - pw[1] + 1]
+            free |= seed
+            reach = _flood(free, seed)
+            ii, jj = np.nonzero(reach)
+            xs, ys = (jj + win[1]) * G, (ii + win[0]) * G
+            outside = ((xs < x0) | (xs > x1) | (ys < y0) | (ys > y1)).any()
+            pin = (ref, p['original_pin'], net)
+            if outside:
+                stats['exit'] += 1
+            else:
+                report['no_exit'].append(pin)
+            needs = (net in bd.config['planes'] and not bd.plane_reached(p)) or _needs_via(bd, p)
+            if needs:
+                stats['via_needed'] += 1
+                if (reach & bd.via_ok(net, win)).any():
+                    stats['via'] += 1
+                else:
+                    report['no_via'].append(pin)
+        report['packages'][ref] = stats
+    dense = dense_packages(bd)
+    if refs:
+        dense = {k: v for k, v in dense.items() if k in refs}
+    saved = (list(bd.tracks), list(bd.vias), list(bd.ops))
+    import copy
+    trial = copy.copy(bd)          # plan on a shallow copy whose copper ops are discarded afterwards
+    trial.__dict__ = dict(bd.__dict__)
+    for k in ('occ', 'core', 'thru', 'smd', 'no_via', '_th', '_dirty'):
+        trial.__dict__[k] = bd.__dict__[k].copy()
+    trial.tracks, trial.vias, trial.ops = list(bd.tracks), list(bd.vias), list(bd.ops)
+    _, unplaced = plan_dogbones(trial, dense, commit=False)
+    report['joint_unplaced'] = unplaced
+    assert (bd.tracks, bd.vias, bd.ops) == saved
+    return report

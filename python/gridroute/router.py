@@ -51,6 +51,7 @@ class Options:
     pad_entry: str = 'any'          # 'axial': leave/enter SMD pads straight through their middle (Board.pad_entry)
     pad_entry_halo: float = .1      # axial: straight run beyond the pad edge (mm, at least one grid cell)
     escape_plan: bool = False
+    escape_hold: bool = False        # reserve dense pins' escapes (corridor, planned via site) until their net connects
     escape_local_mm: float = 6.
     escape_buses: bool = True
     escape_dogbones: bool = True
@@ -139,6 +140,7 @@ class RoutingController:
         if source is not None:
             bd.replace_copper([t for t in source.tracks if only_net is None or t['net']==only_net],
                               [v for v in source.vias if only_net is None or v['net']==only_net])
+            for kind,args,_,_ in source.reservations():bd._op(kind,args,None)
         return bd
 
     def _event(self, stage, **kw):
@@ -154,9 +156,10 @@ class RoutingController:
             ls=bd.config['layers'];kw['layer_cost']={ls[0]:self.options.outer_layer_cost,ls[-1]:self.options.outer_layer_cost}
         ok=bd.connect(net,layers=layers or bd.config['layers'],strict=True,max_exp=self.options.max_expansions,**kw)
         # Two components: connect already tried that pair. Refinement boards are too costly to search twice.
-        if (ok or not self.options.join_components or bd.pitch<self.options.pitch
-                or len(set(bd.pad_components(net)))<3):return ok
-        return self._join_components(bd,net)
+        if not ok and self.options.join_components and bd.pitch>=self.options.pitch and len(set(bd.pad_components(net)))>=3:
+            ok=self._join_components(bd,net)
+        if ok and self.options.escape_hold and bd.reservations([net]):bd.release_reservations([net])
+        return ok
 
     def _join_components(self,bd,net):
         """Board.connect grows one tree from the first pad, so a boxed-in first pad fails the whole net. Join the
@@ -436,20 +439,18 @@ class RoutingController:
     def _reserve_escapes(self,bd):
         """Reserve a short outward corridor at every connected pin of fine-pitch packages for the initial pass,
         so earlier nets' vias and tracks do not seal later pins in (released before recovery)."""
-        groups={}
-        for part in bd.parts.values():
-            if part.placed:
-                for q in part.pads():
-                    if q['layers']!='all':groups.setdefault(q['original_ref'],[]).append(q)
+        from .escape import dense_packages,package_centre
         count=0
-        for ref,ps in groups.items():
-            if len(ps)<6:continue
-            spacing=min(min(math.hypot(a['x']-b['x'],a['y']-b['y']) for b in ps if b is not a) for a in ps)
-            if spacing>self.options.fine_pitch_mm:continue
-            cx=sum(q['x'] for q in ps)/len(ps);cy=sum(q['y'] for q in ps)/len(ps)
+        # pins whose escape is already planned (held site, neck stub or dog-bone copper starting at the pad)
+        planned={tuple(op[1][2]) for op in bd.reservations()}|{tuple(t['pts'][0]) for t in bd.tracks}
+        G=bd.pitch
+        for ref,(ps,pitch) in dense_packages(bd,self.options.fine_pitch_mm).items():
+            cx,cy=package_centre(bd,ref)
             for q in ps:
                 net=q['net']
                 if not net or net.startswith('unconnected-') or len(bd.pads_of(net))<2 and net not in bd.config['planes']:
+                    continue
+                if (round(q['x'],6),round(q['y'],6)) in planned or (q['x'],q['y']) in planned:
                     continue
                 vx,vy=q['x']-cx,q['y']-cy
                 if q['w']>q['h']*1.2 or (q['h']<=q['w']*1.2 and abs(vx)>=abs(vy)):
@@ -460,8 +461,16 @@ class RoutingController:
                     if abs(vy)<half:continue
                 reach=half+self.options.escape_reserve_mm
                 r=min(q.get('escape_width') or bd.width(net),short)/2
-                layer=geometry.LAYERS[geometry.pad_layers(q)[0]]
-                bd.reserve(net,layer,(q['x'],q['y']),(q['x']+d[0]*reach,q['y']+d[1]*reach),r);count+=1
+                L=geometry.pad_layers(q)[0];layer=geometry.LAYERS[L]
+                # clip where it would come within clearance of anything already there (other reservations too)
+                win=bd._win(q['x']-reach-G,q['y']-reach-G,q['x']+reach+G,q['y']+reach+G)
+                ok=bd.track_ok(net,L,2*r,win);k=0
+                while k*G/2<reach:
+                    x,y=q['x']+d[0]*(k+1)*G/2,q['y']+d[1]*(k+1)*G/2
+                    if not ok[int(round(y/G))-win[0],int(round(x/G))-win[1]]:break
+                    k+=1
+                if k*G/2<=half:continue
+                bd.reserve(net,layer,(q['x'],q['y']),(q['x']+d[0]*k*G/2,q['y']+d[1]*k*G/2),r);count+=1
         self._event('reserve_escapes',corridors=count)
 
     def _neck_escape(self,bd,p):
@@ -706,6 +715,15 @@ class RoutingController:
         # Allocate a reusable template only when a retry actually needs one.
         bd=self._fresh(self.options.pitch,cache_template=False)
         packages={}
+        if self.options.escape_hold:
+            # Every dense pin's escape, planned together before anything else is routed: neck-down power
+            # stubs and plane dog-bones as copper, signal via sites reserved until their net connects.
+            # Power nets, plane drops and other signals then route around the reservations.
+            from .escape import dense_packages,plan_dogbones
+            held=dense_packages(bd,self.options.fine_pitch_mm)
+            if self.options.escape_refs:held={k:v for k,v in held.items() if k in self.options.escape_refs}
+            placed,unplaced=plan_dogbones(bd,held,self._time_left,commit=False)
+            self._event('escape_hold',sites=placed,unplaced=unplaced)
         if self.options.escape_plan:
             # buses between facing fine-pitch rows need the lateral room the reservations below would take
             from .escape import dense_packages,route_local_buses
@@ -757,7 +775,7 @@ class RoutingController:
         for n in order:
             if not self._time_left():break
             if not self._connect(bd,n):bd=self._refine_net(bd,n)
-        if self.options.escape_reserve_mm>0:bd.release_reservations()
+        if self.options.escape_reserve_mm>0 and not self.options.escape_hold:bd.release_reservations()
         self._event('initial',deficit=self._score(bd),missing=bd.unrouted())
         if self.options.cleanup or bd.unrouted():
             if (self.options.fallback_pitches and bd.pitch>min(self.options.fallback_pitches)
@@ -775,6 +793,7 @@ class RoutingController:
                     self._recover_plane(bd,net);continue
                 if self.options.late_fanout:self._fanout_net(bd,net)
                 if not self._connect(bd,net):self._repair(bd,net)
+        if bd.reservations():self._event('released',nets=sorted({op[1][0] for op in bd.reservations()}),count=bd.release_reservations())
         if self.options.cleanup:self._cleanup(bd)
         if self.options.polish_via_cost_mm>0:bd=self._polish(bd)
         if self.options.fix_clearances:bd=self._fix_clearances(bd)
