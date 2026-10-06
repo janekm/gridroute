@@ -33,7 +33,8 @@ bd=ctl._fresh(ctl.options.pitch)
 # the controller's pre-routing stages, in run() order
 if ctl.options.escape_hold:
     from gridroute.escape import dense_packages,plan_dogbones
-    n,un=plan_dogbones(bd,dense_packages(bd,ctl.options.fine_pitch_mm),commit=False)
+    n,un=plan_dogbones(bd,dense_packages(bd,ctl.options.fine_pitch_mm),commit=False,
+                       every_pin=ctl.options.escape_hold_every_pin)
     print(f'held escapes: {n} planned, {len(un)} without one: {[tuple(x) for x in un]}')
     r=audit_escapes(bd,a.refs);summary('after planning held escapes',r)
 if ctl.options.escape_reserve_mm>0:ctl._reserve_escapes(bd)

@@ -52,6 +52,8 @@ class Options:
     pad_entry_halo: float = .1      # axial: straight run beyond the pad edge (mm, at least one grid cell)
     escape_plan: bool = False
     escape_hold: bool = False        # reserve dense pins' escapes (corridor, planned via site) until their net connects
+    escape_hold_every_pin: bool = True   # with escape_hold: an access via site for every pin, not just layer changes
+    escape_hold_until: str = 'routed'    # 'routed': until each net connects; 'initial': at most through the first pass
     escape_local_mm: float = 6.
     escape_buses: bool = True
     escape_dogbones: bool = True
@@ -469,6 +471,12 @@ class RoutingController:
                     d=(0.,math.copysign(1,vy));half=q['h']/2;short=q['w']
                     if abs(vy)<half:continue
                 reach=half+self.options.escape_reserve_mm
+                if self.options.escape_hold:
+                    # a pin without a held via site keeps a way out of the whole package outline
+                    out=[q2 for part in bd.parts.values() if part.placed for q2 in part.pads() if q2['original_ref']==ref]
+                    edge=(max(o['x']+o['w']/2 for o in out)-q['x'] if d[0]>0 else q['x']-min(o['x']-o['w']/2 for o in out)) if d[0] else \
+                         (max(o['y']+o['h']/2 for o in out)-q['y'] if d[1]>0 else q['y']-min(o['y']-o['h']/2 for o in out))
+                    reach=max(reach,edge+.3)
                 r=min(q.get('escape_width') or bd.width(net),short)/2
                 L=geometry.pad_layers(q)[0];layer=geometry.LAYERS[L]
                 # clip where it would come within clearance of anything already there (other reservations too)
@@ -615,6 +623,40 @@ class RoutingController:
         self._event('negotiated',deficit=best[0],dead=sorted(dead))
         return bd
 
+    def _nudge_near_misses(self,bd,report,check,deficit,limit=.01):
+        """Raster near-misses of a few micrometres: move the interior corners of the offending track segment away
+        from the other object by the shortfall (+2 um), keeping the result only if the continuous check finds
+        fewer violations and no worse connectivity. Track ends stay, so connections are untouched."""
+        def segs(x):
+            if x[0]=='track':t=bd.tracks[x[1]];return list(zip(t['pts'],t['pts'][1:]))
+            if x[0]=='via':v=bd.vias[x[1]];return [((v['x'],v['y']),(v['x'],v['y']))]
+            return []
+        for v in list(report['violations']):
+            short=v['required']-v['actual']
+            if short<=0 or short>limit:continue
+            for mover,other in ((v['a'],v['b']),(v['b'],v['a'])):
+                if mover[0]!='track' or not segs(other):continue
+                t=bd.tracks[mover[1]];pts=[list(q) for q in t['pts']]
+                best=min(((geometry._seg_dist(*c,a,b),k,c) for k,(a,b) in enumerate(zip(pts,pts[1:])) for s_ in segs(other) for c in s_),key=lambda z:z[0])
+                _,k,c=best;a,b=pts[k],pts[k+1]
+                # direction from the other object's nearest point to the segment's nearest point
+                ax,ay=b[0]-a[0],b[1]-a[1];L2=ax*ax+ay*ay or 1e-12
+                u=max(0.,min(1.,((c[0]-a[0])*ax+(c[1]-a[1])*ay)/L2));px,py=a[0]+u*ax,a[1]+u*ay
+                nx,ny=px-c[0],py-c[1];n=math.hypot(nx,ny)
+                if n<1e-9:continue
+                mv=(short+.002)/n
+                idx=[i for i in (k,k+1) if 0<i<len(pts)-1]
+                if not idx:continue
+                for i in idx:pts[i]=[round(pts[i][0]+nx*mv,6),round(pts[i][1]+ny*mv,6)]
+                old_tracks,old_vias=list(bd.tracks),list(bd.vias)
+                bd.replace_copper([dict(x,pts=pts) if x is t else x for x in bd.tracks],bd.vias)
+                checked=check(bd)
+                ok=len(checked['violations'])<len(report['violations']) and deficit(checked)<=deficit(report)
+                self._event('nudge',net=t['net'],moved_mm=round(short+.002,4),accepted=ok)
+                if ok:return self._nudge_near_misses(bd,checked,check,deficit,limit)
+                bd.replace_copper(old_tracks,old_vias)
+        return report
+
     def _fix_clearances(self,bd,rounds=3):
         """Remove raster near-misses found by the continuous checker: rip one side of each finding (the track
         first, then the other object, then both), reroute with a wider raster margin, and keep the result only if
@@ -622,6 +664,7 @@ class RoutingController:
         from .continuous import check
         deficit=lambda r:sum(max(0,c-1) for c in r['copper_components'].values())
         report=check(bd)
+        if report['violations']:report=self._nudge_near_misses(bd,report,check,deficit)
         for _ in range(rounds):
             if not report['violations']:break   # bounded by rounds, not the routing deadline
             pairs=[[x for x in (v['a'],v['b']) if x[0] in ('track','via')] for v in report['violations']]
@@ -731,7 +774,8 @@ class RoutingController:
             from .escape import dense_packages,plan_dogbones
             held=dense_packages(bd,self.options.fine_pitch_mm)
             if self.options.escape_refs:held={k:v for k,v in held.items() if k in self.options.escape_refs}
-            placed,unplaced=plan_dogbones(bd,held,self._time_left,commit=False)
+            placed,unplaced=plan_dogbones(bd,held,self._time_left,commit=False,
+                                          every_pin=self.options.escape_hold_every_pin)
             self._event('escape_hold',sites=placed,unplaced=unplaced)
         if self.options.escape_plan:
             # buses between facing fine-pitch rows need the lateral room the reservations below would take
@@ -785,6 +829,9 @@ class RoutingController:
             if not self._time_left():break
             if not self._connect(bd,n):bd=self._refine_net(bd,n)
         if self.options.escape_reserve_mm>0 and not self.options.escape_hold:bd.release_reservations()
+        if self.options.escape_hold and self.options.escape_hold_until=='initial' and bd.reservations():
+            # recovery rips real copper to make room; reservations of still-failing nets would only fence it in
+            self._event('released',nets=sorted({op[1][0] for op in bd.reservations()}),count=bd.release_reservations())
         self._event('initial',deficit=self._score(bd),missing=bd.unrouted())
         if self.options.cleanup or bd.unrouted():
             if (self.options.fallback_pitches and bd.pitch>min(self.options.fallback_pitches)
