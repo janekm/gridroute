@@ -47,6 +47,13 @@ class Options:
     max_rips: int = 8
     outward_drops: bool = False
     escape_reserve_mm: float = 0.
+    outer_layer_cost: float = 1.   # per-mm cost multiplier on the outer (component) layers: >1 sends long runs inside
+    pad_entry: str = 'any'          # 'axial': leave/enter SMD pads straight through their middle (Board.pad_entry)
+    escape_plan: bool = False
+    escape_local_mm: float = 6.
+    escape_buses: bool = True
+    escape_dogbones: bool = True
+    escape_refs: tuple = ()          # restrict the plan to these packages (original refs); () = every dense one
     neck_escapes: bool = True
     neck_nets_first: bool = True
     max_neck_escape_mm: float = 1.5
@@ -127,6 +134,7 @@ class RoutingController:
                 self._template_bytes+=size
         if bd.config['spec']:
             raise ValueError('RoutingController requires spec=0 because Board configuration is process-global')
+        bd.pad_entry=self.options.pad_entry
         if source is not None:
             bd.replace_copper([t for t in source.tracks if only_net is None or t['net']==only_net],
                               [v for v in source.vias if only_net is None or v['net']==only_net])
@@ -138,9 +146,12 @@ class RoutingController:
     def _time_left(self):
         return time.perf_counter()-self.started < self.options.deadline_seconds
 
-    def _connect(self, bd, net):
+    def _connect(self, bd, net, layers=None):
         if self.options.neck_escapes:self._neck_net(bd,net)
-        ok=bd.connect(net,layers=bd.config['layers'],strict=True,max_exp=self.options.max_expansions)
+        kw={}
+        if self.options.outer_layer_cost!=1.:
+            ls=bd.config['layers'];kw['layer_cost']={ls[0]:self.options.outer_layer_cost,ls[-1]:self.options.outer_layer_cost}
+        ok=bd.connect(net,layers=layers or bd.config['layers'],strict=True,max_exp=self.options.max_expansions,**kw)
         # Two components: connect already tried that pair. Refinement boards are too costly to search twice.
         if (ok or not self.options.join_components or bd.pitch<self.options.pitch
                 or len(set(bd.pad_components(net)))<3):return ok
@@ -192,7 +203,7 @@ class RoutingController:
         for net in bd.nets:
             ps=bd.pads_of(net)
             if net in planes:
-                deficit+=sum(1 for p in ps if p['layers']!='all' and not bd.has_drop(p,reach=3.))
+                deficit+=sum(1 for p in ps if p['layers']!='all' and not bd.plane_reached(p))
                 continue
             if len(ps)<2 or net.startswith('unconnected-'):
                 continue
@@ -381,17 +392,28 @@ class RoutingController:
 
         Larger radii are tried only when the short drop fails. A via in the pad is
         the last resort, and only for pads that can hold the whole via (exposed pads)."""
-        if p['layers']=='all' or bd.has_drop(p,reach=3.):return True
+        if p['layers']=='all' or bd.plane_reached(p):return True
         width=p.get('escape_width') or bd.width(p['net'])
         # Like a dog-bone: leave the package outwards so the via does not
         # sit in the escape channels of the neighbouring pins.
         outward=self._outward_dirs(bd,p) if self.options.outward_drops else None
-        for dirs in ([outward] if outward else [])+[None]:
+        axial=[(1.,0.),(-1.,0.),(0.,1.),(0.,-1.)] if self.options.pad_entry=='axial' else None
+        for dirs in ([outward] if outward else [])+([axial] if axial else [])+[None]:
             for r in self.options.plane_drop_radii:
                 if bd.fanout(p['ref'],p['num'],width=width,max_r=r,dirs=dirs):return True
         if min(p['w'],p['h'])>=bd.via_size(p['net'])[0]+.1:
-            return bd.fanout(p['ref'],p['num'],width=width,max_r=min(p['w'],p['h'])/2,in_pad=True)
-        return False
+            if bd.fanout(p['ref'],p['num'],width=width,max_r=min(p['w'],p['h'])/2,in_pad=True):return True
+        return self._tie_to_dropped(bd,p)
+
+    def _tie_to_dropped(self,bd,p,reach=6.):
+        """No room for a via at the pad: route it to the nearest pads of its net that already reach the plane
+        (their islands include the via), as a designer ties a crowded pin to a neighbour's via."""
+        targets=sorted((q for q in bd.pads_of(p['net']) if (q['ref'],q['num'])!=(p['ref'],p['num'])
+                        and math.hypot(q['x']-p['x'],q['y']-p['y'])<=reach
+                        and (q['layers']=='all' or bd.plane_reached(q))),
+                       key=lambda q:math.hypot(q['x']-p['x'],q['y']-p['y']))[:4]
+        return bool(targets) and bd._route(p['net'],[p],targets,layers=bd.config['layers'],
+                                           max_exp=self.options.max_expansions)
 
     @staticmethod
     def _outward_dirs(bd,p,min_cos=.35):
@@ -493,7 +515,7 @@ class RoutingController:
     def _recover_plane(self,bd,net):
         for p in bd.pads_of(net):
             if not self._time_left():break
-            if p['layers']=='all' or bd.has_drop(p,reach=3.):continue
+            if p['layers']=='all' or bd.plane_reached(p):continue
             if not self._drop(bd,p):self._repair(bd,net,self._plane_action(net,p))
 
     def _soft_hook(self,bd,history):
@@ -682,6 +704,16 @@ class RoutingController:
         # The ordinary coarse pass may finish without rebuilding any scene.
         # Allocate a reusable template only when a retry actually needs one.
         bd=self._fresh(self.options.pitch,cache_template=False)
+        packages={}
+        if self.options.escape_plan:
+            # buses between facing fine-pitch rows need the lateral room the reservations below would take
+            from .escape import dense_packages,route_local_buses
+            packages=dense_packages(bd,self.options.fine_pitch_mm)
+            if self.options.escape_refs:
+                packages={k:v for k,v in packages.items() if k in self.options.escape_refs}
+            local=route_local_buses(bd,lambda n,ls:self._connect(bd,n,ls),packages,self.options.escape_local_mm,
+                                    self._time_left) if self.options.escape_buses else []
+            self._event('local_buses',packages=sorted(packages),routed=local,deficit=self._score(bd))
         if self.options.escape_reserve_mm>0:self._reserve_escapes(bd)
         if self.options.neck_escapes and self.options.neck_nets_first and bd.__dict__.get('necks'):
             # Class-width power escapes between fine pins have the fewest options: route them first.
@@ -690,6 +722,10 @@ class RoutingController:
                 if not self._time_left():break
                 if not self._connect(bd,net):bd=self._refine_net(bd,net)
             self._event('neck_nets',nets=len(necked),deficit=self._score(bd))
+        if packages and self.options.escape_dogbones:
+            from .escape import plan_dogbones
+            placed,unplaced=plan_dogbones(bd,packages,self._time_left)
+            self._event('dogbones',placed=placed,unplaced=unplaced)
         for net in sorted(bd.config['planes']):
             self._drop_net(bd,net)
         if bd.config['planes']:self._event('plane_drops',deficit=self._score(bd))
@@ -741,5 +777,5 @@ class RoutingController:
         if self.options.cleanup:self._cleanup(bd)
         if self.options.polish_via_cost_mm>0:bd=self._polish(bd)
         if self.options.fix_clearances:bd=self._fix_clearances(bd)
-        self._event('finished',deficit=self._score(bd),missing=bd.unrouted())
+        self._event('finished',deficit=self._score(bd),missing=bd.unrouted(),relaxed_entries=getattr(bd,'relaxed_entries',0))
         return bd,self.events

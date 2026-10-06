@@ -239,6 +239,20 @@ def dedup(pts, eps=1e-6):
     return out
 
 
+def _collinear_merged(pts, eps=1e-9):
+    """Drop interior points that lie on the straight line between their neighbours."""
+    out = [pts[0]]
+    for q, r in zip(pts[1:], pts[2:] + [None]):
+        if r is not None:
+            a = out[-1]
+            cross = (q[0] - a[0]) * (r[1] - a[1]) - (q[1] - a[1]) * (r[0] - a[0])
+            dot = (q[0] - a[0]) * (r[0] - q[0]) + (q[1] - a[1]) * (r[1] - q[1])
+            if abs(cross) < eps and dot >= 0:
+                continue
+        out.append(q)
+    return out
+
+
 class RouteError(Exception):
     pass
 
@@ -934,6 +948,45 @@ class Board:
                 joined.add(comp[id(p)])     # routed: its whole component now belongs to the tree
         return ok
 
+    AXIAL_MAX_PAD = 2.5       # pads larger than this (mm) may be entered anywhere, like thermal or power pads
+
+    def _axial_entries(self, nid, pads, win, blk):
+        """Pad entry rule (Board.pad_entry = 'axial'): a route may leave or enter an SMD pad only on its two
+        centre lines and runs straight for a short halo beyond the pad edge. Blocks the other cells of each pad
+        and its halo in blk (this search only; the net's other copper there stays usable) and returns the
+        pads for snapping the emitted track onto the exact centre line."""
+        e = max(2 * G, 0.1)
+        snaps, seen = [], set()
+        for p in pads:
+            key = (p['ref'], p['num'])
+            if key in seen or p['layers'] == 'all' or p['shape'] == 'polygon' or p.get('angle', 0.):
+                continue
+            seen.add(key)
+            if max(p['w'], p['h']) > self.AXIAL_MAX_PAD or min(p['w'], p['h']) < G:
+                continue
+            L = pad_layers(p)[0]
+            gw, gm = self._pad_mask(p, e)
+            pw, pm = self._pad_mask(p, 0.)
+            i0, j0 = max(gw[0], win[0]), max(gw[1], win[1])
+            i1, j1 = min(gw[2], win[2]), min(gw[3], win[3])
+            if i0 > i1 or j0 > j1:
+                continue
+            region = gm[i0 - gw[0]:i1 - gw[0] + 1, j0 - gw[1]:j1 - gw[1] + 1].copy()
+            ci, cj = int(round(p['y'] / G)), int(round(p['x'] / G))
+            if i0 <= ci <= i1:
+                region[ci - i0, :] = False
+            if j0 <= cj <= j1:
+                region[:, cj - j0] = False
+            pad = np.zeros_like(region)
+            a0, b0 = max(pw[0], i0), max(pw[1], j0)
+            a1, b1 = min(pw[2], i1), min(pw[3], j1)
+            if a0 <= a1 and b0 <= b1:
+                pad[a0 - i0:a1 - i0 + 1, b0 - j0:b1 - j0 + 1] = pm[a0 - pw[0]:a1 - pw[0] + 1, b0 - pw[1]:b1 - pw[1] + 1]
+            region &= ~(~pad & (self.core[L, i0:i1 + 1, j0:j1 + 1] == nid))     # own stubs, vias, tracks stay
+            blk[L, i0 - win[0]:i1 - win[0] + 1, j0 - win[1]:j1 - win[1] + 1] |= region
+            snaps.append((p['x'], p['y'], ci, cj, max(p['w'], p['h']) / 2 + G))
+        return snaps
+
     def _content_key(self, win, *args):
         """Content hash of the board arrays over the tiles covering win, plus args (route cache key)."""
         ti0, tj0, ti1, tj1 = win[0] // TILE, win[1] // TILE, win[2] // TILE, win[3] // TILE
@@ -962,8 +1015,20 @@ class Board:
             if hit is not None:
                 return self._apply(hit)
         res = self._spec_take(net, src_pads, dst_pads, args)
+        axial = self.__dict__.get('pad_entry') == 'axial' and not self.__dict__.get('_relaxed_entry')
+        exp0 = _native.stats['astar_exp']
         if res is None:
             res = self._route_search(net, src_pads, dst_pads, *args)
+        # relax only a search boxed in at its pads (no legal entry, or a tiny search), not ordinary congestion
+        if res[0] == 'fail' and axial and (len(res) > 1 or _native.stats['astar_exp'] - exp0 < 2000):
+            # the exceptional case (e.g. a corner pad): any entry angle and point, counted for reporting
+            self._relaxed_entry = True
+            try:
+                res = self._route_search(net, src_pads, dst_pads, *args)
+            finally:
+                self._relaxed_entry = False
+            if res[0] != 'fail':
+                self.relaxed_entries = getattr(self, 'relaxed_entries', 0) + 1
         if key is not None:
             _CACHE.put(key, res)
         return self._apply(res)
@@ -1101,6 +1166,9 @@ class Board:
                 vok &= ~self._blocked(L, nid, win, vr)
             if _VERIFY:
                 assert np.array_equal(blk, blk_gr) and np.array_equal(vok, vok_gr), ('_route masks', net, win)
+        snap = None
+        if self.__dict__.get('pad_entry') == 'axial' and not self.__dict__.get('_relaxed_entry'):
+            snap = self._axial_entries(nid, src_pads + dst_pads, win, blk)
         neck = None if explicit else self._neck_widths(net, win)
         if neck is not None:
             for L in Ls:
@@ -1121,7 +1189,7 @@ class Board:
         src = _GR.mask_scan(isl_s, blk) if _GR is not None and not _VERIFY else np.argwhere(isl_s & ~blk)
         tgt = isl_d & ~blk
         if not len(src) or not tgt.any():
-            return ('fail',)
+            return ('fail', 'entry') if snap else ('fail',)
         lc = [1.0] * NL
         for l, m in (layer_cost or {}).items():
             lc[LAYERS.index(l)] = m
@@ -1142,7 +1210,7 @@ class Board:
         if path is None:
             return ('fail',)
         return ('path', net, path, win, None if self.cls[net] in LAYER_WIDTHS and not explicit else width, (vd, vdr), H, W,
-                None if neck is None else [float(neck[k]) for k in path])
+                None if neck is None else [float(neck[k]) for k in path], snap)
         return True
 
     def _astar(self, blk, vok, src, tgt, Ls, lc, vcost, pref, turn, weight, max_exp):
@@ -1316,9 +1384,36 @@ class Board:
             return None
         return list(zip((s // HW).tolist(), (s % HW // W).tolist(), (s % W).tolist()))
 
-    def _emit(self, net, path, win, width, via, H, W, neck=None):
+    def _snap_entries(self, path, coords, win, snap):
+        """Move the straight runs at the ends of a path onto their pad's exact centre line and return the pad
+        centres to start / end the track at (None where the end is not on an axial pad)."""
         i0, j0 = win[0], win[1]
-        xy = lambda k: ((k[2] + j0) * G, (k[1] + i0) * G)
+        ends = [None, None]
+        for end, order in ((0, range(len(path))), (1, range(len(path) - 1, -1, -1))):
+            order = list(order)
+            L, i, j = path[order[0]]
+            gi, gj = i + i0, j + j0
+            for x, y, ci, cj, reach in snap:
+                if (gi != ci and gj != cj) or math.hypot(gj * G - x, gi * G - y) > reach:
+                    continue
+                nxt = path[order[1]] if len(order) > 1 else None
+                horizontal = gi == ci and (gj != cj or (nxt is not None and nxt[1] + i0 == gi and nxt[0] == L))
+                for k in order:
+                    s = path[k]
+                    if s[0] != L or (s[1] + i0 != gi if horizontal else s[2] + j0 != gj):
+                        break
+                    coords[k] = (coords[k][0], y) if horizontal else (x, coords[k][1])
+                ends[end] = (x, y)
+                break
+        return ends
+
+    def _emit(self, net, path, win, width, via, H, W, neck=None, snap=None):
+        i0, j0 = win[0], win[1]
+        coords = [((k[2] + j0) * G, (k[1] + i0) * G) for k in path]
+        ends = self._snap_entries(path, coords, win, snap) if snap else [None, None]
+        self._emit_ends = (ends[0], ends[1], len(path) - 1)
+        path = [(k[0], k[1], k[2], n) for n, k in enumerate(path)]
+        xy = lambda k: coords[k[3]]
         neck = neck or [0.] * len(path)
         seg, nw = [path[0]], [neck[0]]
         for k, w in zip(path[1:], neck[1:]):
@@ -1355,7 +1450,15 @@ class Board:
             if (b[1] - a[1], b[2] - a[2]) != (c[1] - b[1], c[2] - b[2]):
                 pts.append(b)
         pts.append(seg[-1])
-        self.add_track(net, LAYERS[seg[0][0]], [xy(k) for k in pts], width)
+        out = [xy(k) for k in pts]
+        start, end, last = getattr(self, '_emit_ends', (None, None, -1))
+        if len(seg[0]) > 3:
+            if start is not None and seg[0][3] == 0 and math.dist(start, out[0]) > 1e-9:
+                out.insert(0, start)
+            if end is not None and seg[-1][3] == last and math.dist(end, out[-1]) > 1e-9:
+                out.append(end)
+            out = _collinear_merged(out)
+        self.add_track(net, LAYERS[seg[0][0]], out, width)
 
     # ------------------------------------------------------------------ differential pairs
     def route_pair(self, netp, netn, a, b, layer, width=None, gap=0.2, margin=4.0, turn=0.3, pref=None,
@@ -1581,6 +1684,31 @@ class Board:
             self.add_track(net, LAYERS[L], [(p['x'], p['y']), (x, y)], width)
         self.add_via(net, x, y)
         return True
+
+    def via_ok(self, net, win):
+        """[H, W] cells of grid window win where a via of `net` fits against the current board (the same tests as
+        a plane drop: copper on every layer, SMD pads, holes, via rule areas, drill-to-copper clearance)."""
+        nid = self.net_id[net]
+        vd, vdr = self.via_size(net)
+        vok = np.ones((win[2] - win[0] + 1, win[3] - win[1] + 1), dtype=bool)
+        for L in range(NL):
+            vok &= ~self._blocked(L, nid, win, self._reach(net, vd / 2, LAYERS[L]))
+        vok &= ~self._near_smd(win, vd / 2 + 0.1)
+        vok &= ~self._near_holes(win, vdr / 2 + HOLE_TO_HOLE + 0.01)
+        vok &= ~self._via_areas(win, vd / 2 + MARGIN)
+        hr = vdr / 2 + HOLE_CLEAR + MARGIN
+        if hr > self._reach(net, vd / 2):
+            vok &= ~self._near_foreign_copper(nid, win, hr)
+        return vok
+
+    def track_ok(self, net, L, width, win):
+        """[H, W] cells of window win where a track centre of `net` with `width` fits on layer index L."""
+        return ~self._blocked(L, self.net_id[net], win, self._reach(net, width / 2, LAYERS[L]))
+
+    def plane_reached(self, p):
+        """A plane net's SMD pad reaches a via or plated hole of its net through copper: its own drop (3 mm), or
+        a trace tied to a neighbour's drop (8 mm)."""
+        return self.has_drop(p, 3.) or self.has_drop(p, 8.)
 
     def has_drop(self, p, reach=4.0):
         """True if pad p already reaches a via or plated hole of its own net through copper (remembered: copper is
@@ -2144,10 +2272,7 @@ class Board:
                 for pd in pads:
                     if pd['layers'] == 'all':
                         continue
-                    w = self._win(pd['x'] - 3, pd['y'] - 3, pd['x'] + 3, pd['y'] + 3)
-                    isl = self._island(nid, self._pad_seeds(pd, w), w)
-                    thr = self.thru[w[0]:w[2] + 1, w[1]:w[3] + 1] == nid
-                    if not (isl.any(axis=0) & thr).any():
+                    if not self.plane_reached(pd):
                         out.append((net, pd['ref'], pd['num']))
                 continue
             if len(pads) < 2:
