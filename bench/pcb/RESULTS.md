@@ -141,3 +141,22 @@ Pads and the grid: 105 of 461 connected pads have both coordinates on the 0.05 m
 grid offset improves that (each package has its own sub-grid offset). U1, U3 and U4 are entirely on
 grid; U10/J3 are off-grid only along their pin axis (harmless for straight exits), J1, U6, U7 and U8
 are off-grid across their axis by 0.0125-0.0375 mm.
+
+## Round 4: an escape for every pin (6 October 2026)
+
+`escape_hold` now gives every connected pin of a dense package an access via site (`escape_hold_every_pin`),
+plane and neck-down pins first, then pins that must change layer, then same-side pins. Pins without a site
+keep a corridor out of the whole package outline. 128 of 189 dense pins get a site; 61 cannot (U1 21,
+U3 11): at 0.4 mm pitch with 0.5 mm vias, a stub between two first-row vias misses the clearance limit,
+so not every QFN pin can have its own via.
+
+Audit (counting planned escapes): before general routing starts, only 2 connected pins on the whole board
+are boxed in (C302-1, U1-26), down from 17-19 without held escapes.
+
+Seeded means (4 seeds, 90 s): base 32.8; hold every pin until routed 37.3 (initial pass 46-50 vs 54-58,
+but only 31-42 recovery repairs vs about 77); hold every pin through the first pass only 33.0.
+In the hold-until-routed runs about 40% of the still-unconnected pads held a site: their failure is
+beyond the escape (inner-layer access around the via, or the far end), not at the package.
+
+A raster near-miss of 1.4 um that rerouting could not fix is now repaired by nudging the segment's
+interior corners away by the shortfall (`_nudge_near_misses`).

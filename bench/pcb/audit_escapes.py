@@ -15,7 +15,7 @@ from gridroute.escape import audit_escapes
 
 def summary(name,r):
     bad={k:v for k,v in r['packages'].items() if v['exit']<v['pins'] or v['via']<v['via_needed']}
-    print(f"{name}: {r['pins']} pins; no exit {len(r['no_exit'])}, no via site {len(r['no_via'])}, "
+    print(f"{name}: {r['pins']} pins ({r['held']} with a planned escape); no exit {len(r['no_exit'])}, no via site {len(r['no_via'])}, "
           f"no joint via site {len(r['joint_unplaced'])}")
     for k,v in sorted(bad.items()):print('  ',k,v)
     for kind in ('no_exit','no_via','joint_unplaced'):

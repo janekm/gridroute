@@ -420,7 +420,10 @@ def audit_escapes(bd, refs=None, margin=.3, reach_mm=3.):
         if part.placed:
             for q in part.pads():
                 groups.setdefault(q['original_ref'], []).append(q)
-    report = dict(pins=0, no_exit=[], no_via=[], joint_unplaced=[], packages={})
+    report = dict(pins=0, no_exit=[], no_via=[], joint_unplaced=[], packages={}, held=0)
+    # pins whose escape is already planned: a held site (reservation) or escape copper starting at the pad
+    planned = {(op[1][0], round(op[1][2][0], 6), round(op[1][2][1], 6)) for op in bd.reservations()}
+    planned |= {(t['net'], round(t['pts'][0][0], 6), round(t['pts'][0][1], 6)) for t in bd.tracks}
     for ref, ps in sorted(groups.items()):
         if refs and ref not in refs:
             continue
@@ -437,6 +440,10 @@ def audit_escapes(bd, refs=None, margin=.3, reach_mm=3.):
                 continue        # already on its plane, or a central (exposed) pad: a via in the pad serves it
             stats['pins'] += 1
             report['pins'] += 1
+            if (net, round(p['x'], 6), round(p['y'], 6)) in planned:
+                stats['exit'] += 1
+                report['held'] += 1
+                continue
             L = _side(p)
             width = p.get('escape_width') or bd.width(net, geometry.LAYERS[L])
             win = bd._win(p['x'] - reach_mm, p['y'] - reach_mm, p['x'] + reach_mm, p['y'] + reach_mm)
