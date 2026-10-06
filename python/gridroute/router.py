@@ -156,7 +156,9 @@ class RoutingController:
             ls=bd.config['layers'];kw['layer_cost']={ls[0]:self.options.outer_layer_cost,ls[-1]:self.options.outer_layer_cost}
         ok=bd.connect(net,layers=layers or bd.config['layers'],strict=True,max_exp=self.options.max_expansions,**kw)
         # Two components: connect already tried that pair. Refinement boards are too costly to search twice.
-        if not ok and self.options.join_components and bd.pitch>=self.options.pitch and len(set(bd.pad_components(net)))>=3:
+        # not inside a refinement retry (too costly there); a retained fine grid is the normal board, though
+        if (not ok and self.options.join_components and not getattr(self,'_refining',False)
+                and len(set(bd.pad_components(net)))>=3):
             ok=self._join_components(bd,net)
         if ok and self.options.escape_hold and bd.reservations([net]):bd.release_reservations([net])
         return ok
@@ -229,6 +231,13 @@ class RoutingController:
         return sorted([n for n in bd.nets if len(bd.pads_of(n))>=2 and not n.startswith('unconnected-') and n not in planes],key=key)
 
     def _refine_net(self, bd, net):
+        self._refining=True
+        try:
+            return self._refine_net_at(bd, net)
+        finally:
+            self._refining=False
+
+    def _refine_net_at(self, bd, net):
         for pitch in self.options.fallback_pitches:
             if pitch>=bd.pitch or not self._time_left():
                 continue
@@ -783,12 +792,15 @@ class RoutingController:
                 bd=self._fresh(min(self.options.fallback_pitches),bd)
             if self.options.cleanup:self._cleanup(bd)
         if self.options.negotiate and bd.unrouted():bd=self._negotiate(bd)
+        # Fewest attempts first (then name), so a deadline does not starve nets late in the alphabet.
+        attempts={}
         for iteration in range(self.options.recovery_passes):
             missing=sorted({p[0] for p in bd.unrouted()})
             if not missing or not self._time_left():break
             self._seen_states.add(self._state_key(bd))
-            for net in missing:
+            for net in sorted(missing,key=lambda n:(attempts.get(n,0),n)):
                 if not self._time_left():break
+                attempts[net]=attempts.get(net,0)+1
                 if net in bd.config['planes']:
                     self._recover_plane(bd,net);continue
                 if self.options.late_fanout:self._fanout_net(bd,net)

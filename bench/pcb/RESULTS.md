@@ -107,3 +107,37 @@ Findings:
   remaining failures are pin access at U10, U3, J3 and J1 plus the I2C nets.
 - Axial pad entry costs about 4 connections on this board. The continuous checker flags the RF net at
   U1 (class clearance), which the project's courtyard rule permits natively.
+
+## Round 3: held escapes and the escape audit (6 October 2026)
+
+`bench/pcb/audit_escapes.py CASE` checks every connected pin: can a track of the net's width get out
+of the package outline, and reach a legal via site where the net must change layer; then whether all
+via-needing pins of a dense package get sites at once. AMOLED planes: on the empty board all 441 signal
+pins escape and reach a via site individually (two exposed GND pads use via-in-pad); 20-23 cannot all
+get via sites simultaneously. Before the fixes below, the pre-routing stages sealed 17-19 pins (all
+of J1's USB pins, several U3 pins, U6's I2C pins).
+
+Fixed along the way:
+
+- J1 (single-row USB-C) got no escape corridors: its centre was taken from the SMD pins only, and its
+  coincident A/B pads gave pitch 0.
+- Corridors reserved after held via sites could invalidate them (22 of 40): corridors are now clipped
+  against existing copper and reservations and skip pins with a planned escape.
+- Reservations lived only in the grown occupancy raster; nets with a clearance surplus (PWR, and every
+  net on inner layers with the 0.152 mm rule) were checked against them with the reduced radius and
+  could pass 0.05 mm too close. Reservations now have their own raster, dilated like copper.
+- Component joining was gated on the primary pitch; with `retain_fine_grid` the AMOLED run continues on
+  0.025 mm, so it never ran, and ESP32_SDA/SCL (first pad boxed in at U6) stayed entirely unrouted.
+- Recovery went through failing nets alphabetically every pass, so the deadline starved later nets;
+  it now takes the least-attempted nets first.
+
+Seeded means (4 seeds, 90 s): base 37.5 -> **32.8** after the last two fixes (27, 34, 34, 36).
+`escape_hold` (all dense pins' escapes planned first; neck-down stubs and plane dog-bones as copper,
+signal via sites reserved until the net connects; all 38 held via sites verified legal through power
+nets and plane drops) gives 39.0: the initial pass is equal, but the persistent reservations leave the
+recovery loop fewer repairs (about 49 vs 77 attempts, 13 vs 25 accepted). It stays an option, off.
+
+Pads and the grid: 105 of 461 connected pads have both coordinates on the 0.05 mm grid; no global
+grid offset improves that (each package has its own sub-grid offset). U1, U3 and U4 are entirely on
+grid; U10/J3 are off-grid only along their pin axis (harmless for straight exits), J1, U6, U7 and U8
+are off-grid across their axis by 0.0125-0.0375 mm.
