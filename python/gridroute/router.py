@@ -11,6 +11,7 @@ import copy
 import hashlib
 import math
 import time
+import numpy as np
 from . import board as geometry
 
 
@@ -38,6 +39,19 @@ class Options:
     max_expansions: int = 4_000_000
     cleanup: bool = True
     power_nets: tuple = ('GND', '+3V3', '+5V', 'VCC')
+    negotiate: bool = False
+    negotiate_rounds: int = 30
+    soft_cost_mm: float = .5
+    history_cost_mm: float = .25
+    max_rips: int = 8
+    outward_drops: bool = False
+    escape_reserve_mm: float = 0.
+    neck_escapes: bool = True
+    neck_nets_first: bool = True
+    max_neck_escape_mm: float = 1.5
+    fine_pitch_mm: float = .65
+    fix_clearances: bool = True
+    plane_drop_radii: tuple = (2., 2.9)  # within unrouted()'s 3 mm drop window
 
 
 def _segment_distance(a, b, c, d):
@@ -121,7 +135,16 @@ class RoutingController:
         return time.perf_counter()-self.started < self.options.deadline_seconds
 
     def _connect(self, bd, net):
+        if self.options.neck_escapes:self._neck_net(bd,net)
         return bd.connect(net,layers=bd.config['layers'],strict=True,max_exp=self.options.max_expansions)
+
+    def _neck_net(self,bd,net):
+        """Escape stubs for the net's neck-down pads that have none yet (placed against the current copper)."""
+        pads=[p for p in bd.pads_of(net) if p.get('escape_width') and p['layers']!='all']
+        if not pads or net in bd.config['planes'] or bd._net_complete(net):return
+        starts={tuple(t['pts'][0]) for t in bd.tracks if t['net']==net}
+        for p in pads:
+            if (round(p['x'],6),round(p['y'],6)) not in starts:self._neck_escape(bd,p)
 
     def _fanout_net(self,bd,net):
         for p in sorted(bd.pads_of(net),key=lambda p:(min(p['w'],p['h']),p['ref'],p['num'])):
@@ -134,8 +157,12 @@ class RoutingController:
         # Count distinct components, not missing pads: many missing pads can be
         # one disconnected island. Fall back to pad deficits for unusual shapes.
         deficit=0
+        planes=bd.config['planes']
         for net in bd.nets:
             ps=bd.pads_of(net)
+            if net in planes:
+                deficit+=sum(1 for p in ps if p['layers']!='all' and not bd.has_drop(p,reach=3.))
+                continue
             if len(ps)<2 or net.startswith('unconnected-'):
                 continue
             labels=bd.pad_components(net)
@@ -149,7 +176,8 @@ class RoutingController:
             span=math.hypot(max(p['x'] for p in ps)-min(p['x'] for p in ps),
                             max(p['y'] for p in ps)-min(p['y'] for p in ps))
             return (len(ps)>8,span,n)
-        return sorted([n for n in bd.nets if len(bd.pads_of(n))>=2 and not n.startswith('unconnected-')],key=key)
+        planes=bd.config['planes']
+        return sorted([n for n in bd.nets if len(bd.pads_of(n))>=2 and not n.startswith('unconnected-') and n not in planes],key=key)
 
     def _refine_net(self, bd, net):
         for pitch in self.options.fallback_pitches:
@@ -246,9 +274,10 @@ class RoutingController:
         vias=sorted((v['net'],v['x'],v['y'],v['d'],v['drill']) for v in bd.vias)
         return hashlib.blake2b(repr((tracks,vias)).encode(),digest_size=16).digest()
 
-    def _candidates(self,bd,net):
+    def _candidates(self,bd,net,action=None):
+        kind=getattr(action,'key',None);action=action or (lambda b:self._connect(b,net))
         own = repr(([t for t in bd.tracks if t['net']==net],[v for v in bd.vias if v['net']==net]))
-        failure_key = (net,bd.pitch,own)
+        failure_key = (net,bd.pitch,own,kind)
         if failure_key in self._static_failures:
             return []
         # Remove dynamic copper only in a temporary scene to find a legal path
@@ -262,8 +291,8 @@ class RoutingController:
             static.replace_copper(own_tracks+[t for t in bd.tracks if t['net'] in protected],
                                   own_vias+[v for v in bd.vias if v['net'] in protected])
             nt,nv=len(static.tracks),len(static.vias)
-            if self.options.late_fanout:self._fanout_net(static,net)
-            ok=self._connect(static,net)
+            if self.options.late_fanout and net not in bd.config['planes']:self._fanout_net(static,net)
+            ok=action(static)
             candidate=static.tracks[nt:]+static.vias[nv:]
             self._activate(bd)
             if not ok or not candidate:
@@ -282,8 +311,9 @@ class RoutingController:
         self._activate(bd)
         return [c for _,_,c in sorted(candidates,key=lambda c:c[:2])]
 
-    def _repair(self,bd,net):
-        for candidate in self._candidates(bd,net):
+    def _repair(self,bd,net,action=None):
+        plane=net in bd.config['planes']
+        for candidate in self._candidates(bd,net,action):
             for slack in self.options.blocker_slacks:
                 if not self._time_left():break
                 gone=self._blockers(bd,net,candidate,slack)
@@ -292,9 +322,13 @@ class RoutingController:
                     continue
                 old_tracks,old_vias=list(bd.tracks),list(bd.vias);before=self._score(bd)
                 bd._rip_ops(gone)
-                if self.options.late_fanout:self._fanout_net(bd,net)
-                first=self._connect(bd,net)
-                for n in affected:self._connect(bd,n)
+                if plane:first=action(bd)
+                else:
+                    if self.options.late_fanout:self._fanout_net(bd,net)
+                    first=self._connect(bd,net)
+                for n in affected:
+                    if n in bd.config['planes']:self._drop_net(bd,n)
+                    else:self._connect(bd,n)
                 after=self._score(bd);plateau=False
                 accept=first and after<before
                 if first and after==before and self._plateaus<self.options.plateau_budget:
@@ -307,6 +341,253 @@ class RoutingController:
                 if accept:return True
                 bd.replace_copper(old_tracks,old_vias)
         return False
+
+    def _drop(self,bd,p):
+        """Connect an SMD pad of a plane net to its plane with a short stub and a via.
+
+        Larger radii are tried only when the short drop fails. A via in the pad is
+        the last resort, and only for pads that can hold the whole via (exposed pads)."""
+        if p['layers']=='all' or bd.has_drop(p,reach=3.):return True
+        width=p.get('escape_width') or bd.width(p['net'])
+        # Like a dog-bone: leave the package outwards so the via does not
+        # sit in the escape channels of the neighbouring pins.
+        outward=self._outward_dirs(bd,p) if self.options.outward_drops else None
+        for dirs in ([outward] if outward else [])+[None]:
+            for r in self.options.plane_drop_radii:
+                if bd.fanout(p['ref'],p['num'],width=width,max_r=r,dirs=dirs):return True
+        if min(p['w'],p['h'])>=bd.via_size(p['net'])[0]+.1:
+            return bd.fanout(p['ref'],p['num'],width=width,max_r=min(p['w'],p['h'])/2,in_pad=True)
+        return False
+
+    @staticmethod
+    def _outward_dirs(bd,p,min_cos=.35):
+        """Unit directions pointing away from the pad's package centre (None for a central pad)."""
+        centres=bd.__dict__.get('_package_centres')
+        if centres is None:
+            groups={}
+            for part in bd.parts.values():
+                if part.placed:
+                    for q in part.pads():groups.setdefault(q['original_ref'],[]).append((q['x'],q['y']))
+            centres=bd._package_centres={k:(sum(x for x,_ in v)/len(v),sum(y for _,y in v)/len(v),len(v))
+                                         for k,v in groups.items()}
+        cx,cy,n=centres.get(p['original_ref'],(p['x'],p['y'],1))
+        vx,vy=p['x']-cx,p['y']-cy;d=math.hypot(vx,vy)
+        if n<2 or d<max(p['w'],p['h'])/2:return None
+        dirs=[(math.cos(a*math.pi/4),math.sin(a*math.pi/4)) for a in range(8)]
+        return [u for u in dirs if (u[0]*vx+u[1]*vy)/d>=min_cos] or None
+
+    def _reserve_escapes(self,bd):
+        """Reserve a short outward corridor at every connected pin of fine-pitch packages for the initial pass,
+        so earlier nets' vias and tracks do not seal later pins in (released before recovery)."""
+        groups={}
+        for part in bd.parts.values():
+            if part.placed:
+                for q in part.pads():
+                    if q['layers']!='all':groups.setdefault(q['original_ref'],[]).append(q)
+        count=0
+        for ref,ps in groups.items():
+            if len(ps)<6:continue
+            spacing=min(min(math.hypot(a['x']-b['x'],a['y']-b['y']) for b in ps if b is not a) for a in ps)
+            if spacing>self.options.fine_pitch_mm:continue
+            cx=sum(q['x'] for q in ps)/len(ps);cy=sum(q['y'] for q in ps)/len(ps)
+            for q in ps:
+                net=q['net']
+                if not net or net.startswith('unconnected-') or len(bd.pads_of(net))<2 and net not in bd.config['planes']:
+                    continue
+                vx,vy=q['x']-cx,q['y']-cy
+                if q['w']>q['h']*1.2 or (q['h']<=q['w']*1.2 and abs(vx)>=abs(vy)):
+                    d=(math.copysign(1,vx),0.);half=q['w']/2;short=q['h']
+                    if abs(vx)<half:continue
+                else:
+                    d=(0.,math.copysign(1,vy));half=q['h']/2;short=q['w']
+                    if abs(vy)<half:continue
+                reach=half+self.options.escape_reserve_mm
+                r=min(q.get('escape_width') or bd.width(net),short)/2
+                layer=geometry.LAYERS[geometry.pad_layers(q)[0]]
+                bd.reserve(net,layer,(q['x'],q['y']),(q['x']+d[0]*reach,q['y']+d[1]*reach),r);count+=1
+        self._event('reserve_escapes',corridors=count)
+
+    def _neck_escape(self,bd,p):
+        """A straight escape stub at the pad's permitted neck-down width (p['escape_width']) from the pad centre
+        to the nearest grid point where the net's class width fits, outwards first. It starts on the pad, so it
+        touches the package courtyard as neck-down rules require."""
+        net=p['net'];ew=p.get('escape_width')
+        if not ew or not net or net in bd.config['planes'] or p['layers']=='all':return False
+        L=geometry.pad_layers(p)[0];layer=geometry.LAYERS[L];full=bd.width(net,layer)
+        if ew>=full:return False
+        G=bd.pitch;R=self.options.max_neck_escape_mm+max(p['w'],p['h'])/2
+        win=bd._win(p['x']-R-G,p['y']-R-G,p['x']+R+G,p['y']+R+G);i0,j0=win[0],win[1];nid=bd.net_id[net]
+        thin=bd._blocked(L,nid,win,bd._reach(net,ew/2,layer))
+        fat=bd._blocked(L,nid,win,bd._reach(net,full/2,layer))
+        outward=self._outward_dirs(bd,p,min_cos=.7) or []
+        dirs=outward+[d for d in self._outward_dirs(bd,p,min_cos=.3) or [] if d not in outward]
+        def cell(x,y):return int(round(y/G))-i0,int(round(x/G))-j0
+        for dx,dy in dirs:
+            step=G/2;n=int(R/step)
+            for k in range(1,n+1):
+                x,y=p['x']+dx*k*step,p['y']+dy*k*step
+                i,j=cell(x,y)
+                if not(0<=i<thin.shape[0] and 0<=j<thin.shape[1]) or thin[i,j]:break
+                if fat[i,j]:continue
+                ex,ey=(j+j0)*G,(i+i0)*G
+                m=max(int(math.hypot(ex-p['x'],ey-p['y'])/(G/2)),1)
+                if any(thin[cell(p['x']+(ex-p['x'])*t/m,p['y']+(ey-p['y'])*t/m)] for t in range(m+1)):break
+                bd.add_track(net,layer,[(p['x'],p['y']),(ex,ey)],ew)
+                return True
+        return False
+
+    def _neck_escapes(self,bd):
+        count=0
+        for part in bd.parts.values():
+            if not part.placed:continue
+            for q in part.pads():
+                if q.get('escape_width') and q['net'] and len(bd.pads_of(q['net']))>=2 and self._neck_escape(bd,q):count+=1
+        self._event('neck_escapes',stubs=count)
+
+    def _drop_net(self,bd,net):
+        ok=True
+        for p in sorted(bd.pads_of(net),key=lambda p:(min(p['w'],p['h']),p['ref'],p['num'])):
+            if not self._time_left():break
+            if not self._drop(bd,p):ok=False
+        return ok
+
+    def _plane_action(self,net,p):
+        def act(b):return self._drop(b,b.parts[p['ref']].pad(p['num']))
+        act.key=('drop',p['ref'],p['num'])
+        return act
+
+    def _recover_plane(self,bd,net):
+        for p in bd.pads_of(net):
+            if not self._time_left():break
+            if p['layers']=='all' or bd.has_drop(p,reach=3.):continue
+            if not self._drop(bd,p):self._repair(bd,net,self._plane_action(net,p))
+
+    def _soft_hook(self,bd,history):
+        """Cost of states that only other nets' routed copper blocks (passable in a negotiated search)."""
+        unit=self.options.soft_cost_mm/bd.pitch;hunit=self.options.history_cost_mm/bd.pitch
+        def soft(static,net,nid,win,Ls,half,blk):
+            i0,j0,i1,j1=win
+            cost=np.zeros(blk.shape,dtype=np.float32)
+            hist=history[:,i0:i1+1,j0:j1+1]
+            self._activate(bd)
+            try:
+                for L in Ls:
+                    wh=half if half is not None else bd.width(net,geometry.LAYERS[L])/2
+                    hard=bd._blocked(L,nid,win,bd._reach(net,wh,geometry.LAYERS[L]))
+                    contested=hard&~blk[L]
+                    cost[L][contested]=unit*(1+hist[L][contested])
+            finally:
+                self._activate(static)
+            cost+=hunit*hist
+            return cost
+        return soft
+
+    def _negotiated_candidate(self,bd,net,history):
+        static=self._fresh(bd.pitch,bd,only_net=net)
+        nt,nv=len(static.tracks),len(static.vias)
+        static.soft_cost=self._soft_hook(bd,history);static.contested=[]
+        try:
+            ok=self._connect(static,net)
+        finally:
+            self._activate(bd)
+        if not ok:return None,[]
+        return static.tracks[nt:]+static.vias[nv:],static.contested
+
+    def _negotiate(self,bd):
+        """Negotiated rip-up and reroute (PathFinder-style) for nets that still fail.
+
+        A failed net searches the static scene, where other nets' routed copper is
+        passable at a cost that grows with a per-cell history of contention. The
+        objects its path crosses are ripped, the net is routed, and the victims are
+        rerouted or queued. Temporary regressions are allowed; the best state is kept."""
+        shape=(geometry.NL,bd.ny,bd.nx)
+        history=np.zeros(shape,dtype=np.float32)
+        best=(self._score(bd),list(bd.tracks),list(bd.vias))
+        rips={};fails={};dead=set();planes=bd.config['planes']
+        for round_ in range(self.options.negotiate_rounds):
+            missing=sorted({p[0] for p in bd.unrouted()}-dead,key=lambda n:(-fails.get(n,0),n))
+            if not missing or not self._time_left():break
+            for net in missing:
+                if not self._time_left():break
+                if net in planes:
+                    self._recover_plane(bd,net);continue
+                if self._connect(bd,net):continue
+                fails[net]=fails.get(net,0)+1
+                candidate,contested=self._negotiated_candidate(bd,net,history)
+                if candidate is None:
+                    dead.add(net);self._event('negotiate_dead',net=net);continue
+                for L,i,j in contested:history[L,i,j]+=1
+                gone=self._blockers(bd,net,candidate,self.options.blocker_slacks[0])
+                affected=sorted({bd.ops[i][3]['net'] for i in gone})
+                if any(rips.get(n,0)>=self.options.max_rips for n in affected):
+                    self._event('negotiate_skip',net=net,affected=affected);continue
+                old_tracks,old_vias=list(bd.tracks),list(bd.vias)
+                bd._rip_ops(gone)
+                ok=self._connect(bd,net)
+                if not ok:
+                    bd.replace_copper(old_tracks,old_vias)
+                    self._event('negotiate',net=net,removed_objects=len(gone),affected=affected,connected=False)
+                    continue
+                for n in affected:
+                    rips[n]=rips.get(n,0)+1
+                    if n in planes:self._drop_net(bd,n)
+                    else:self._connect(bd,n)
+                score=self._score(bd)
+                self._event('negotiate',net=net,removed_objects=len(gone),affected=affected,connected=True,
+                            deficit=score,round=round_)
+                if score<best[0]:best=(score,list(bd.tracks),list(bd.vias))
+        if self._score(bd)>best[0]:bd.replace_copper(best[1],best[2])
+        self._event('negotiated',deficit=best[0],dead=sorted(dead))
+        return bd
+
+    def _fix_clearances(self,bd,rounds=3):
+        """Remove raster near-misses found by the continuous checker: rip one side of each finding (the track
+        first, then the other object, then both), reroute with a wider raster margin, and keep the result only if
+        findings drop without losing connectivity."""
+        from .continuous import check
+        deficit=lambda r:sum(max(0,c-1) for c in r['copper_components'].values())
+        report=check(bd)
+        for _ in range(rounds):
+            if not report['violations']:break   # bounded by rounds, not the routing deadline
+            pairs=[[x for x in (v['a'],v['b']) if x[0] in ('track','via')] for v in report['violations']]
+            pairs=[sorted(x,key=lambda y:y[0]!='track') for x in pairs if x]
+            if not pairs:break
+            lookup=lambda x:(bd.tracks if x[0]=='track' else bd.vias)[x[1]]
+            choices=[[x[0] for x in pairs],[x[-1] for x in pairs],[y for x in pairs for y in x]]
+            old_tracks,old_vias=list(bd.tracks),list(bd.vias);accept=False
+            for choice,repair in [(c,False) for c in choices]+[(choices[0],True)]:
+                for grow in ((.5,.25) if not repair else (.5,)):
+                    items={id(lookup(x)):lookup(x) for x in choice}
+                    nets=sorted({x['net'] for x in items.values()})
+                    bd._rip_ops([i for i,op in enumerate(bd.ops) if op[3] is not None and id(op[3]) in items])
+                    margin=geometry.MARGIN;geometry.MARGIN=margin+bd.pitch*grow
+                    try:
+                        for n in nets:
+                            if n in bd.config['planes']:self._drop_net(bd,n)
+                            elif not self._connect(bd,n) and repair:self._repair(bd,n)
+                    finally:
+                        geometry.MARGIN=margin
+                    checked=check(bd)
+                    accept=len(checked['violations'])<len(report['violations']) and deficit(checked)<=deficit(report)
+                    self._event('fix_clearances',nets=nets,margin_grow=grow,repair=repair,before=len(report['violations']),
+                                after=len(checked['violations']),accepted=accept)
+                    if accept:break
+                    bd.replace_copper(old_tracks,old_vias)
+                if accept:break
+            if not accept:
+                # Last resort: an illegal connection is worse than a missing one. Remove the offending tracks
+                # and let the net stay open (cleanup trims the remains).
+                items={id(lookup(x)):lookup(x) for x in choices[0] if x[0]=='track'}
+                if items:
+                    bd._rip_ops([i for i,op in enumerate(bd.ops) if op[3] is not None and id(op[3]) in items])
+                    checked=check(bd)
+                    accept=not checked['violations'] and deficit(checked)<=deficit(report)+len(items)
+                    self._event('fix_clearances',nets=sorted({x['net'] for x in items.values()}),dropped=True,
+                                before=len(report['violations']),after=len(checked['violations']),accepted=accept)
+                    if not accept:bd.replace_copper(old_tracks,old_vias)
+                if not accept:break
+            report=checked
+        return bd
 
     def _begin(self):
         self.events=[];self._static_failures.clear();self._seen_states.clear();self._plateaus=0
@@ -340,6 +621,8 @@ class RoutingController:
             if not missing or not self._time_left():break
             for net in missing:
                 if not self._time_left():break
+                if net in bd.config['planes']:
+                    self._recover_plane(bd,net);continue
                 if not self._connect(bd,net):self._repair(bd,net)
         if self.options.cleanup:self._cleanup(bd)
         self._event('finished',deficit=self._score(bd),missing=bd.unrouted())
@@ -350,6 +633,17 @@ class RoutingController:
         # The ordinary coarse pass may finish without rebuilding any scene.
         # Allocate a reusable template only when a retry actually needs one.
         bd=self._fresh(self.options.pitch,cache_template=False)
+        if self.options.escape_reserve_mm>0:self._reserve_escapes(bd)
+        if self.options.neck_escapes and self.options.neck_nets_first:
+            # Class-width power escapes between fine pins have the fewest options: route them first.
+            necked=[n for n in self._order(bd) if any(p.get('escape_width') for p in bd.pads_of(n))]
+            for net in necked:
+                if not self._time_left():break
+                if not self._connect(bd,net):bd=self._refine_net(bd,net)
+            self._event('neck_nets',nets=len(necked),deficit=self._score(bd))
+        for net in sorted(bd.config['planes']):
+            self._drop_net(bd,net)
+        if bd.config['planes']:self._event('plane_drops',deficit=self._score(bd))
         for net in self.options.pre_route_nets:
             if net not in bd.nets or not self._time_left():continue
             if self.options.fanout:self._fanout_net(bd,net)
@@ -377,20 +671,25 @@ class RoutingController:
         for n in order:
             if not self._time_left():break
             if not self._connect(bd,n):bd=self._refine_net(bd,n)
+        if self.options.escape_reserve_mm>0:bd.release_reservations()
         self._event('initial',deficit=self._score(bd),missing=bd.unrouted())
         if self.options.cleanup or bd.unrouted():
             if (self.options.fallback_pitches and bd.pitch>min(self.options.fallback_pitches)
                     and (self._refinement_attempted or self.options.verify_at_finest or bd.unrouted())):
                 bd=self._fresh(min(self.options.fallback_pitches),bd)
             if self.options.cleanup:self._cleanup(bd)
+        if self.options.negotiate and bd.unrouted():bd=self._negotiate(bd)
         for iteration in range(self.options.recovery_passes):
             missing=sorted({p[0] for p in bd.unrouted()})
             if not missing or not self._time_left():break
             self._seen_states.add(self._state_key(bd))
             for net in missing:
                 if not self._time_left():break
+                if net in bd.config['planes']:
+                    self._recover_plane(bd,net);continue
                 if self.options.late_fanout:self._fanout_net(bd,net)
                 if not self._connect(bd,net):self._repair(bd,net)
         if self.options.cleanup:self._cleanup(bd)
+        if self.options.fix_clearances:bd=self._fix_clearances(bd)
         self._event('finished',deficit=self._score(bd),missing=bd.unrouted())
         return bd,self.events

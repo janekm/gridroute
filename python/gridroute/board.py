@@ -536,6 +536,52 @@ class Board:
             self._has_via_areas = True
             self._paint(self.no_via, None, win, mask, 1)
 
+    def reserve(self, net, layer, a, b, r):
+        """Reserve the capsule a-b (radius r, mm) on `layer` for `net`: other nets keep their clearance from it, as
+        from copper, but it carries no connectivity (e.g. an escape corridor of a fine-pitch pin). Not copper:
+        replace_copper() keeps it; release_reservations() removes all of them."""
+        self._op('reserve', (net, LAYERS.index(layer), tuple(a), tuple(b), r), None)
+
+    def _do_reserve(self, net, L, a, b, r):
+        nid = self.net_id[net]
+        win, m = self._mask_seg(a[0], a[1], b[0], b[1], r)
+        i0, j0, i1, j1 = win
+        self._touch(win)
+        w = self.occ[L, i0:i1 + 1, j0:j1 + 1]
+        w[m & (w == 0)] = nid      # never marks a clash: a reservation must not block anything already there
+
+    def release_reservations(self):
+        return self._rip_ops([k for k, op in enumerate(self.ops) if op[0] == 'reserve'])
+
+    def add_neck(self, points, width, nets, layers=None, inset=None):
+        """Neck-down region: tracks of `nets` may use `width` (narrower than their class) on `layers` inside the
+        polygon `points`, e.g. a CAD rule letting power tracks touching a fine-pitch package's courtyard be thin.
+        The raster region is inset (default one pitch) so that every thin segment really touches the polygon."""
+        inset = G if inset is None else inset
+        win, mask = self._polygon_mask([dict(points=[tuple(q) for q in points])], -inset)
+        Ls = [LAYERS.index(l) for l in (layers or LAYERS) if l in LAYERS]
+        if mask.any() and Ls:
+            self.__dict__.setdefault('necks', []).append(dict(win=win, mask=mask, layers=Ls, width=width,
+                                                              nets=frozenset(nets)))
+
+    def _neck_widths(self, net, win):
+        """[NL, H, W] neck width per cell of window win for `net` (0 = class width)."""
+        out = None
+        for nk in self.__dict__.get('necks', ()):
+            if net not in nk['nets']:
+                continue
+            a, b = nk['win'], win
+            i0, j0, i1, j1 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+            if i0 > i1 or j0 > j1:
+                continue
+            if out is None:
+                out = np.zeros((NL, b[2] - b[0] + 1, b[3] - b[1] + 1), dtype=np.float32)
+            reg = nk['mask'][i0 - a[0]:i1 - a[0] + 1, j0 - a[1]:j1 - a[1] + 1]
+            for L in nk['layers']:
+                view = out[L, i0 - b[0]:i1 - b[0] + 1, j0 - b[1]:j1 - b[1] + 1]
+                view[reg & ((view == 0) | (view > nk['width']))] = nk['width']
+        return out
+
     def keepout_ring(self, x, y, radius, width, layers=None, clearance=None):
         """An unfilled circular CAD stroke, with its interior still routable."""
         if radius <= 0 or width < 0:
@@ -1055,6 +1101,13 @@ class Board:
                 vok &= ~self._blocked(L, nid, win, vr)
             if _VERIFY:
                 assert np.array_equal(blk, blk_gr) and np.array_equal(vok, vok_gr), ('_route masks', net, win)
+        neck = None if explicit else self._neck_widths(net, win)
+        if neck is not None:
+            for L in Ls:
+                for wn in np.unique(neck[L][neck[L] > 0]):
+                    region = neck[L] == wn
+                    thin = self._blocked(L, nid, win, self._reach(net, float(wn) / 2, LAYERS[L]))
+                    blk[L] &= ~(region & ~thin)
         vok &= ~self._near_smd(win, vd / 2 + 0.1)     # no via-in-pad, not even on the net's own pads
         vok &= ~self._near_holes(win, vdr / 2 + HOLE_TO_HOLE + 0.01)
         vok &= ~self._via_areas(win, vd / 2 + MARGIN)
@@ -1072,10 +1125,24 @@ class Board:
         lc = [1.0] * NL
         for l, m in (layer_cost or {}).items():
             lc[LAYERS.index(l)] = m
-        path = self._astar(blk, vok, src, tgt, Ls, lc, via_cost / G, pref or {}, turn / G, weight, max_exp)
+        # negotiated routing (see router.RoutingController): a hook may make some blocked states passable at a
+        # cost; the search then runs on this board's (static) obstacles plus that cost.
+        soft = self.__dict__.get('soft_cost')
+        cost = None
+        if soft is not None:
+            cost = soft(self, net, nid, win, Ls, half if explicit else None, blk)
+        if cost is not None:
+            path = self._astar_gr_run(blk, vok, src, tgt, Ls, lc, via_cost / G, pref or {}, turn / G, weight, max_exp,
+                                      cost=cost)
+            if path is not None:
+                self.contested = getattr(self, 'contested', []) + [(L, i + i0, j + j0) for L, i, j in path
+                                                                    if cost[L, i, j] > 0]
+        else:
+            path = self._astar(blk, vok, src, tgt, Ls, lc, via_cost / G, pref or {}, turn / G, weight, max_exp)
         if path is None:
             return ('fail',)
-        return ('path', net, path, win, None if self.cls[net] in LAYER_WIDTHS and not explicit else width, (vd, vdr), H, W)
+        return ('path', net, path, win, None if self.cls[net] in LAYER_WIDTHS and not explicit else width, (vd, vdr), H, W,
+                None if neck is None else [float(neck[k]) for k in path])
         return True
 
     def _astar(self, blk, vok, src, tgt, Ls, lc, vcost, pref, turn, weight, max_exp):
@@ -1219,7 +1286,7 @@ class Board:
         _CACHE.put(key, ('S', path))
         return path
 
-    def _astar_gr_run(self, blk, vok, src, tgt, Ls, lc, vcost, pref, turn, weight, max_exp, read_set=False):
+    def _astar_gr_run(self, blk, vok, src, tgt, Ls, lc, vcost, pref, turn, weight, max_exp, read_set=False, cost=None):
         nL, H, W = blk.shape
         HW = H * W
         lok = np.zeros(NL, dtype=bool)
@@ -1227,7 +1294,7 @@ class Board:
         flat = src if src.ndim == 1 else src[:, 0] * HW + src[:, 1] * W + src[:, 2]
         s = _GR.astar(blk, vok, flat, tgt, self._move_costs(Ls, lc, pref), lok,
                       vcost, turn, weight * min(lc[L] for L in Ls), max_exp,
-                      **(dict(budget=_BUDGET, weight=weight, read_set=read_set) if _HYBRID else {}))
+                      cost=cost, **(dict(budget=_BUDGET, weight=weight, read_set=read_set) if _HYBRID else {}))
         if read_set:
             s, tiles = s
             return (None if s is None else
@@ -1249,18 +1316,36 @@ class Board:
             return None
         return list(zip((s // HW).tolist(), (s % HW // W).tolist(), (s % W).tolist()))
 
-    def _emit(self, net, path, win, width, via, H, W):
+    def _emit(self, net, path, win, width, via, H, W, neck=None):
         i0, j0 = win[0], win[1]
         xy = lambda k: ((k[2] + j0) * G, (k[1] + i0) * G)
-        seg = [path[0]]
-        for k in path[1:]:
+        neck = neck or [0.] * len(path)
+        seg, nw = [path[0]], [neck[0]]
+        for k, w in zip(path[1:], neck[1:]):
             if k[0] != seg[-1][0]:
-                self._flush(net, seg, xy, width)
+                self._flush_necked(net, seg, nw, xy, width)
                 self.add_via(net, *xy(k), d=via[0], drill=via[1])
-                seg = [k]
+                seg, nw = [k], [w]
             else:
                 seg.append(k)
-        self._flush(net, seg, xy, width)
+                nw.append(w)
+        self._flush_necked(net, seg, nw, xy, width)
+
+    def _flush_necked(self, net, seg, nw, xy, width):
+        """Flush one layer's run, thin where it lies in a neck region: a thin run extends one cell into the
+        class-width copper on each side (so it still touches the region), class-width runs cover the rest."""
+        if not any(nw):
+            return self._flush(net, seg, xy, width)
+        k = 0
+        while k < len(seg):
+            e = k
+            while e + 1 < len(seg) and nw[e + 1] == nw[k]:
+                e += 1
+            if nw[k]:
+                self._flush(net, seg[max(k - 1, 0):e + 2], xy, nw[k])
+            else:
+                self._flush(net, seg[k:e + 1], xy, width)
+            k = e + 1
 
     def _flush(self, net, seg, xy, width):
         if len(seg) < 2:

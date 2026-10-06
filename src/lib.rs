@@ -276,6 +276,7 @@ unsafe fn gr_astar_impl(
         tbox: (tx0, ty0, tx1, ty1),
         max_exp,
         touched: std::ptr::null_mut(),
+        cost: None,
     };
     let (res, e) = if reference { astar::astar_ref(&p) } else { astar::astar(&p) };
     if !nexp.is_null() {
@@ -319,6 +320,7 @@ pub unsafe extern "C" fn gr_astar_guided(
         tbox: (0, 0, 0, 0),
         max_exp,
         touched: std::ptr::null_mut(),
+        cost: None,
     };
     let t = std::time::Instant::now();
     let mut field = vec![0f32; n];
@@ -373,6 +375,7 @@ pub unsafe extern "C" fn gr_field(
         tbox: (0, 0, 0, 0),
         max_exp: 0,
         touched: std::ptr::null_mut(),
+        cost: None,
     };
     let o = std::slice::from_raw_parts_mut(out, n);
     if backend != BACKEND_CPU {
@@ -402,6 +405,18 @@ pub unsafe extern "C" fn gr_astar_hybrid(
     mcost: *const f32, lay_ok: *const u8, vcost: f32, turn: f32, hmul: f32, tx0: i32, ty0: i32, tx1: i32, ty1: i32,
     max_exp: i64, out: *mut i32, out_cap: i32, budget: i64, weight: f32, info: *mut f64, touched: *mut u8,
 ) -> i32 {
+    gr_astar_hybrid_cost(nl, h, w, blk, vok, tgt, src, nsrc, mcost, lay_ok, vcost, turn, hmul, tx0, ty0, tx1, ty1,
+                         max_exp, out, out_cap, budget, weight, info, touched, std::ptr::null())
+}
+
+/// gr_astar_hybrid with `cost` (may be NULL): float [nl*h*w], an extra cost (>= 0) for entering each state.
+#[no_mangle]
+pub unsafe extern "C" fn gr_astar_hybrid_cost(
+    nl: i32, h: i32, w: i32, blk: *const u8, vok: *const u8, tgt: *const u8, src: *const i32, nsrc: i32,
+    mcost: *const f32, lay_ok: *const u8, vcost: f32, turn: f32, hmul: f32, tx0: i32, ty0: i32, tx1: i32, ty1: i32,
+    max_exp: i64, out: *mut i32, out_cap: i32, budget: i64, weight: f32, info: *mut f64, touched: *mut u8,
+    cost: *const f32,
+) -> i32 {
     let n = nl as usize * h as usize * w as usize;
     let mut p = astar::Problem {
         nl: nl as usize,
@@ -419,6 +434,7 @@ pub unsafe extern "C" fn gr_astar_hybrid(
         tbox: (tx0, ty0, tx1, ty1),
         max_exp: max_exp.min(budget),
         touched,
+        cost: if cost.is_null() { None } else { Some(std::slice::from_raw_parts(cost, n)) },
     };
     let put = |path: Vec<i32>| -> i32 {
         if path.len() > out_cap as usize {

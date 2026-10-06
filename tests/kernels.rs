@@ -91,7 +91,7 @@ fn problem<'a>(nl: usize, h: usize, w: usize, b: &'a [u8], v: &'a [u8], t: &'a [
         }
     }
     gridroute::astar::Problem { nl, h, w, blk: b, vok: v, tgt: t, src: s, mcost: mc, lay_ok: lok, vcost: 7.0, turn: 2.0,
-        hmul: 1.2, tbox: (tx0.max(0), ty0.max(0), tx1.max(0), ty1.max(0)), max_exp: 1 << 30, touched: std::ptr::null_mut() }
+        hmul: 1.2, tbox: (tx0.max(0), ty0.max(0), tx1.max(0), ty1.max(0)), max_exp: 1 << 30, touched: std::ptr::null_mut(), cost: None }
 }
 
 #[test]

@@ -159,6 +159,9 @@ pub struct Problem<'a> {
     /// Optional read set: [ceil(h/32)][ceil(w/32)] bytes, set to 1 for every 32x32 tile holding a cell the search
     /// read (expanded cells and their neighbours, all layers). Null when not wanted.
     pub touched: *mut u8,
+    /// Optional extra cost of entering each state ([nl*h*w], >= 0), e.g. negotiated congestion. `astar_ref`
+    /// ignores it; the reachability check and cost-to-target fields stay admissible because costs are >= 0.
+    pub cost: Option<&'a [f32]>,
 }
 
 pub const TOUCH_TILE: usize = 32;
@@ -406,6 +409,7 @@ fn astar_core<HF: Fn(usize, i32, i32) -> f32>(
         let (h, w) = (p.h as i64, p.w as i64);
         let hw = h * w;
         let (vok, tgt) = (p.vok, p.tgt);
+        let ecost = |s2: usize| p.cost.map_or(0.0, |c| c[s2]);
         let mut off = [0i64; 8];
         for d in 0..8 {
             off[d] = DI[d] as i64 * w + DJ[d] as i64;
@@ -461,7 +465,7 @@ fn astar_core<HF: Fn(usize, i32, i32) -> f32>(
                     continue;
                 }
                 let t = if din != 8 && din as usize != d { p.turn } else { 0.0 };
-                let g2 = cur.g + mrow[d] + t;
+                let g2 = cur.g + mrow[d] + t + ecost(s2);
                 if g2 < d2 {
                     st[s2] = St { d: g2, pd: ((d as u32) << 28) | (s as u32 + 1) };
                     let hh = heur(s2, i2 as i32, j2 as i32);
@@ -477,7 +481,7 @@ fn astar_core<HF: Fn(usize, i32, i32) -> f32>(
                         continue;
                     }
                     let s2 = (l2 * hw + c) as usize;
-                    let g2 = cur.g + p.vcost;
+                    let g2 = cur.g + p.vcost + ecost(s2);
                     if g2 < st[s2].d {
                         st[s2] = St { d: g2, pd: (8 << 28) | (s as u32 + 1) };
                         let f = if via_h {

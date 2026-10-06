@@ -70,6 +70,8 @@ def _load():
         [ctypes.c_float] * 3 + [ctypes.c_int] * 4 + [ctypes.c_int64, _i32p, ctypes.c_int, _i64p]
     so.gr_astar.restype = ctypes.c_int
     so.gr_astar_hybrid.argtypes = so.gr_astar.argtypes[:-1] + [ctypes.c_int64, ctypes.c_float, ctypes.POINTER(ctypes.c_double), _u8p]
+    so.gr_astar_hybrid_cost.argtypes = so.gr_astar_hybrid.argtypes + [_f32p]
+    so.gr_astar_hybrid_cost.restype = ctypes.c_int
     so.gr_hash_tiles.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), _i32p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                  _i32p, ctypes.POINTER(ctypes.c_uint64)]
     so.gr_astar_hybrid.restype = ctypes.c_int
@@ -256,10 +258,11 @@ def island_crop(core, thru, nid, win, seeds, crop):
 
 
 def astar(blk, vok, src, tgt, mcost, lay_ok, vcost, turn, hmul, max_exp, tbox=None, cap=1 << 22, reference=False,
-          budget=None, weight=1.2, read_set=False):
+          budget=None, weight=1.2, read_set=False, cost=None):
     """Multi-layer A* (see src/astar.rs). budget: hybrid search (gr_astar_hybrid): after `budget` expansions an
     open search switches to the GPU cost-to-target field and field-guided A* with `weight`. blk, tgt: bool [nl, h, w]; vok: bool [h, w]; src: int array of flat state
     indices; mcost: float32 [nl, 8]; lay_ok: bool [nl]. tbox: target bounding box (x0, y0, x1, y1), default from tgt.
+    cost: optional float32 [nl, h, w], an extra cost (>= 0) for entering each state (always a hybrid search).
     Returns the flat state indices of the path (source first) or None."""
     nl, h, w = blk.shape
     b8 = np.ascontiguousarray(blk).view(np.uint8)
@@ -274,11 +277,19 @@ def astar(blk, vok, src, tgt, mcost, lay_ok, vcost, turn, hmul, max_exp, tbox=No
     nexp = ctypes.c_int64(0)
     args = (nl, h, w, _ptr(b8, _u8p), _ptr(v8, _u8p), _ptr(t8, _u8p), _ptr(s32, _i32p), len(s32),
             _ptr(mc, _f32p), _ptr(lok, _u8p), float(vcost), float(turn), float(hmul), *tbox, int(max_exp), _ptr(out, _i32p), cap)
+    if cost is not None and not reference and budget is None:
+        budget = max_exp
     if budget is not None and not reference:
         info = (ctypes.c_double * 3)()
         touched = np.zeros(((h + 31) // 32, (w + 31) // 32), dtype=np.uint8) if read_set else None
-        n = _LIB.gr_astar_hybrid(*args, int(budget), float(weight), info,
-                                 _ptr(touched, _u8p) if read_set else None)
+        if cost is not None:
+            c32 = np.ascontiguousarray(cost, dtype=np.float32)
+            assert c32.shape == blk.shape
+            n = _LIB.gr_astar_hybrid_cost(*args, int(budget), float(weight), info,
+                                          _ptr(touched, _u8p) if read_set else None, _ptr(c32, _f32p))
+        else:
+            n = _LIB.gr_astar_hybrid(*args, int(budget), float(weight), info,
+                                     _ptr(touched, _u8p) if read_set else None)
         stats['astar_exp'] += int(info[2])
         stats['guided'] += info[0] == 2
         stats['field_nopath'] += info[0] == 3
@@ -289,7 +300,7 @@ def astar(blk, vok, src, tgt, mcost, lay_ok, vcost, turn, hmul, max_exp, tbox=No
         stats['astar_exp'] += nexp.value
     if n == -2:
         return astar(blk, vok, src, tgt, mcost, lay_ok, vcost, turn, hmul, max_exp, tbox, cap * 8, reference, budget, weight,
-                     read_set)
+                     read_set, cost)
     path = out[:n].copy() if n >= 0 else None
     if read_set and budget is not None and not reference:
         return path, np.argwhere(touched).astype(np.int32)

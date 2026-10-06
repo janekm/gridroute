@@ -153,6 +153,7 @@ impl Coarse {
             tbox: (0, 0, 0, 0),
             max_exp: 0,
             touched: std::ptr::null_mut(),
+            cost: None,
         }
     }
 }

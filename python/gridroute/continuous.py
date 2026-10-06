@@ -3,6 +3,7 @@
 This is a bounded subset of DRC: physical pad connectivity, copper clearance,
 hole-to-copper clearance and hole-to-hole clearance. It does not evaluate arbitrary
 CAD rule expressions, solder-mask webs, board edges, zones or differential pairs.
+Plane nets (configure(planes=...)) count every via and plated pad as joined by the plane.
 A final native CAD validation is still required. Geometry uses millimetres.
 """
 from dataclasses import dataclass
@@ -129,6 +130,11 @@ def check(bd,clearances=True):
             if root(ia)==root(ib):continue
             connectivity_pairs+=1
             if distance(scene[a],scene[b])<=EPS:union(ia,ib)
+    # A plane net's vias and plated holes all reach its plane layer (not modelled as copper here).
+    for net in bd.config.get('planes',{}):
+        anchors=[i for i in grouped.get(net,()) if copper[i].role=='via' or
+                 (copper[i].role=='pad' and copper[i].layers==(1<<len(bd.config['layers']))-1)]
+        for i in anchors[1:]:union(anchors[0],i)
     components={};copper_components={};missing=[]
     for net,ids in grouped.items():
         if net is None or str(net).startswith('unconnected-'):continue
