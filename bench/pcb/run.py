@@ -31,13 +31,16 @@ def run(case,out,options,margin_factor=.5,copper_grow_factor=0.,continuous_check
         factory=lambda pitch:builder(model,pitch=pitch,margin=pitch*.75,copper_grow=pitch*.5)
         bd,continuous,attempts=repair_connectivity(bd,factory,deadline_seconds=min(30.,options.deadline_seconds))
     elapsed=time.perf_counter()-started
+    from gridroute.continuous import check
+    final=check(bd);final_summary=dict(deficit=sum(max(0,c-1) for c in final['copper_components'].values()),
+                                       violations=len(final['violations']),missing_nets=final['missing_nets'])
     bd.save(str(out/'layout.json'),model['size'])
     sources=[ROOT/'model.py',ROOT/'supplied_model.py',ROOT.parents[1]/'python/gridroute/board.py',ROOT.parents[1]/'python/gridroute/router.py',ROOT.parents[1]/'python/gridroute/continuous.py',ROOT/'run.py']
     data={'case':case,'model_sha256':hashlib.sha256((out/'input/model.json').read_bytes()).hexdigest(),
           'source_sha256':{str(p.relative_to(ROOT.parents[1])):hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
           'native':gr.available(),'metal':gr.metal_available(),'device':gr.device_name(),'options':dataclasses.asdict(options),
           'margin_factor':margin_factor,'copper_grow_factor':copper_grow_factor,
-          'events':events,'continuous_check':continuous,'continuous_attempts':attempts,'routing_seconds':elapsed,'missing':bd.unrouted(),
+          'events':events,'final_check':final_summary,'continuous_check':continuous,'continuous_attempts':attempts,'routing_seconds':elapsed,'missing':bd.unrouted(),
           'tracks':len(bd.tracks),'vias':len(bd.vias),'routable_nets':model['routable_nets'],
           'complete_nets':model['routable_nets']-len({p[0] for p in bd.unrouted()}),
           'peak_rss_bytes':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*(1 if sys.platform=='darwin' else 1024),

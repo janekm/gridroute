@@ -39,6 +39,7 @@ class Options:
     max_expansions: int = 4_000_000
     cleanup: bool = True
     power_nets: tuple = ('GND', '+3V3', '+5V', 'VCC')
+    seed: int = 0
     negotiate: bool = False
     negotiate_rounds: int = 30
     soft_cost_mm: float = .5
@@ -136,7 +137,30 @@ class RoutingController:
 
     def _connect(self, bd, net):
         if self.options.neck_escapes:self._neck_net(bd,net)
-        return bd.connect(net,layers=bd.config['layers'],strict=True,max_exp=self.options.max_expansions)
+        ok=bd.connect(net,layers=bd.config['layers'],strict=True,max_exp=self.options.max_expansions)
+        return ok or self._join_components(bd,net)
+
+    def _join_components(self,bd,net):
+        """Board.connect grows one tree from the first pad, so a boxed-in first pad fails the whole net. Join the
+        other copper components to the largest one instead; each pair is tried once, within a bounded budget."""
+        pads=bd.pads_of(net)
+        if len(pads)<2:return True
+        groups={}
+        for p,l in zip(pads,bd.pad_components(net,pads)):groups.setdefault(l,[]).append(p)
+        rest=sorted(groups.values(),key=lambda g:(-len(g),g[0]['ref'],g[0]['num']))
+        attempts=4*len(rest)
+        while len(rest)>1 and attempts>0 and self._time_left():
+            main=rest.pop(0);left=[]
+            for g in rest:
+                if attempts<=0 or not self._time_left():left.append(g);continue
+                attempts-=1
+                if bd._route(net,g,main,layers=bd.config['layers'],max_exp=self.options.max_expansions):main=main+g
+                else:left.append(g)
+            if not left:return True
+            # the leftovers may still join each other (e.g. when the main group itself was boxed in)
+            rest=sorted(left,key=lambda g:(-len(g),g[0]['ref'],g[0]['num']))
+            if len(main)<sum(len(g) for g in rest):rest.append(main)
+        return len(set(bd.pad_components(net,pads)))<2
 
     def _neck_net(self,bd,net):
         """Escape stubs for the net's neck-down pads that have none yet (placed against the current copper)."""
@@ -169,13 +193,16 @@ class RoutingController:
             deficit+=max(0,len(set(labels))-1)
         return deficit
 
-    @staticmethod
-    def _order(bd):
+    def _order(self,bd):
+        seed=self.options.seed
+        def jitter(n):
+            # deterministic per (seed, net): a portfolio explores orders, not run-to-run noise
+            return 1.+int.from_bytes(hashlib.blake2b(f'{seed}:{n}'.encode(),digest_size=4).digest(),'big')/2**32 if seed else 1.
         def key(n):
             ps=bd.pads_of(n)
             span=math.hypot(max(p['x'] for p in ps)-min(p['x'] for p in ps),
                             max(p['y'] for p in ps)-min(p['y'] for p in ps))
-            return (len(ps)>8,span,n)
+            return (len(ps)>8,span*jitter(n),n)
         planes=bd.config['planes']
         return sorted([n for n in bd.nets if len(bd.pads_of(n))>=2 and not n.startswith('unconnected-') and n not in planes],key=key)
 
