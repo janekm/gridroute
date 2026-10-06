@@ -49,6 +49,7 @@ class Options:
     escape_reserve_mm: float = 0.
     outer_layer_cost: float = 1.   # per-mm cost multiplier on the outer (component) layers: >1 sends long runs inside
     pad_entry: str = 'any'          # 'axial': leave/enter SMD pads straight through their middle (Board.pad_entry)
+    pad_entry_halo: float = .1      # axial: straight run beyond the pad edge (mm, at least one grid cell)
     escape_plan: bool = False
     escape_local_mm: float = 6.
     escape_buses: bool = True
@@ -134,7 +135,7 @@ class RoutingController:
                 self._template_bytes+=size
         if bd.config['spec']:
             raise ValueError('RoutingController requires spec=0 because Board configuration is process-global')
-        bd.pad_entry=self.options.pad_entry
+        bd.pad_entry=self.options.pad_entry;bd.pad_entry_halo=self.options.pad_entry_halo
         if source is not None:
             bd.replace_copper([t for t in source.tracks if only_net is None or t['net']==only_net],
                               [v for v in source.vias if only_net is None or v['net']==only_net])

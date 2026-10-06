@@ -955,7 +955,7 @@ class Board:
         centre lines and runs straight for a short halo beyond the pad edge. Blocks the other cells of each pad
         and its halo in blk (this search only; the net's other copper there stays usable) and returns the
         pads for snapping the emitted track onto the exact centre line."""
-        e = max(2 * G, 0.1)
+        e = max(G, self.__dict__.get('pad_entry_halo', 0.1))
         snaps, seen = [], set()
         for p in pads:
             key = (p['ref'], p['num'])

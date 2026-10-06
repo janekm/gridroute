@@ -71,3 +71,39 @@ via LNS.
 5. **Cold AMOLED**: emulate the source planes with dedicated GND/VCC3V3 track layers, or accept that
    this profile is a planes problem.
 6. **Determinism under load**: expansion budgets instead of wall-clock deadlines inside portfolios.
+
+## Round 2: escape planning, pad entry, stack-up (6 October 2026)
+
+AMOLED planes profile, 90 s, four seeds each (net-order jitter), in-process deficit (matches native).
+Seed noise is large (base 31-50), so single runs are not evidence.
+
+| Configuration | Deficits (seeds 0-3) | Mean |
+|---|---|---:|
+| Base (fanout off, late fanout, escape reservations) | 31, 40, 50, 42 | 40.8 |
+| + local buses only | 45, 42, 45, 50 | 45.5 |
+| + escape plan for U10/J3 | 40, 48, 50, 42 | 45.0 |
+| + escape plan, all dense packages | 47, 54, 49, 52 | 50.5 |
+| Base, outer-layer cost x2 / x3 | means | 39.0 / 41.0 |
+| **Base + plane ties (new default)** | 31, 30, 41, 31 | **33.3** |
+| + escape plan U10/J3 | 35, 38, 43, 38 | 38.5 |
+| + axial pad entry (0.1 mm halo) | 37, 42, 37, 41 | 39.3 |
+| + axial pad entry (one-cell halo) | 37, 39, 38, 35 | 37.3 |
+| 8 layers (In5/In6 signal), plane ties | 16, 25, 38, 26 | 26.3 |
+
+Native KiCad, best candidates, all with zero new errors: 6 layers 30, 8 layers 16, 6 layers with
+axial entry 35.
+
+Findings:
+
+- Escape planning works mechanically (dog-bones with staggered and between-row vias, crossing-free
+  buses), but completion does not improve: U10/J3 pins fail later, when their long runs to U1 are
+  sealed off, not at the package. Kept as `escape_plan`, off.
+- The router already puts a lot of length on inner layers (base 434 mm inner vs reference 701 mm);
+  segment counts on F/B were misleading. A higher outer-layer cost moves length inward without
+  helping completion.
+- The biggest win was plane pads without room for a via: they are now tied to a neighbouring pad's
+  drop (`_tie_to_dropped`), as a designer would.
+- Two more signal layers help (mean 33 -> 26, best 30 -> 16) but do not finish the board: the
+  remaining failures are pin access at U10, U3, J3 and J1 plus the I2C nets.
+- Axial pad entry costs about 4 connections on this board. The continuous checker flags the RF net at
+  U1 (class clearance), which the project's courtyard rule permits natively.
