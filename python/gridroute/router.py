@@ -52,6 +52,9 @@ class Options:
     max_neck_escape_mm: float = 1.5
     fine_pitch_mm: float = .65
     fix_clearances: bool = True
+    join_components: bool = True
+    polish_via_cost_mm: float = 0.
+    polish_seconds: float = 20.
     plane_drop_radii: tuple = (2., 2.9)  # within unrouted()'s 3 mm drop window
 
 
@@ -138,7 +141,10 @@ class RoutingController:
     def _connect(self, bd, net):
         if self.options.neck_escapes:self._neck_net(bd,net)
         ok=bd.connect(net,layers=bd.config['layers'],strict=True,max_exp=self.options.max_expansions)
-        return ok or self._join_components(bd,net)
+        # Two components: connect already tried that pair. Refinement boards are too costly to search twice.
+        if (ok or not self.options.join_components or bd.pitch<self.options.pitch
+                or len(set(bd.pad_components(net)))<3):return ok
+        return self._join_components(bd,net)
 
     def _join_components(self,bd,net):
         """Board.connect grows one tree from the first pad, so a boxed-in first pad fails the whole net. Join the
@@ -164,6 +170,7 @@ class RoutingController:
 
     def _neck_net(self,bd,net):
         """Escape stubs for the net's neck-down pads that have none yet (placed against the current copper)."""
+        if not bd.__dict__.get('necks'):return   # only boards with neck-down rules (Board.add_neck)
         pads=[p for p in bd.pads_of(net) if p.get('escape_width') and p['layers']!='all']
         if not pads or net in bd.config['planes'] or bd._net_complete(net):return
         starts={tuple(t['pts'][0]) for t in bd.tracks if t['net']==net}
@@ -616,6 +623,21 @@ class RoutingController:
             report=checked
         return bd
 
+    def _polish(self,bd):
+        """Human-like cleanup of complete nets: reroute each against the finished board with a via cost and keep
+        it only if it is complete and cheaper (Board.relax), within a time budget of its own."""
+        started=time.perf_counter();nets=[n for n in self._order(bd) if bd._net_complete(n)]
+        vias,length=len(bd.vias),sum(math.dist(a,b) for t in bd.tracks for a,b in zip(t['pts'],t['pts'][1:]))
+        saved=[]
+        for n in sorted(nets,key=lambda n:-sum(1 for v in bd.vias if v['net']==n)):
+            if time.perf_counter()-started>self.options.polish_seconds:break
+            if not any(v['net']==n for v in bd.vias):continue
+            saved+=bd.relax(nets=[n],passes=1,via_cost=self.options.polish_via_cost_mm,layers=bd.config['layers'])
+        self._event('polish',nets=len(saved),vias_before=vias,vias_after=len(bd.vias),
+                    length_before=round(length,2),
+                    length_after=round(sum(math.dist(a,b) for t in bd.tracks for a,b in zip(t['pts'],t['pts'][1:])),2))
+        return bd
+
     def _begin(self):
         self.events=[];self._static_failures.clear();self._seen_states.clear();self._plateaus=0
         self._refinement_attempted=False
@@ -661,7 +683,7 @@ class RoutingController:
         # Allocate a reusable template only when a retry actually needs one.
         bd=self._fresh(self.options.pitch,cache_template=False)
         if self.options.escape_reserve_mm>0:self._reserve_escapes(bd)
-        if self.options.neck_escapes and self.options.neck_nets_first:
+        if self.options.neck_escapes and self.options.neck_nets_first and bd.__dict__.get('necks'):
             # Class-width power escapes between fine pins have the fewest options: route them first.
             necked=[n for n in self._order(bd) if any(p.get('escape_width') for p in bd.pads_of(n))]
             for net in necked:
@@ -717,6 +739,7 @@ class RoutingController:
                 if self.options.late_fanout:self._fanout_net(bd,net)
                 if not self._connect(bd,net):self._repair(bd,net)
         if self.options.cleanup:self._cleanup(bd)
+        if self.options.polish_via_cost_mm>0:bd=self._polish(bd)
         if self.options.fix_clearances:bd=self._fix_clearances(bd)
         self._event('finished',deficit=self._score(bd),missing=bd.unrouted())
         return bd,self.events
