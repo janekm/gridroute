@@ -29,7 +29,7 @@ def render(out_dir,png=None,scale=24,box=None,only=None):
         pt=lambda p:(ox+p[0]*scale,oy+p[1]*scale)
         d.text((10,6),L,fill='#e8f0f6')
         d.polygon([pt(p) for p in m['outline']],fill='#182c34')
-        li=layers.index(L);col=COLORS[0] if li==0 else COLORS[-1] if li==len(layers)-1 else COLORS[li]
+        li=layers.index(L);col=COLORS[0] if li==0 else COLORS[-1] if li==len(layers)-1 else COLORS[li%(len(COLORS)-1)]
         for p in m['pads']:
             on=layers if p['layers']=='all' else [layers[0] if p['layers']=='F' else layers[-1]]
             if L not in on:continue
