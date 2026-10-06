@@ -160,3 +160,26 @@ beyond the escape (inner-layer access around the via, or the far end), not at th
 
 A raster near-miss of 1.4 um that rerouting could not fix is now repaired by nudging the segment's
 interior corners away by the shortfall (`_nudge_near_misses`).
+
+## Round 5: held escapes on other PCBench boards (6 October 2026)
+
+Native suite, 30 s, continuous check, one run per case. A = defaults; B = `escape_hold` (every pin,
+until routed); C = `escape_hold` released after the first pass (`escape_hold_until='initial'`).
+Unconnected items, all with zero new errors:
+
+| Board | Layers | A | B | C |
+|---|---:|---:|---:|---:|
+| rxadc_14 | 4 | 7 | 2 | **1** |
+| 1Bitsy | 4 | pass | 1 | pass |
+| SmartWatch / TinyTracker | 4 | pass | pass | pass |
+| USBee32-S2 | 4 | 6 | 6 | 6 |
+| ESP32-board | 2 | 5 | 4 | 4 |
+| tinyFISH | 2 | 18 | 21 | 17 |
+| miniboard-stm32f0 | 2 | 3 | 5 | 5 |
+| OtterPill | 2 | 31 | 44 | 47 |
+| AS5043, ESP32-Module, Hardware_Playground, Hornbill, TMC261 | 2 | unchanged | | |
+
+On 2-layer boards a via only flips sides while held sites and corridors take scarce surface (OtterPill:
+0.8 mm vias, 10 sites placed, 60 pins on long corridors, first pass 40 -> 49). Held escapes are now off
+below 4 copper layers (`escape_hold_min_layers`). Seeded (4 seeds, run.py, no continuous repair):
+rxadc A 6.25 -> C 2.75 (B 4.0); 1Bitsy A 1.75, C 2.0; AMOLED planes C 33.0 vs 32.8.

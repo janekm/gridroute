@@ -54,6 +54,7 @@ class Options:
     escape_hold: bool = False        # reserve dense pins' escapes (corridor, planned via site) until their net connects
     escape_hold_every_pin: bool = True   # with escape_hold: an access via site for every pin, not just layer changes
     escape_hold_until: str = 'routed'    # 'routed': until each net connects; 'initial': at most through the first pass
+    escape_hold_min_layers: int = 4      # held escapes need layers to escape to: off on boards with fewer copper layers
     escape_local_mm: float = 6.
     escape_buses: bool = True
     escape_dogbones: bool = True
@@ -162,7 +163,7 @@ class RoutingController:
         if (not ok and self.options.join_components and not getattr(self,'_refining',False)
                 and len(set(bd.pad_components(net)))>=3):
             ok=self._join_components(bd,net)
-        if ok and self.options.escape_hold and bd.reservations([net]):bd.release_reservations([net])
+        if ok and getattr(self,'_hold',False) and bd.reservations([net]):bd.release_reservations([net])
         return ok
 
     def _join_components(self,bd,net):
@@ -471,7 +472,7 @@ class RoutingController:
                     d=(0.,math.copysign(1,vy));half=q['h']/2;short=q['w']
                     if abs(vy)<half:continue
                 reach=half+self.options.escape_reserve_mm
-                if self.options.escape_hold:
+                if getattr(self,'_hold',False):
                     # a pin without a held via site keeps a way out of the whole package outline
                     out=[q2 for part in bd.parts.values() if part.placed for q2 in part.pads() if q2['original_ref']==ref]
                     edge=(max(o['x']+o['w']/2 for o in out)-q['x'] if d[0]>0 else q['x']-min(o['x']-o['w']/2 for o in out)) if d[0] else \
@@ -723,6 +724,7 @@ class RoutingController:
         return bd
 
     def _begin(self):
+        self._hold=False
         self.events=[];self._static_failures.clear();self._seen_states.clear();self._plateaus=0
         self._refinement_attempted=False
         self._templates.clear();self._template_bytes=0
@@ -767,7 +769,9 @@ class RoutingController:
         # Allocate a reusable template only when a retry actually needs one.
         bd=self._fresh(self.options.pitch,cache_template=False)
         packages={}
-        if self.options.escape_hold:
+        hold=self._hold=(self.options.escape_hold and
+                         len(bd.config['layers'])+len(set(bd.config['planes'].values()))>=self.options.escape_hold_min_layers)
+        if hold:
             # Every dense pin's escape, planned together before anything else is routed: neck-down power
             # stubs and plane dog-bones as copper, signal via sites reserved until their net connects.
             # Power nets, plane drops and other signals then route around the reservations.
@@ -828,8 +832,8 @@ class RoutingController:
         for n in order:
             if not self._time_left():break
             if not self._connect(bd,n):bd=self._refine_net(bd,n)
-        if self.options.escape_reserve_mm>0 and not self.options.escape_hold:bd.release_reservations()
-        if self.options.escape_hold and self.options.escape_hold_until=='initial' and bd.reservations():
+        if self.options.escape_reserve_mm>0 and not hold:bd.release_reservations()
+        if hold and self.options.escape_hold_until=='initial' and bd.reservations():
             # recovery rips real copper to make room; reservations of still-failing nets would only fence it in
             self._event('released',nets=sorted({op[1][0] for op in bd.reservations()}),count=bd.release_reservations())
         self._event('initial',deficit=self._score(bd),missing=bd.unrouted())
