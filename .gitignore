@@ -1,3 +1,4 @@
 target/
 __pycache__/
 examples/demo_layout.json
+bench/pcb/cases/

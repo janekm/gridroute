@@ -43,7 +43,8 @@ def _env(name, default):
 
 def configure(layers=('F.Cu', 'B.Cu'), planes=None, pitch=0.05, classes=None, net_class=None, layer_widths=None,
               edge_clear=0.3, hole_clear=0.25, pad_grow=0.025, margin=0.025, search=None, budget=None, field=None,
-              accel=None, spec=None, cache=None, cache_name='', salt=b''):
+              accel=None, spec=None, cache=None, cache_name='', salt=b'', hole_to_hole=0.25, layer_clearances=None,
+              copper_grow=0.):
     """Set the board rules and router options for this process (call before creating a Board).
 
     layers: signal layer names, top first. planes: {net: plane layer} for nets carried by planes (their pads get
@@ -57,17 +58,20 @@ def configure(layers=('F.Cu', 'B.Cu'), planes=None, pitch=0.05, classes=None, ne
     or 'off'; default ~/Library/Caches/gridroute/<cache_name hash>-routes.pkl), salt (bytes mixed into cache keys,
     e.g. the caller's rule sources, so changing them starts a fresh cache)."""
     global LAYERS, NL, G, CLASSES, CLEAR, VIA_D, VIA_DRILL, PLANES, EDGE_CLEAR, HOLE_CLEAR, LAYER_WIDTHS, PAD_GROW
-    global MARGIN, _net_class, _GR, _VERIFY, _HYBRID, REPRODUCE, _BUDGET, _FIELD, _CACHE, _SALT, _SPEC_N, _SPEC_POOL
+    global MARGIN, HOLE_TO_HOLE, LAYER_CLEARANCES, COPPER_GROW, _net_class, _GR, _VERIFY, _HYBRID, REPRODUCE, _BUDGET, _FIELD, _CACHE, _SALT, _SPEC_N, _SPEC_POOL, _CONFIG
     LAYERS = list(layers)
     NL = len(LAYERS)
     G = pitch
     CLASSES = dict(classes or {'Default': (0.15, 0.15, 0.5, 0.3)})
-    CLEAR = CLASSES['Default'][1]
+    CLEAR = min(r[1] for r in CLASSES.values())
     VIA_D, VIA_DRILL = CLASSES['Default'][2], CLASSES['Default'][3]
     PLANES = dict(planes or {})
     EDGE_CLEAR, HOLE_CLEAR = edge_clear, hole_clear
+    HOLE_TO_HOLE = hole_to_hole
     LAYER_WIDTHS = {k: dict(v) for k, v in (layer_widths or {}).items()}
+    LAYER_CLEARANCES = dict(layer_clearances or {})
     PAD_GROW, MARGIN = pad_grow, margin
+    COPPER_GROW = copper_grow
     _net_class = net_class or (lambda n: 'Default')
     accel = accel or _env('ACCEL', 'on')
     search = search or _env('SEARCH', 'hybrid')
@@ -87,7 +91,7 @@ def configure(layers=('F.Cu', 'B.Cu'), planes=None, pitch=0.05, classes=None, ne
         h.update(open(os.path.abspath(__file__), 'rb').read())
         h.update(salt)
         h.update(repr((LAYERS, PLANES, G, CLASSES, LAYER_WIDTHS, EDGE_CLEAR, HOLE_CLEAR, PAD_GROW, MARGIN, _HYBRID,
-                       _BUDGET, _FIELD, _GR.__file__, os.path.getmtime(_GR._LIB._name))).encode())
+                       HOLE_TO_HOLE, LAYER_CLEARANCES, COPPER_GROW, _BUDGET, _FIELD, _GR.__file__, os.path.getmtime(_GR._LIB._name))).encode())
         path = where or os.path.join(os.path.expanduser('~/Library/Caches/gridroute'),
                                      hashlib.sha1(cache_name.encode()).hexdigest()[:12] + '-routes.pkl')
         _CACHE, _SALT = _GR.SearchCache(path), h.hexdigest()
@@ -95,6 +99,11 @@ def configure(layers=('F.Cu', 'B.Cu'), planes=None, pitch=0.05, classes=None, ne
         _SPEC_POOL.shutdown(wait=True)
     _SPEC_N = int(spec if spec is not None else _env('SPEC', '4')) if _GR is not None else 0
     _SPEC_POOL = ThreadPoolExecutor(_SPEC_N) if _SPEC_N > 0 else None
+    _CONFIG = dict(layers=list(LAYERS), planes=dict(PLANES), pitch=G, classes=dict(CLASSES),
+                   net_class=_net_class, layer_widths=LAYER_WIDTHS, edge_clear=EDGE_CLEAR, hole_clear=HOLE_CLEAR,
+                   pad_grow=PAD_GROW, margin=MARGIN, search=search, budget=_BUDGET, field=_FIELD, accel=accel,
+                   spec=_SPEC_N, cache=where, cache_name=cache_name, salt=salt, hole_to_hole=HOLE_TO_HOLE,
+                   layer_clearances=LAYER_CLEARANCES,copper_grow=COPPER_GROW)
 
 
 def net_class(net):
@@ -131,11 +140,23 @@ class Part:
         out = []
         for p in self.fp['pads']:
             dx, dy = rot(p['x'], p['y'], self.rot)
-            r = (p['rot'] + self.rot) % 180
-            assert min(abs(r), abs(r - 90), abs(r - 180)) < 1, (self.ref, p['num'], r)
-            w, h = (p['h'], p['w']) if abs(r - 90) < 1 else (p['w'], p['h'])
+            r = (p['rot'] + p.get('angle', 0.) + self.rot) % 180
+            orthogonal = min(abs(r), abs(r - 90), abs(r - 180)) < 1e-6
+            swap = orthogonal and abs(r - 90) < 1e-6
+            w, h = (p['h'], p['w']) if swap else (p['w'], p['h'])
+            dw, dh = p.get('drill_w', p['drill']), p.get('drill_h', p['drill'])
+            if swap:
+                dw, dh = dh, dw
             out.append(dict(num=p['num'], x=self.x + dx, y=self.y + dy, w=w, h=h, shape=p['shape'],
                             layers=p['layers'], npth=p['npth'], drill=p['drill'], ref=self.ref, rr=p.get('rr', 0.0),
+                            drill_w=dw, drill_h=dh, angle=0. if orthogonal else r,
+                            original_ref=p.get('original_ref',self.ref), original_pin=p.get('original_pin',p['num']),
+                            escape_width=p.get('escape_width'), mask_layers=p.get('mask_layers',()),
+                            mask_margin=p.get('mask_margin',0.),mask_margins=p.get('mask_margins',{}),
+                            clearance=p.get('clearance',0.),
+                            polygons=[dict(points=[tuple(a+b for a,b in zip(rot(x,y,self.rot),(self.x+dx,self.y+dy))) for x,y in poly['points']],
+                                           holes=[[tuple(a+b for a,b in zip(rot(x,y,self.rot),(self.x+dx,self.y+dy))) for x,y in hole] for hole in poly.get('holes',[])])
+                                      for poly in p.get('polygons',[])],
                             net=self.net_of.get((self.ref, p['num'])) if p['num'] else None))
         return out
 
@@ -186,6 +207,30 @@ def _seg_dist(x, y, a, b):
     return math.hypot(x - a[0] - t * vx, y - a[1] - t * vy)
 
 
+def _pad_distance(x, y, p):
+    """Distance from a point to the actual pad copper, not its bounding box."""
+    if p['shape']=='polygon':
+        def inside(ring):
+            value=False
+            for (ax,ay),(bx,by) in zip(ring,ring[1:]+ring[:1]):
+                if (ay>y)!=(by>y) and x<(bx-ax)*(y-ay)/(by-ay)+ax:value=not value
+            return value
+        distance=math.inf
+        for poly in p['polygons']:
+            if inside(poly['points']) and not any(inside(h) for h in poly.get('holes',[])):return 0.
+            for ring in [poly['points']]+poly.get('holes',[]):
+                distance=min(distance,min(_seg_dist(x,y,a,b) for a,b in zip(ring,ring[1:]+ring[:1])))
+        return distance
+    if p['shape'] in ('circle', 'oval'):
+        rr = min(p['w'], p['h']) / 2
+    else:
+        rr = min(p.get('rr', 0.), p['w'] / 2, p['h'] / 2)
+    dx, dy = rot(x - p['x'], y - p['y'], -p.get('angle', 0.))
+    dx = max(abs(dx) - p['w'] / 2 + rr, 0.)
+    dy = max(abs(dy) - p['h'] / 2 + rr, 0.)
+    return max(0., math.hypot(dx, dy) - rr)
+
+
 def dedup(pts, eps=1e-6):
     out = [pts[0]]
     for p in pts[1:]:
@@ -206,17 +251,22 @@ class Board:
         'oval'), rr (corner radius), layers ('all' through-hole, 'F' top or 'B' bottom), npth, drill, in footprint
         coordinates at 0 degrees (gridroute.kicad.dump_footprints writes this from KiCad libraries)."""
         self.w, self.h = w, h
+        self.config = dict(_CONFIG)
+        self.pitch = G
         self.nx, self.ny = int(math.ceil(w / G)) + 1, int(math.ceil(h / G)) + 1
         self.occ = np.zeros((NL, self.ny, self.nx), dtype=np.int16)
         self.core = np.zeros((NL, self.ny, self.nx), dtype=np.int16)
         self.thru = np.zeros((self.ny, self.nx), dtype=np.int16)
         self.smd = np.zeros((self.ny, self.nx), dtype=np.int16)      # SMD pad copper (either side): no vias
+        self.no_via = np.zeros((self.ny, self.nx), dtype=np.int16)   # explicit via-only rule areas
+        self._has_via_areas = False
         self.phantom = np.zeros((self.ny, self.nx), dtype=bool)      # temporary F.Cu / via obstacles (templates)
         self.comps, self.pin_net = comps, pin_net
         self.fpdefs = footprints
         self.nets = sorted(set(self.pin_net.values()))
         self.net_id = {n: i + 1 for i, n in enumerate(self.nets)}
         self.cls = {n: net_class(n) for n in self.nets}
+        self._id_clearance = {self.net_id[n]:CLASSES[c][1] for n,c in self.cls.items()}
         self.parts = {r: Part(r, self.fpdefs[c['footprint']], self.pin_net) for r, c in self.comps.items()}
         self.tracks, self.vias = [], []
         self.keepouts, self.rule_keepouts, self.texts, self.rects, self.zones = [], [], [], [], []
@@ -233,7 +283,7 @@ class Board:
         self._edges()
 
     def _edges(self):
-        e = int(round((EDGE_CLEAR - CLEAR) / G)) + 1
+        e = max(1,int(round((EDGE_CLEAR - CLEAR) / G)) + 1)
         for a in (self.occ,):
             a[:, :e, :] = KEEP
             a[:, -e:, :] = KEEP
@@ -320,6 +370,19 @@ class Board:
         return win, dx * dx + dy * dy <= r * r + 1e-9
 
     def _pad_mask(self, p, grow):
+        if p['shape']=='polygon':return self._polygon_mask(p['polygons'],grow)
+        if p.get('angle', 0.):
+            a = math.radians(p['angle'])
+            c, s = math.cos(a), math.sin(a)
+            w, h = p['w'] / 2, p['h'] / 2
+            bx, by = abs(c) * w + abs(s) * h + grow, abs(s) * w + abs(c) * h + grow
+            win = self._win(p['x'] - bx, p['y'] - by, p['x'] + bx, p['y'] + by)
+            ys, xs = self._grid(win)
+            x, y = xs - p['x'], ys - p['y']
+            u, v = x * c - y * s, x * s + y * c
+            rr = min(w, h) if p['shape'] in ('circle', 'oval') else min(p.get('rr', 0.), w, h)
+            dx, dy = np.maximum(np.abs(u) - w + rr, 0), np.maximum(np.abs(v) - h + rr, 0)
+            return win, dx * dx + dy * dy <= (rr + grow) ** 2 + 1e-9
         if p['shape'] in ('circle', 'oval'):
             rr = min(p['w'], p['h']) / 2
             ax, ay = (p['w'] / 2 - rr, 0) if p['w'] >= p['h'] else (0, p['h'] / 2 - rr)
@@ -335,6 +398,26 @@ class Board:
             return win, dx * dx + dy * dy <= (rr + grow) ** 2 + 1e-9
         return self._mask_rect(p['x'] - p['w'] / 2, p['y'] - p['h'] / 2, p['x'] + p['w'] / 2, p['y'] + p['h'] / 2, grow)
 
+    def _polygon_mask(self, polygons, grow=0.):
+        points=[q for poly in polygons for q in poly['points']]
+        win=self._win(min(x for x,y in points)-max(grow,0),min(y for x,y in points)-max(grow,0),
+                      max(x for x,y in points)+max(grow,0),max(y for x,y in points)+max(grow,0))
+        ys,xs=self._grid(win);shape=(win[2]-win[0]+1,win[3]-win[1]+1)
+        result=np.zeros(shape,dtype=bool)
+        for poly in polygons:
+            inside=np.zeros(shape,dtype=bool);distance=np.full(shape,np.inf)
+            for ri,ring in enumerate([poly['points']]+list(poly.get('holes',[]))):
+                ring_inside=np.zeros(shape,dtype=bool)
+                for (ax,ay),(bx,by) in zip(ring,ring[1:]+ring[:1]):
+                    if by!=ay:ring_inside^=((ay>ys)!=(by>ys)) & (xs<(bx-ax)*(ys-ay)/(by-ay)+ax)
+                    vx,vy=bx-ax,by-ay;den=vx*vx+vy*vy
+                    t=np.clip(((xs-ax)*vx+(ys-ay)*vy)/den,0,1) if den else 0
+                    distance=np.minimum(distance,(xs-ax-t*vx)**2+(ys-ay-t*vy)**2)
+                if ri==0:inside=ring_inside
+                else:inside &= ~ring_inside
+            result |= (inside|(distance<=grow*grow+1e-12)) if grow>=0 else (inside&(distance>=grow*grow))
+        return win,result
+
     # ------------------------------------------------------------------ placement
     def place(self, ref, x, y, rot=0.0, gap=0.15):
         """Place a footprint; courtyards closer than `gap` to an already placed part are recorded in self.overlaps."""
@@ -343,6 +426,7 @@ class Board:
         rot += self.turn.get(ref, 0)
         p.x, p.y, p.rot, p.placed = x, y, rot % 360, True
         self._pad_index = None
+        self._hole_pads = None
         a = p.courtyard()
         for r, q in self.parts.items():
             if q.placed and r != ref:
@@ -354,46 +438,68 @@ class Board:
         return p
 
     def _do_pad(self, pad, nid):
+        required=max(HOLE_CLEAR,pad.get('clearance',0.))
         if pad['npth']:
-            win, m = self._mask_seg(pad['x'], pad['y'], pad['x'], pad['y'], pad['drill'] / 2 + HOLE_CLEAR - CLEAR + PAD_GROW)
+            hole = dict(pad, shape='oval', w=pad.get('drill_w', pad['drill']), h=pad.get('drill_h', pad['drill']))
+            win, m = self._pad_mask(hole, max(0.,required - CLEAR) + PAD_GROW)
             for L in range(NL):
                 self._paint(self.occ, L, win, m, KEEP)
             return
         Ls = pad_layers(pad)
-        win, m = self._pad_mask(pad, PAD_GROW + self.extra(pad['net']))
+        surplus=max(self.extra(pad['net']),pad.get('clearance',0.)-CLEAR,0.)
+        win, m = self._pad_mask(pad, PAD_GROW + surplus)
         cwin, cm = self._pad_mask(pad, 0.0)
         for L in Ls:
             self._paint(self.occ, L, win, m, nid)
             self._paint(self.core, L, cwin, cm, nid)
         if pad['layers'] == 'all':
             self._paint(self.thru, None, cwin, cm, nid)
+            hole = dict(pad, shape='oval', w=pad.get('drill_w', pad['drill']), h=pad.get('drill_h', pad['drill']))
+            hwin, hm = self._pad_mask(hole, max(0., required - CLEAR) + PAD_GROW)
+            for L in Ls:
+                self._paint(self.occ, L, hwin, hm, nid)
         else:
             self._paint(self.smd, None, cwin, cm, 1)
+        # Some footprints expose an aperture on the opposite side to their
+        # copper (castellated/edge connectors, or legacy footprint mistakes).
+        # A foreign trace through that aperture becomes exposed copper and a
+        # solder-mask bridge. Preserve it as an obstacle, never connectivity.
+        for layer in pad.get('mask_layers',()):
+            L = LAYERS.index(layer)
+            margin=pad.get('mask_margins',{}).get(layer,pad.get('mask_margin',0.))
+            if L not in Ls or margin>CLEAR+surplus:
+                mwin, mm = self._pad_mask(pad, max(0.,margin-CLEAR) + PAD_GROW)
+                self._paint(self.occ,L,mwin,mm,nid)
 
     # ------------------------------------------------------------------ copper
     def add_track(self, net, layer, pts, width=None):
         width = width or self.width(net, layer)
-        t = dict(net=net, layer=layer, width=round(width, 4), pts=[[round(x, 4), round(y, 4)] for x, y in pts])
+        # CAD units are nanometres. Four-decimal rounding can put an imperial
+        # class width below its actual minimum (e.g. .37592 -> .3759 mm).
+        width=math.ceil(width*1e6-1e-6)/1e6
+        pts=[[round(x,6),round(y,6)] for x,y in pts]
+        t = dict(net=net, layer=layer, width=width, pts=pts)
         self._op('track', (net, LAYERS.index(layer), [tuple(q) for q in pts], width), t)
         self.tracks.append(t)
 
     def _do_track(self, net, L, pts, width):
         nid = self.net_id[net]
         for a, b in zip(pts, pts[1:]):
-            self._paint_seg(self.occ, L, a, b, width / 2 + self.extra(net), nid)
+            self._paint_seg(self.occ, L, a, b, width / 2 + self.extra(net) + COPPER_GROW, nid)
             self._paint_seg(self.core, L, a, b, width / 2, nid)
 
     def add_via(self, net, x, y, d=None, drill=None):
         d0, dr0 = self.via_size(net)
         d, drill = d or d0, drill or dr0
-        v = dict(net=net, x=round(x, 4), y=round(y, 4), d=d, drill=drill)
-        self._op('via', (net, x, y, d), v)
+        v = dict(net=net, x=round(x, 6), y=round(y, 6), d=d, drill=drill)
+        self._op('via', (net, v['x'], v['y'], d, drill), v)
         self.vias.append(v)
 
-    def _do_via(self, net, x, y, d):
+    def _do_via(self, net, x, y, d, drill):
         nid = self.net_id[net]
         for L in range(NL):
-            self._paint_seg(self.occ, L, (x, y), (x, y), d / 2 + self.extra(net), nid)
+            reach = max(d / 2 + self.extra(net), drill / 2 + HOLE_CLEAR - CLEAR)
+            self._paint_seg(self.occ, L, (x, y), (x, y), reach + COPPER_GROW, nid)
             self._paint_seg(self.core, L, (x, y), (x, y), d / 2, nid)
         self._paint_seg(self.thru, None, (x, y), (x, y), d / 2, nid)
 
@@ -408,6 +514,47 @@ class Board:
         win, m = self._mask_rect(x0, y0, x1, y1)
         for l in layers:
             self._paint(self.occ, LAYERS.index(l), win, m, KEEP)
+
+    def keepout_polygon(self, points, layers=None, holes=(), tracks=True, vias=True, clearance=None):
+        """Preserve a CAD copper obstacle or rule area, including polygon holes.
+
+        Track exclusions enter the clearance raster. Via-only areas are kept
+        separately, so they do not unnecessarily block legal surface traces.
+        """
+        self._op('polygon', (tuple(map(tuple, points)), tuple(layers or LAYERS),
+                             tuple(tuple(map(tuple, h)) for h in holes), tracks, vias, clearance))
+
+    def _do_polygon(self, points, layers, holes, tracks, vias, clearance=None):
+        polygons=[dict(points=points,holes=holes)]
+        win,mask=self._polygon_mask(polygons,PAD_GROW+max(0.,(clearance or 0.)-CLEAR))
+        if tracks:
+            cwin,cm=self._polygon_mask(polygons,0.)
+            for layer in layers:
+                self._paint(self.occ, LAYERS.index(layer), win, mask, KEEP)
+                self._paint(self.core, LAYERS.index(layer), cwin, cm, KEEP)
+        if vias:
+            self._has_via_areas = True
+            self._paint(self.no_via, None, win, mask, 1)
+
+    def keepout_ring(self, x, y, radius, width, layers=None, clearance=None):
+        """An unfilled circular CAD stroke, with its interior still routable."""
+        if radius <= 0 or width < 0:
+            raise ValueError('Ring radius must be positive and width nonnegative')
+        self._op('ring', (x, y, radius, width, tuple(layers or LAYERS), clearance))
+
+    def _do_ring(self, x, y, radius, width, layers, clearance):
+        grow=PAD_GROW+max(0.,(clearance or 0.)-CLEAR)
+        outer=radius+width/2+grow
+        win=self._win(x-outer,y-outer,x+outer,y+outer)
+        ys,xs=self._grid(win)
+        distance=np.abs(np.hypot(xs-x,ys-y)-radius)
+        mask=distance<=width/2+grow
+        core=distance<=width/2
+        for layer in layers:
+            self._paint(self.occ,LAYERS.index(layer),win,mask,KEEP)
+            self._paint(self.core,LAYERS.index(layer),win,core,KEEP)
+        self._has_via_areas=True
+        self._paint(self.no_via,None,win,mask,1)
 
     def text(self, s, x, y, layer='F.SilkS', size=1.0):
         self.texts.append(dict(text=s, x=x, y=y, layer=layer, size=size))
@@ -436,16 +583,35 @@ class Board:
     def _blocked_gr(self, Ls, nid, win, r, reduce_or=False):
         """_blocked for several layers in one native call ([len(Ls), H, W], or the OR over them [H, W])."""
         ph = self.phantom.any() and 0 in Ls
-        return _GR.dilate(self.occ, Ls, win, _GR.disc_span(r / G), excl=nid if isinstance(nid, tuple) else (nid,),
+        excluded=nid if isinstance(nid, tuple) else (nid,)
+        own=max([CLEAR]+[self._id_clearance.get(n,CLEAR) for n in excluded]+
+                [LAYER_CLEARANCES.get(LAYERS[L],0.) for L in Ls])
+        # Class clearances combine with max(), never by summing both surpluses.
+        # The grown raster enforces the obstacle's class; true copper separately
+        # enforces the searching net's class. Single-class boards keep one call.
+        base_r=r-max(0.,own-CLEAR)
+        out = _GR.dilate(self.occ, Ls, win, _GR.disc_span(base_r / G), excl=excluded,
                           extra=self.phantom if ph else None, extra_on=[1] + [0] * (NL - 1) if ph else None,
                           reduce_or=reduce_or)
+        if own>CLEAR:
+            out |= _GR.dilate(self.core,Ls,win,_GR.disc_span((r+PAD_GROW)/G),excl=excluded,
+                              extra=self.phantom if ph else None,extra_on=[1]+[0]*(NL-1) if ph else None,
+                              reduce_or=reduce_or)
+        return out
 
     def _blocked_np(self, L, nid, win, r):
+        excluded=nid if isinstance(nid,tuple) else (nid,)
+        own=max([CLEAR,LAYER_CLEARANCES.get(LAYERS[L],0.)]+[self._id_clearance.get(n,CLEAR) for n in excluded])
+        out=self._dilate_np(self.occ,L,nid,win,r-max(0.,own-CLEAR))
+        if own>CLEAR:out|=self._dilate_np(self.core,L,nid,win,r+PAD_GROW)
+        return out
+
+    def _dilate_np(self, source, L, nid, win, r):
         i0, j0, i1, j1 = win
         rc = int(math.ceil(r / G))
         pi0, pj0 = max(i0 - rc, 0), max(j0 - rc, 0)
         pi1, pj1 = min(i1 + rc, self.ny - 1), min(j1 + rc, self.nx - 1)
-        src = self.occ[L, pi0:pi1 + 1, pj0:pj1 + 1]
+        src = source[L, pi0:pi1 + 1, pj0:pj1 + 1]
         other = src != 0
         for n in (nid if isinstance(nid, tuple) else (nid,)):
             other &= src != n
@@ -478,12 +644,77 @@ class Board:
             return out
         return self._near_smd_np(win, r)
 
-    def _near_smd_np(self, win, r):
+    def _near_foreign_copper(self, nid, win, radius):
+        """Hole-to-copper distance, independent of either copper netclass.
+
+        Use the true copper raster: _blocked applies class-clearance surplus
+        compensation and therefore must not receive a drill-clearance radius.
+        """
+        radius+=PAD_GROW
+        if _GR is not None:
+            return _GR.dilate(self.core,list(range(NL)),win,_GR.disc_span(radius/G),
+                              excl=(nid,),reduce_or=True)
+        out=np.zeros((win[2]-win[0]+1,win[3]-win[1]+1),bool)
+        for L in range(NL):out|=self._dilate_np(self.core,L,nid,win,radius)
+        return out
+
+    def _near_holes(self, win, radius, exclude_net=None):
+        """Exact capsule distance to drilled holes, including same-net PTHs.
+
+        radius is the new object's radius plus its required hole clearance.
+        Existing holes are not copper: same-net copper exemptions must never
+        permit overlapping drills. Slots use their two physical drill sizes.
+        Only intersecting local holes allocate a window-sized distance mask.
+        """
+        ys, xs = self._grid(win)
+        out = np.zeros((win[2] - win[0] + 1, win[3] - win[1] + 1), dtype=bool)
+        for x, y, w, h, angle, net in self._holes():
+            if exclude_net is not None and net == exclude_net:
+                continue
+            r = min(w, h) / 2 + radius
+            ax, ay = max(0., (w - h) / 2), max(0., (h - w) / 2)
+            if abs(w-h) < 1e-9:
+                angle = 0.
+            c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+            bx, by = abs(c) * ax + abs(s) * ay, abs(s) * ax + abs(c) * ay
+            if x + bx + r < win[1] * G or x - bx - r > win[3] * G or y + by + r < win[0] * G or y - by - r > win[2] * G:
+                continue
+            # A drill only affects a small rectangle even when the search covers
+            # the entire board. Restrict the distance arithmetic to that box.
+            i0=max(win[0],int(math.floor((y-by-r)/G)));i1=min(win[2],int(math.ceil((y+by+r)/G)))
+            j0=max(win[1],int(math.floor((x-bx-r)/G)));j1=min(win[3],int(math.ceil((x+bx+r)/G)))
+            yy=ys[i0-win[0]:i1-win[0]+1];xx=xs[:,j0-win[1]:j1-win[1]+1]
+            # Preserve row/column broadcasting for round and orthogonal holes.
+            # Expanding both coordinates to HxW for every ordinary via makes
+            # this otherwise small local check needlessly memory-bound.
+            if angle:
+                u, v = (xx - x) * c - (yy - y) * s, (xx - x) * s + (yy - y) * c
+            else:
+                u, v = xx - x, yy - y
+            dx, dy = np.maximum(np.abs(u) - ax, 0), np.maximum(np.abs(v) - ay, 0)
+            out[i0-win[0]:i1-win[0]+1,j0-win[1]:j1-win[1]+1] |= dx * dx + dy * dy < r * r
+        return out
+
+    def _holes(self):
+        if getattr(self, '_hole_pads', None) is None:
+            pads = (p for part in self.parts.values() if part.placed for p in part.pads())
+            self._hole_pads = [(p['x'],p['y'],p.get('drill_w',p['drill']),p.get('drill_h',p['drill']),
+                                p.get('angle',0.),p['net']) for p in pads if p['drill'] > 0]
+        return self._hole_pads + [(v['x'],v['y'],v['drill'],v['drill'],0.,v['net']) for v in self.vias]
+
+    def _via_areas(self, win, r):
+        if not self._has_via_areas:
+            return np.zeros((win[2]-win[0]+1,win[3]-win[1]+1),dtype=bool)
+        if _GR is not None:
+            return _GR.dilate(self.no_via, [0], win, _GR.disc_span(r/G, strict=False))[0]
+        return self._near_smd_np(win, r, source=self.no_via)
+
+    def _near_smd_np(self, win, r, source=None):
         i0, j0, i1, j1 = win
         rc = int(math.ceil(r / G))
         pi0, pj0 = max(i0 - rc, 0), max(j0 - rc, 0)
         pi1, pj1 = min(i1 + rc, self.ny - 1), min(j1 + rc, self.nx - 1)
-        src = self.smd[pi0:pi1 + 1, pj0:pj1 + 1] != 0
+        src = (self.smd if source is None else source)[pi0:pi1 + 1, pj0:pj1 + 1] != 0
         H, W = src.shape
         cs = np.zeros((H, W + 1), dtype=np.int32)
         np.cumsum(src, axis=1, out=cs[:, 1:])
@@ -502,8 +733,8 @@ class Board:
                 dil[-di:] |= hd[:H + di]
         return dil[i0 - pi0:i1 - pi0 + 1, j0 - pj0:j1 - pj0 + 1]
 
-    def _reach(self, net, half):
-        return half + CLEAR + self.extra(net) + MARGIN
+    def _reach(self, net, half, layer=None):
+        return half + max(self.clearance(net),LAYER_CLEARANCES.get(layer,0.)) + MARGIN
 
     def _island(self, nid, seeds, win):
         """Mask (NL, H, W) of window cells of net nid connected to the seed cells through copper and holes."""
@@ -554,6 +785,19 @@ class Board:
 
     def _pad_seeds(self, p, win):
         i0, j0 = win[0], win[1]
+        # Supported pads are filled, axis-aligned convex shapes. One interior
+        # cell per copper layer reaches the same island as seeding every pixel.
+        # Keep the exhaustive fallback for clipped pads and malformed/overlapping
+        # input: these cases must not silently change connectivity semantics.
+        i, j = int(round(p['y'] / G)), int(round(p['x'] / G))
+        Ls = pad_layers(p)
+        nid = self.net_id.get(p.get('net'))
+        if (p['shape'] in ('rect', 'roundrect', 'circle', 'oval')
+                and min(p['w'], p['h']) >= G
+                and win[0] <= i <= win[2] and win[1] <= j <= win[3]
+                and 0 <= i < self.ny and 0 <= j < self.nx
+                and nid is not None and all(self.core[L, i, j] == nid for L in Ls)):
+            return [(L, i - i0, j - j0) for L in Ls]
         cwin, cm = self._pad_mask(p, 0.0)
         ii, jj = np.nonzero(cm)
         return [(L, i + cwin[0] - i0, j + cwin[1] - j0) for L in pad_layers(p) for i, j in zip(ii, jj)]
@@ -568,6 +812,39 @@ class Board:
                         idx.setdefault(pd['net'], []).append(pd)
             self._pad_index = idx
         return list(self._pad_index.get(net, ()))
+
+    def pad_components(self, net, pads=None):
+        """Canonical component labels at pads, in pad order (0, 1, ...).
+
+        Native flood labelling avoids allocating a full-board mask per net.
+        Off-grid/tiny pads without an occupied centre use the exhaustive island
+        fallback. An unrepresented pad receives its own disconnected label.
+        """
+        pads = self.pads_of(net) if pads is None else pads
+        cells = [(pad_layers(p)[0], int(round(p['y'] / G)), int(round(p['x'] / G))) for p in pads]
+        nid = self.net_id[net]
+        if _GR is not None and all(0 <= i < self.ny and 0 <= j < self.nx and self.core[L, i, j] == nid
+                                   for L, i, j in cells):
+            raw = _GR.label_cells(self.core, self.thru, nid, cells)
+            canonical, out = {}, []
+            for k, label in enumerate(raw):
+                key = int(label) if label >= 0 else ('missing', k)
+                out.append(canonical.setdefault(key, len(canonical)))
+            return out
+        win = (0, 0, self.ny - 1, self.nx - 1)
+        seeds = [self._pad_seeds(p, win) for p in pads]
+        labels = [-1] * len(pads)
+        component = 0
+        for k, ss in enumerate(seeds):
+            if labels[k] >= 0:
+                continue
+            labels[k] = component
+            island = self._island(nid, ss, win)
+            for j in range(k + 1, len(pads)):
+                if labels[j] < 0 and any(island[s] for s in seeds[j]):
+                    labels[j] = component
+            component += 1
+        return labels
 
     def route(self, net, a, b, **kw):
         """Connect the copper island of pad a=(ref, num) to the island of pad b."""
@@ -617,9 +894,9 @@ class Board:
         d = self._dirty[ti0:ti1 + 1, tj0:tj1 + 1]
         if d.any():
             tl = np.argwhere(d) + (ti0, tj0)
-            self._th[tl[:, 0], tl[:, 1]] = _GR.tile_hashes([self.occ, self.core, self.thru, self.smd, self.phantom], TILE, tl)
+            self._th[tl[:, 0], tl[:, 1]] = _GR.tile_hashes([self.occ, self.core, self.thru, self.smd, self.no_via, self.phantom], TILE, tl)
             d[:] = False
-        return _GR.hash_arrays([self._th[ti0:ti1 + 1, tj0:tj1 + 1]]) + repr((_SALT, win, args))
+        return _GR.hash_arrays([self._th[ti0:ti1 + 1, tj0:tj1 + 1]]) + repr((_SALT, win, args, self._holes()))
 
     def _route(self, net, src_pads, dst_pads, layers=None, width=None, margin=3.0, via_cost=1.0, layer_cost=None,
                pref=None, turn=0.1, weight=1.2, window=None, max_exp=4_000_000, extra_src=None, extra_dst=None):
@@ -719,8 +996,6 @@ class Board:
     def _route_search(self, net, src_pads, dst_pads, layers, width, margin, via_cost, layer_cost, pref, turn, weight,
                       window, max_exp, extra_src, extra_dst):
         explicit = width is not None
-        if not explicit and self.cls[net] in LAYER_WIDTHS:   # search at the widest width the emitted layers may use
-            width = max(self.width(net, l) for l in (layers or LAYERS))
         width = width or self.width(net)
         half = width / 2
         nid = self.net_id[net]
@@ -759,10 +1034,18 @@ class Board:
         blk = np.ones((NL, H, W), dtype=bool)
         vd, vdr = self.via_size(net)
         vr = self._reach(net, vd / 2)
-        if _GR is not None:
+        per_layer = bool(LAYER_CLEARANCES or (not explicit and self.cls[net] in LAYER_WIDTHS))
+        if per_layer:
+            for L in Ls:
+                wh = half if explicit else self.width(net,LAYERS[L])/2
+                blk[L] = self._blocked(L,nid,win,self._reach(net,wh,LAYERS[L]))
+            vok = np.ones((H,W),dtype=bool)
+            for L in range(NL):
+                vok &= ~self._blocked(L,nid,win,self._reach(net,vd/2,LAYERS[L]))
+        elif _GR is not None:
             blk[Ls] = self._blocked_gr(Ls, nid, win, r)
             vok = ~self._blocked_gr(list(range(NL)), nid, win, vr, reduce_or=True)
-        if _GR is None or _VERIFY:
+        if not per_layer and (_GR is None or _VERIFY):
             if _VERIFY:
                 blk_gr, vok_gr = blk.copy(), vok.copy()
             for L in Ls:
@@ -773,7 +1056,13 @@ class Board:
             if _VERIFY:
                 assert np.array_equal(blk, blk_gr) and np.array_equal(vok, vok_gr), ('_route masks', net, win)
         vok &= ~self._near_smd(win, vd / 2 + 0.1)     # no via-in-pad, not even on the net's own pads
-        # the hole needs HOLE_CLEAR from other copper as well (approximated by the pad reach above)
+        vok &= ~self._near_holes(win, vdr / 2 + HOLE_TO_HOLE + 0.01)
+        vok &= ~self._via_areas(win, vd / 2 + MARGIN)
+        # Copper and drill clearances are independent; a small annulus does not
+        # make the hole's clearance to foreign copper disappear.
+        hr = vdr / 2 + HOLE_CLEAR + MARGIN
+        if hr > vr:
+            vok &= ~self._near_foreign_copper(nid,win,hr)
         blk[:, 0, :] = blk[:, -1, :] = blk[:, :, 0] = blk[:, :, -1] = True
         # sources as flat state indices (native scan) or (L, i, j) rows (numpy fallback, verify mode)
         src = _GR.mask_scan(isl_s, blk) if _GR is not None and not _VERIFY else np.argwhere(isl_s & ~blk)
@@ -1148,10 +1437,15 @@ class Board:
         i0, j0 = win[0], win[1]
         vok = np.ones((win[2] - i0 + 1, win[3] - j0 + 1), dtype=bool)
         for LL in range(NL):
-            vok &= ~self._blocked(LL, nid, win, self._reach(net, vd / 2))
+            vok &= ~self._blocked(LL, nid, win, self._reach(net, vd / 2, LAYERS[LL]))
         if not in_pad:
             vok &= ~self._near_smd(win, vd / 2 + 0.1)
-        sok = ~self._blocked(L, nid, win, self._reach(net, width / 2))
+        vok &= ~self._near_holes(win, vdr / 2 + HOLE_TO_HOLE + 0.01)
+        vok &= ~self._via_areas(win, vd / 2 + MARGIN)
+        hr = vdr / 2 + HOLE_CLEAR + MARGIN
+        if hr > self._reach(net, vd / 2):
+            vok &= ~self._near_foreign_copper(nid,win,hr)
+        sok = ~self._blocked(L, nid, win, self._reach(net, width / 2, LAYERS[L]))
         # an existing via of the net within reach: a straight stub to it instead of another hole
         for v in sorted((v for v in self.vias if v['net'] == net),
                         key=lambda v: math.hypot(v['x'] - p['x'], v['y'] - p['y'])):
@@ -1165,11 +1459,8 @@ class Board:
                    and 0 <= int(round((p['x'] + (v['x'] - p['x']) * t / n) / G)) - j0 < sok.shape[1]):
                 self.add_track(net, LAYERS[L], [(p['x'], p['y']), (v['x'], v['y'])], width)
                 return True
-        # keep drilled holes apart (hole-to-hole 0.25 mm), whatever their net
-        ys, xs = self._grid(win)
-        for v in self.vias:
-            if abs(v['x'] - p['x']) < max_r + 2 and abs(v['y'] - p['y']) < max_r + 2:
-                vok &= (xs - v['x']) ** 2 + (ys - v['y']) ** 2 >= ((v['drill'] + vdr) / 2 + 0.3) ** 2
+        # _near_holes above already includes every existing via and pad drill
+        # using the configured hole-to-hole rule, including same-net holes.
         dirs = dirs or [(math.cos(a * math.pi / 4), math.sin(a * math.pi / 4)) for a in range(8)]
         best = None
         rmin = 0.0 if in_pad else max(p['w'], p['h']) / 2 + 0.05
@@ -1181,9 +1472,13 @@ class Board:
                 if not (0 <= i < vok.shape[0] and 0 <= j < vok.shape[1]) or not vok[i, j]:
                     continue
                 good = True
+                # Test the segment that will actually be emitted: its via end
+                # is snapped to the grid and may differ from the nominal ray.
+                ex,ey=(j+j0)*G,(i+i0)*G
                 for t in range(k + 1):
-                    ii = int(round((p['y'] + dy * t * G) / G)) - i0
-                    jj = int(round((p['x'] + dx * t * G) / G)) - j0
+                    ratio=t/max(k,1)
+                    ii = int(round((p['y'] + (ey-p['y'])*ratio) / G)) - i0
+                    jj = int(round((p['x'] + (ex-p['x'])*ratio) / G)) - j0
                     if not sok[ii, jj]:
                         good = False
                         break
@@ -1263,7 +1558,7 @@ class Board:
         self.vias = [v for v in self.vias if id(v) not in ids]
         for a in (self.occ, self.core):
             a[:, i0:i1 + 1, j0:j1 + 1] = 0
-        for a in (self.thru, self.smd):
+        for a in (self.thru, self.smd, self.no_via):
             a[i0:i1 + 1, j0:j1 + 1] = 0
         self._dirty[i0 // TILE:i1 // TILE + 1, j0 // TILE:j1 // TILE + 1] = True
         # replay into a scratch board region: each operation repaints in full (outside the region that is idempotent)
@@ -1284,11 +1579,22 @@ class Board:
         pads = self.pads_of(net)
         if len(pads) < 2:
             return True
-        nid = self.net_id[net]
-        xs, ys = [p['x'] for p in pads], [p['y'] for p in pads]
-        w = self._win(min(xs) - 15, min(ys) - 15, max(xs) + 15, max(ys) + 15)
-        isl = self._island(nid, self._pad_seeds(pads[0], w), w)
-        return all(any(isl[s] for s in self._pad_seeds(pd, w)) for pd in pads[1:])
+        return len(set(self.pad_components(net, pads))) <= 1
+
+    def replace_copper(self, tracks, vias):
+        """Replace routed copper and synchronize all rasters and operation logs.
+
+        Footprints, keepouts and other static geometry remain in place. Inputs
+        may be the board's current lists; new dictionaries are made on replay.
+        This is also the rollback primitive for an external routing controller.
+        """
+        tracks, vias = list(tracks), list(vias)
+        self._rip_ops([i for i, op in enumerate(self.ops) if op[3] is not None])
+        self.tracks, self.vias = [], []
+        for t in tracks:
+            self.add_track(t['net'], t['layer'], t['pts'], t['width'])
+        for v in vias:
+            self.add_via(v['net'], v['x'], v['y'], d=v['d'], drill=v['drill'])
 
     def relax(self, nets=None, since=0, passes=3, via_cost=1.0, turn=0.05, margin=3.0, gain=0.2, layers=None):
         """Rip-up-and-reroute relaxation, run once the whole board is routed.
@@ -1383,7 +1689,7 @@ class Board:
         touch = [a for a in touch if a[3]]
         L = LAYERS.index(t['layer'])
         nid = self.net_id[t['net']]
-        reach = self._reach(t['net'], half)
+        reach = self._reach(t['net'], half, t['layer'])
 
         def free(i, j):
             for x, y, r, segs in touch:
@@ -1467,8 +1773,71 @@ class Board:
         def run():
             n = self._prune_vias()
             return self.tracks, self.vias, n
+        before_tracks, before_vias = list(self.tracks), list(self.vias)
+        before_missing = set(self.unrouted())
         self.tracks, self.vias, n = self._memo('prune', (self.tracks, self.vias, self._placement()), run)
+        self.replace_copper(self.tracks, self.vias)
+        # A via's copper disc can bridge disjoint track ends even on one layer.
+        # Do not silently destroy that connection during a cosmetic cleanup.
+        if set(self.unrouted()) != before_missing:
+            self.replace_copper(before_tracks, before_vias)
+            return 0
         return n
+
+    def via_bridges_copper(self, v):
+        """Whether deleting a via can break a physical copper joint.
+
+        Raster flood-fill joins adjacent pixels even when physical track ends
+        are only tangent. Require positive overlap between all local branches.
+        Pad/via contacts are conservatively retained by this cosmetic cleanup.
+        """
+        eps=0.002
+        ts=[t for t in self.tracks if t['net']==v['net'] and any(
+            _seg_dist(v['x'],v['y'],a,b)<(v['d']+t['width'])/2+eps
+            for a,b in zip(t['pts'],t['pts'][1:]))]
+        if any(_pad_distance(v['x'],v['y'],p)<v['d']/2+eps for p in self.pads_of(v['net'])):
+            return True
+        if any(u is not v and u['net']==v['net'] and math.hypot(u['x']-v['x'],u['y']-v['y'])<(u['d']+v['d'])/2+eps for u in self.vias):
+            return True
+        if len(ts)<2:return False
+        def distance(a,b,c,d):
+            def orient(a,b,c):return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+            if orient(a,b,c)*orient(a,b,d)<0 and orient(c,d,a)*orient(c,d,b)<0:return 0.
+            return min(_seg_dist(*a,c,d),_seg_dist(*b,c,d),_seg_dist(*c,a,b),_seg_dist(*d,a,b))
+        seen={0};todo=[0]
+        while todo:
+            i=todo.pop();t=ts[i]
+            for j,u in enumerate(ts):
+                if j in seen or u['layer']!=t['layer']:continue
+                if any(distance(a,b,c,d)<(t['width']+u['width'])/2-eps
+                       for a,b in zip(t['pts'],t['pts'][1:]) for c,d in zip(u['pts'],u['pts'][1:])):
+                    seen.add(j);todo.append(j)
+        return len(seen)!=len(ts)
+
+    def via_replacement_tracks(self,v):
+        """Replace a one-layer via joint inside the existing copper union.
+
+        Returns None when any contact cannot be joined without adding copper
+        outside the old via disc and touching tracks. The caller retains those vias.
+        """
+        if any(_pad_distance(v['x'],v['y'],p)<v['d']/2+.002 for p in self.pads_of(v['net'])):return None
+        if any(u is not v and u['net']==v['net'] and math.hypot(u['x']-v['x'],u['y']-v['y'])<(u['d']+v['d'])/2+.002 for u in self.vias):return None
+        stars=[];layers=set()
+        for t in self.tracks:
+            if t['net']!=v['net']:continue
+            closest=None
+            for a,b in zip(t['pts'],t['pts'][1:]):
+                dx,dy=b[0]-a[0],b[1]-a[1];den=dx*dx+dy*dy
+                k=max(0.,min(1.,((v['x']-a[0])*dx+(v['y']-a[1])*dy)/den)) if den else 0.
+                q=(a[0]+k*dx,a[1]+k*dy);d=math.hypot(q[0]-v['x'],q[1]-v['y'])
+                if closest is None or d<closest[0]:closest=(d,q)
+            if closest is None or closest[0]>=(v['d']+t['width'])/2+.002:continue
+            layers.add(t['layer']);width=self.width(v['net'],t['layer'])
+            # The cylinder up to the old track's centre must lie in the via;
+            # the final round cap is already covered by that existing track.
+            if width>t['width']+1e-9 or math.hypot(closest[0],width/2)>v['d']/2-.001:return None
+            if closest[0]>.0001:stars.append(dict(net=v['net'],layer=t['layer'],width=width,pts=[(v['x'],v['y']),closest[1]]))
+        return stars if len(layers)==1 else None
 
     def _prune_vias(self):
         """Remove signal vias that touch copper on one layer only (e.g. a template's branch via a copy did not use).
@@ -1499,10 +1868,10 @@ class Board:
                 layers = {self.tracks[ti]['layer'] for ti in touch}
                 at_pad = False
                 for p in pads.get(v['net'], []):
-                    if abs(p['x'] - v['x']) < p['w'] / 2 + v['d'] / 2 and abs(p['y'] - v['y']) < p['h'] / 2 + v['d'] / 2:
+                    if _pad_distance(v['x'], v['y'], p) < v['d'] / 2 - 1e-3:
                         layers |= {LAYERS[L] for L in pad_layers(p)}
                         at_pad = True
-                if len(layers) >= 2:
+                if len(layers) >= 2 or self.via_bridges_copper(v):
                     continue
                 drop_v.add(vi)
                 if len(touch) == 1 and not at_pad:
@@ -1524,6 +1893,7 @@ class Board:
             n = self._trim_dangling()
             return self.tracks, n
         self.tracks, n = self._memo('trim', (self.tracks, self.vias, self._placement()), run)
+        self.replace_copper(self.tracks, self.vias)
         return n
 
     def _trim_dangling(self):
@@ -1550,17 +1920,16 @@ class Board:
             def touched(ti, x, y, layer, w):
                 n = self.tracks[ti]['net']
                 for p in pads.get(n, []):
-                    if layer in [LAYERS[L] for L in pad_layers(p)] and abs(p['x'] - x) <= p['w'] / 2 + w / 2 and \
-                            abs(p['y'] - y) <= p['h'] / 2 + w / 2:
+                    if layer in [LAYERS[L] for L in pad_layers(p)] and _pad_distance(x, y, p) < 1e-6:
                         return True
                 for v in vias.get(n, []):
-                    if math.hypot(v['x'] - x, v['y'] - y) <= v['d'] / 2 + w / 2:
+                    if math.hypot(v['x'] - x, v['y'] - y) < v['d'] / 2 - 1e-3:
                         return True
                 for tj in by_net[n]:
                     if tj == ti:
                         continue
                     u = self.tracks[tj]
-                    if u['layer'] == layer and any(_seg_dist(x, y, a, b) <= (u['width'] + w) / 2 for a, b in
+                    if u is not None and u['layer'] == layer and any(_seg_dist(x, y, a, b) < u['width'] / 2 - 1e-3 for a, b in
                                                    zip(u['pts'], u['pts'][1:])):
                         return True
                 return False
@@ -1598,7 +1967,7 @@ class Board:
                         self.tracks[ti] = None
                     else:
                         pts = new[::-1] if rev else new
-                        self.tracks[ti] = dict(t, pts=[[round(x, 4), round(y, 4)] for x, y in pts])
+                        self.tracks[ti] = dict(t, pts=[[round(x, 6), round(y, 6)] for x, y in pts])
                         t = self.tracks[ti]
                     changed = True
                     if self.tracks[ti] is None:
@@ -1698,11 +2067,9 @@ class Board:
                 continue
             if len(pads) < 2:
                 continue
-            xs, ys = [p['x'] for p in pads], [p['y'] for p in pads]
-            w = self._win(min(xs) - 15, min(ys) - 15, max(xs) + 15, max(ys) + 15)
-            isl = self._island(nid, self._pad_seeds(pads[0], w), w)
-            for pd in pads[1:]:
-                if not any(isl[s] for s in self._pad_seeds(pd, w)):
+            labels = self.pad_components(net, pads)
+            for pd, label in zip(pads[1:], labels[1:]):
+                if label != labels[0]:
                     out.append((net, pd['ref'], pd['num']))
         return out
 
