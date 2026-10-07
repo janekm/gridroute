@@ -218,6 +218,21 @@ class ClassClearanceTests(unittest.TestCase):
         self.assertFalse(blocked[100,122])  # 0.550 > .500; old double-surplus threshold was .600
         np.testing.assert_array_equal(blocked,bd._blocked_np(0,bd.net_id['A'],win,r))
 
+    def test_wider_class_adds_pad_grow_to_pads_only(self):
+        board.configure(pitch=.025,margin=0,pad_grow=.05,cache='off',spec=0,
+                        classes={'Default':(.2,.1,.4,.2),'Wide':(.2,.2,.4,.2)},net_class=lambda n:'Wide' if n=='A' else 'Default')
+        pad=dict(num='1',x=0,y=0,w=.4,h=.4,rot=0,shape='rect',layers='F',npth=False,drill=0)
+        bd=board.Board(6,6,{'P':{'footprint':'f'}},{('P','1'):'C',('A','1'):'A',('B','1'):'B'},
+                       {'f':{'pads':[pad],'courtyard':[0,0,0,0]}});bd.place('P',3,1)
+        bd.add_track('B','F.Cu',[(2,3),(4,3)],.2)
+        win=(0,0,bd.ny-1,bd.nx-1);r=bd._reach('A',.1)
+        blocked=bd._blocked(0,bd.net_id['A'],win,r)
+        # a Default track: .1 half width + .1 half width + .2 clearance, no pad grow (a hand-drawn neck stays reachable)
+        self.assertTrue(blocked[135,120]);self.assertFalse(blocked[137,120])
+        # a Default pad keeps its pad grow under the wider class: .2 edge + .1 + .2 + .05
+        self.assertTrue(blocked[61,120]);self.assertFalse(blocked[63,120])
+        np.testing.assert_array_equal(blocked,bd._blocked_np(0,bd.net_id['A'],win,r))
+
     def test_layer_clearance_floor_and_foreign_class_both_apply(self):
         board.configure(layers=['F.Cu','In1.Cu','B.Cu'],pitch=.025,margin=0,pad_grow=0,hole_clear=.1,cache='off',spec=0,
                         classes={'Default':(.2,.1,.4,.2),'Wide':(.2,.2,.4,.2)},

@@ -281,6 +281,7 @@ class Board:
         self.net_id = {n: i + 1 for i, n in enumerate(self.nets)}
         self.cls = {n: net_class(n) for n in self.nets}
         self._id_clearance = {self.net_id[n]:CLASSES[c][1] for n,c in self.cls.items()}
+        self._wide_ids = tuple(i for i, c in self._id_clearance.items() if c > CLEAR)   # nets above the minimum
         self.parts = {r: Part(r, self.fpdefs[c['footprint']], self.pin_net) for r, c in self.comps.items()}
         self.tracks, self.vias = [], []
         self.keepouts, self.rule_keepouts, self.texts, self.rects, self.zones = [], [], [], [], []
@@ -660,16 +661,20 @@ class Board:
         own=max([CLEAR]+[self._id_clearance.get(n,CLEAR) for n in excluded]+
                 [LAYER_CLEARANCES.get(LAYERS[L],0.) for L in Ls])
         # Class clearances combine with max(), never by summing both surpluses.
-        # The grown raster enforces the obstacle's class; true copper separately
-        # enforces the searching net's class. Single-class boards keep one call.
+        # The grown raster enforces the obstacle's class; the searching net's
+        # class is enforced on the grown raster of minimum-clearance copper
+        # (pads keep PAD_GROW, tracks and vias get none, as before classes
+        # combined) and on the true copper of wider-class nets, whose grown
+        # raster already carries their own surplus. Single-class boards keep one call.
         base_r=r-max(0.,own-CLEAR)
         out = _GR.dilate(self.occ, Ls, win, _GR.disc_span(base_r / G), excl=excluded,
                           extra=self.phantom if ph else None, extra_on=[1] + [0] * (NL - 1) if ph else None,
                           reduce_or=reduce_or)
         if own>CLEAR:
-            out |= _GR.dilate(self.core,Ls,win,_GR.disc_span((r+PAD_GROW)/G),excl=excluded,
+            out |= _GR.dilate(self.occ,Ls,win,_GR.disc_span(r/G),excl=excluded+self._wide_ids,
                               extra=self.phantom if ph else None,extra_on=[1]+[0]*(NL-1) if ph else None,
                               reduce_or=reduce_or)
+            out |= _GR.dilate(self.core,Ls,win,_GR.disc_span(r/G),excl=excluded,reduce_or=reduce_or)
             rsv=self.__dict__.get('rsv')
             if rsv is not None and rsv[:,win[0]:win[2]+1,win[1]:win[3]+1].any():
                 out |= _GR.dilate(rsv,Ls,win,_GR.disc_span(r/G),excl=excluded,reduce_or=reduce_or)
@@ -680,11 +685,12 @@ class Board:
         own=max([CLEAR,LAYER_CLEARANCES.get(LAYERS[L],0.)]+[self._id_clearance.get(n,CLEAR) for n in excluded])
         out=self._dilate_np(self.occ,L,nid,win,r-max(0.,own-CLEAR))
         if own>CLEAR:
-            out|=self._dilate_np(self.core,L,nid,win,r+PAD_GROW)
+            out|=self._dilate_np(self.occ,L,excluded+self._wide_ids,win,r)
+            out|=self._dilate_np(self.core,L,nid,win,r,phantom=False)
             if self.__dict__.get('rsv') is not None:out|=self._dilate_np(self.rsv,L,nid,win,r)
         return out
 
-    def _dilate_np(self, source, L, nid, win, r):
+    def _dilate_np(self, source, L, nid, win, r, phantom=True):
         i0, j0, i1, j1 = win
         rc = int(math.ceil(r / G))
         pi0, pj0 = max(i0 - rc, 0), max(j0 - rc, 0)
@@ -693,7 +699,7 @@ class Board:
         other = src != 0
         for n in (nid if isinstance(nid, tuple) else (nid,)):
             other &= src != n
-        if L == 0 and self.phantom.any():
+        if phantom and L == 0 and self.phantom.any():
             other |= self.phantom[pi0:pi1 + 1, pj0:pj1 + 1]
         H, W = other.shape
         cs = np.zeros((H, W + 1), dtype=np.int32)
