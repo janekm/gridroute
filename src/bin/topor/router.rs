@@ -50,8 +50,11 @@ pub struct Router {
     pub last_exp: usize,
     /// Objects joined without a piece (a via inside its pad).
     pub ties: Vec<(u32, u32)>,
-    /// Wire-end objects of unzipped pair members (virtual, never exported).
+    /// Wire-end objects of unzipped pair members and planned pin escapes (virtual, never exported).
     pub junctions: Vec<u32>,
+    /// Planned escapes of fine-pitch pins: (pad, net, pad end, outward direction, stub length); the
+    /// junctions at the ends of their stubs are named "junction:esc:" (ids do not survive a rollback).
+    pub esc_plans: Vec<(u32, u32, P2, P2, f64)>,
     /// Unzip mode: members leave the ribbon to reach stations with spread-out pads by stubs.
     pub split_wide: bool,
     /// Other nets may not rip differential pair members (relaxed for the last rip-up rounds).
@@ -154,7 +157,7 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()) }
+        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), esc_plans: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()) }
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -175,7 +178,7 @@ impl Router {
         }
         for &j in &self.junctions {
             let o = &self.w.objs[j as usize];
-            if o.alive && o.s.net == net {
+            if o.alive && o.s.net == net && !(self.is_escape_end(j) && !self.w.obj_pieces[j as usize].iter().any(|&p| self.w.pieces[p as usize].alive)) {
                 v.push(j);
             }
         }
@@ -560,6 +563,12 @@ impl Router {
             }
         }
         for o in [a, b] {
+            // a planned escape whose stub went: its end junction goes too (the pad re-plans it on reroute)
+            if self.is_escape_end(o) && self.w.obj_pieces[o as usize].iter().all(|&q| !self.w.pieces[q as usize].alive) {
+                let _ = self.w.remove_via(o);
+                self.junctions.retain(|&j| j != o);
+                continue;
+            }
             let ob = &self.w.objs[o as usize];
             if ob.alive && ob.s.kind == Kind::Via && self.w.obj_pieces[o as usize].iter().all(|&q| !self.w.pieces[q as usize].alive) {
                 if std::env::var("TOPOR_VALIDATE").is_ok() {
@@ -768,6 +777,12 @@ impl Router {
 
     /// Grow a net's tree until connected or stuck. Returns remaining deficit.
     pub fn route_net(&mut self, net: u32) -> usize {
+        // a pin whose planned escape was ripped gets it back before the net routes
+        for i in 0..self.esc_plans.len() {
+            if self.esc_plans[i].1 == net {
+                self.plant_escape(i);
+            }
+        }
         if self.is_plane(net) {
             // groups with a big pad first (vias in the pad): small pads beside it then tie to it
             let mut comps = self.components(net);
@@ -1089,6 +1104,415 @@ impl Router {
         }
         found.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         found.into_iter().take(5).map(|(_, n)| self.w.b.nets[n as usize].name.clone()).collect()
+    }
+
+    /// Pin rows of fine-pitch parts (16+ pads; elongated pads, rectangular or oval, with a neighbour of
+    /// another net closer than 0.7 mm), each row ordered along the part's side: (pad, pad's outer end,
+    /// outward direction).
+    fn escape_rows(&self) -> Vec<Vec<(u32, P2, P2)>> {
+        let mut parts: HashMap<String, Vec<u32>> = HashMap::default();
+        for (i, o) in self.w.objs.iter().enumerate() {
+            if o.alive && o.s.kind == Kind::Pad && o.s.net != NONE && !o.s.name.starts_with("junction:") && !o.s.name.starts_with("zone:") {
+                parts.entry(o.s.name.split('.').next().unwrap_or("").to_string()).or_default().push(i as u32);
+            }
+        }
+        let mut names: Vec<String> = parts.keys().cloned().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let pads = &parts[&name];
+            if pads.len() < 16 {
+                continue;
+            }
+            let c = |o: u32| self.w.objs[o as usize].s.center;
+            let cc = pads.iter().fold(p2(0.0, 0.0), |a, &o| a + c(o)) * (1.0 / pads.len() as f64);
+            let mut rows: HashMap<i32, Vec<(f64, u32, P2, P2)>> = HashMap::default();
+            for &o in pads {
+                let s = &self.w.objs[o as usize].s;
+                // polygon pads, or oval ones (a segment core with a radius)
+                if s.pts.len() < 2 || (s.pts.len() == 2 && s.r <= 0.0) || !pads.iter().any(|&q| q != o && self.w.objs[q as usize].s.net != s.net && c(q).dist(s.center) < 0.7) {
+                    continue;
+                }
+                let n = s.pts.len();
+                let (mut ax, mut best) = (p2(1.0, 0.0), 0.0);
+                for k in 0..n {
+                    let e = s.pts[(k + 1) % n] - s.pts[k];
+                    if e.norm() > best {
+                        best = e.norm();
+                        ax = e.unit();
+                    }
+                }
+                if ax.dot(s.center - cc) < 0.0 {
+                    ax = -ax;
+                }
+                let (mut far, mut hw) = (0.0f64, 0.0f64);
+                for q in &s.pts {
+                    far = far.max((*q - s.center).dot(ax) + s.r);
+                    hw = hw.max((*q - s.center).dot(ax.perp()).abs() + s.r);
+                }
+                // not a pin (an exposed pad), or no clear long axis
+                if far > 0.75 || far < 1.5 * hw {
+                    continue;
+                }
+                let side = (ax.y.atan2(ax.x) / std::f64::consts::FRAC_PI_2).round() as i32 & 3;
+                rows.entry(side).or_default().push(((s.center - cc).dot(ax.perp()), o, s.center + ax * far, ax));
+            }
+            let mut sides: Vec<i32> = rows.keys().cloned().collect();
+            sides.sort();
+            for side in sides {
+                let mut row = rows[&side].clone();
+                row.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                out.push(row.into_iter().map(|(_, o, a, ax)| (o, a, ax)).collect());
+            }
+        }
+        out
+    }
+
+    /// Fan-out of fine-pitch parts, planned per row of pins the way a 0.4 mm QFN is fanned out by hand.
+    /// A pin whose net has another pad within 3.5 mm stays on its layer (it leaves straight out towards
+    /// the passives round the part) unless its way there must cross a neighbour's; every other pin drops
+    /// to a via in front of the row. In row order,
+    /// each via goes where it costs least (close in, little sideways), clear of the vias and stubs already
+    /// planned and of the straight way out of every pin that stays on its layer, with the stubs in pin
+    /// order so that none crosses another. Vias and stubs are laid as the nets' copper before anything
+    /// else routes; the nets go on from them. (Short straight stubs for the pins that stay on their layer
+    /// as well took the room the power pins' plane drops need: worse on EXT.)
+    fn plan_fanout(&mut self) {
+        let mut made = 0;
+        let mut wanted = 0;
+        for row in self.escape_rows() {
+            let (a0, ax) = (row[0].1, row[0].2);
+            let perp = ax.perp();
+            let u: Vec<f64> = row.iter().map(|r| (r.1 - a0).dot(perp)).collect();
+            // 0: routes otherwise (plane, pair, single pad), 1: stays on its layer, 2: drops to a via
+            // where each pin's nearest pad of its net elsewhere lies along the row
+            let mut target: Vec<f64> = vec![0.0; row.len()];
+            let mut kind: Vec<u8> = row
+                .iter()
+                .enumerate()
+                .map(|(i, &(o, _, _))| {
+                    let s = &self.w.objs[o as usize].s;
+                    let net = s.net;
+                    let paired = self.w.b.partner.get(net as usize).map_or(false, |&x| x != NONE);
+                    if self.is_plane(net) || paired || self.net_pads[net as usize].len() < 2 {
+                        return 0;
+                    }
+                    let part = s.name.split('.').next().unwrap_or("");
+                    let nearest = self.net_pads[net as usize]
+                        .iter()
+                        .filter(|&&q| q != o && self.w.objs[q as usize].s.name.split('.').next().unwrap_or("") != part)
+                        .map(|&q| {
+                            let t = &self.w.objs[q as usize].s;
+                            (point_hull_dist(&t.pts, s.center) - t.r, t.center)
+                        })
+                        .fold((f64::INFINITY, s.center), |a, b| if b.0 < a.0 { b } else { a });
+                    target[i] = (nearest.1 - a0).dot(perp);
+                    if nearest.0 < 3.5 {
+                        1
+                    } else {
+                        2
+                    }
+                })
+                .collect();
+            // two pins that stay on their layer with their targets the other way round along the row must
+            // cross there: the one in most such crossings drops to a via instead, until none is left
+            loop {
+                let inv = |i: usize, me: &Vec<u8>| (0..row.len()).filter(|&j| j != i && me[j] == 1 && ((u[j] - u[i]) * (target[j] - target[i]) < 0.0) && (target[j] - target[i]).abs() > 0.2).count();
+                let worst = (0..row.len()).filter(|&i| kind[i] == 1).map(|i| (inv(i, &kind), i)).max();
+                match worst {
+                    Some((n, i)) if n > 0 => kind[i] = 2,
+                    _ => break,
+                }
+            }
+            let w_of = |me: &Router, o: u32| -> (f64, f64, f64) {
+                let net = me.w.objs[o as usize].s.net;
+                let (vd, _) = me.w.b.via_size(net);
+                let ni = &me.w.b.nets[net as usize];
+                let l = (0..me.w.nsig()).find(|&l| me.w.objs[o as usize].s.layers & (1 << l) != 0).unwrap_or(0);
+                (vd, ni.wpref[l], me.w.b.classes[ni.class].clear)
+            };
+            // planned so far: (row index, lateral position, distance out)
+            let mut placed: Vec<(usize, f64, f64)> = Vec::new();
+            for i in 0..row.len() {
+                if kind[i] != 2 {
+                    continue;
+                }
+                wanted += 1;
+                let (o, a, _) = row[i];
+                let net = self.w.objs[o as usize].s.net;
+                let (vd, w, clr) = w_of(self, o);
+                let gap_track = vd / 2.0 + w / 2.0 + clr + 0.03;
+                let gap_via = vd + clr + 0.03;
+                let mut cands: Vec<(f64, f64, f64)> = Vec::new();
+                for &sd in &[0.0, 0.3, 0.6, 0.9, 1.2] {
+                    let s_out = vd / 2.0 + clr + 0.05 + sd;
+                    for &d in &[0.0, 0.15, -0.15, 0.3, -0.3, 0.45, -0.45, 0.6, -0.6, 0.8, -0.8] {
+                        cands.push((s_out + 1.5 * f64::abs(d), s_out, d));
+                    }
+                }
+                cands.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+                let mut done = false;
+                for &(_, s_out, d) in &cands {
+                    let v = u[i] + d;
+                    let (lo, hi) = (u[i].min(v), u[i].max(v));
+                    // the straight ways out of pins that stay on their layer (aiming them at their targets
+                    // instead left more pins without a via site: worse on EXT)
+                    let blocks_way = (0..row.len()).any(|j| kind[j] == 1 && ((v - u[j]).abs() < gap_track || (u[j] > lo - (w + clr + 0.03) && u[j] < hi + (w + clr + 0.03))));
+                    if blocks_way {
+                        continue;
+                    }
+                    // vias and stubs already planned in this row: apart, in pin order, uncrossed
+                    let stub = |k: usize, vk: f64, sk: f64| (p2(u[k], 0.0), p2(vk, sk));
+                    let me_site = p2(v, s_out);
+                    let (m0, m1) = stub(i, v, s_out);
+                    let clash = placed.iter().any(|&(k, vk, sk)| {
+                        let (k0, k1) = stub(k, vk, sk);
+                        let site = p2(vk, sk);
+                        site.dist(me_site) < gap_via || (k < i) != (vk < v) || seg_point_dist(k0, k1, me_site) < gap_track || seg_point_dist(m0, m1, site) < gap_track || seg_seg_dist(k0, k1, m0, m1) < w + clr + 0.03
+                    });
+                    if clash {
+                        continue;
+                    }
+                    let pos = a + ax * s_out + perp * d;
+                    if !self.w.via_fits(net, pos) {
+                        continue;
+                    }
+                    self.w.begin();
+                    let vid = match self.w.add_via(net, pos) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            self.w.rollback();
+                            continue;
+                        }
+                    };
+                    let mut viol = Vec::new();
+                    self.w.check_via_at(net, pos, vid, &mut viol, true);
+                    if !viol.is_empty() {
+                        self.w.rollback();
+                        continue;
+                    }
+                    self.w.commit();
+                    if self.connect_within(net, o, vid, NONE, s_out + d.abs() + 0.6) {
+                        placed.push((i, v, s_out));
+                        made += 1;
+                        done = true;
+                        break;
+                    }
+                    let _ = self.w.remove_via(vid);
+                }
+                if !done && std::env::var("TOPOR_FANDBG").is_ok() {
+                    eprintln!("fan-out: no via site for {} ({})", self.w.objs[o as usize].s.name, self.w.b.nets[net as usize].name);
+                }
+            }
+            if std::env::var("TOPOR_FANDBG").is_ok() {
+                let tag: String = kind.iter().map(|k| match k { 0 => '.', 1 => 'F', _ => 'V' }).collect();
+                eprintln!("fan-out row {} .. {}: {}", self.w.objs[row[0].0 as usize].s.name, self.w.objs[row[row.len() - 1].0 as usize].s.name, tag);
+            }
+        }
+        if self.cfg.verbose {
+            eprintln!("[{:.1}s] planned fan-out: {} of {} far-going fine-pitch pins dropped to vias", self.elapsed(), made, wanted);
+        }
+    }
+
+    /// The planned escape of the pin at index k of a row: a straight stub out of the pad, short and long
+    /// in turn along the row so that vias at the stubs' ends stagger. None for pins that route otherwise
+    /// (planes, differential pairs, single-pad nets).
+    fn escape_plan(&self, row: &[(u32, P2, P2)], k: usize, parity: usize) -> Option<(u32, u32, P2, P2, f64)> {
+        let (o, a, ax) = row[k];
+        let net = self.w.objs[o as usize].s.net;
+        let paired = self.w.b.partner.get(net as usize).map_or(false, |&x| x != NONE);
+        if self.is_plane(net) || paired || self.net_pads[net as usize].len() < 2 {
+            return None;
+        }
+        let (vd, _) = self.w.b.via_size(net);
+        let clear = self.w.b.classes[self.w.b.nets[net as usize].class].clear;
+        Some((o, net, a, ax, if (k + parity) % 2 == 0 { 0.3 } else { 0.3 + vd + clear + 0.1 }))
+    }
+
+    /// A few rip-up rounds over whatever is still open (after a local rebuild), ending on the best board
+    /// they reach.
+    fn settle(&mut self, rounds: usize) {
+        let nn = self.w.b.nets.len() as u32;
+        let mut best: Option<(usize, (World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>, Vec<(u32, u32, P2, P2, f64)>))> = None;
+        for _ in 0..rounds {
+            let d = self.total_deficit();
+            if best.as_ref().map_or(true, |b| d < b.0) {
+                best = Some((d, (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone(), self.esc_plans.clone())));
+            }
+            let failing: Vec<u32> = (0..nn).filter(|&n| self.deficit(n) > 0 && self.net_pads[n as usize].len() >= 1).collect();
+            if failing.is_empty() || self.elapsed() > self.cfg.seconds * 1.5 || self.stopped() {
+                break;
+            }
+            for net in failing {
+                if self.deficit(net) == 0 {
+                    continue;
+                }
+                let victims = self.repair_net(net);
+                self.route_net(net);
+                for v in victims {
+                    self.reroute(v);
+                }
+            }
+        }
+        if let Some((d, st)) = best {
+            if d < self.total_deficit() {
+                self.w = st.0;
+                self.ties = st.1;
+                self.history = st.2;
+                self.junctions = st.3;
+                self.esc_plans = st.4;
+            }
+        }
+    }
+
+    /// Planned escapes for every fine-pitch pin before anything else routes (TOPOR_ATTEMPT=2; on EXT it
+    /// left more open than the plain fan-out: the end game re-escapes single rows instead).
+    fn plan_escapes(&mut self) {
+        for row in self.escape_rows() {
+            for k in 0..row.len() {
+                if let Some(pl) = self.escape_plan(&row, k, 0) {
+                    self.esc_plans.push(pl);
+                }
+            }
+        }
+        let mut made = 0;
+        for i in 0..self.esc_plans.len() {
+            if self.plant_escape(i) {
+                made += 1;
+            }
+        }
+        if self.cfg.verbose {
+            eprintln!("[{:.1}s] planned escapes: {} of {} fine-pitch pins", self.elapsed(), made, self.esc_plans.len());
+        }
+    }
+
+    /// End game for pins of fine-pitch parts still open: the neighbours' escapes (a via parked in front of
+    /// the pin, a stub running across it) seal it in. Rip the copper of the open pin's net and of its
+    /// neighbours three pins either side near that stretch of the row, give them all straight escapes
+    /// (short and long in turn, either way round: which pins need the long stub depends on what lies
+    /// beyond the row), route the open net first and the neighbours after; kept only if the board ends up
+    /// less incomplete.
+    fn re_escape_repairs(&mut self) {
+        let rows = self.escape_rows();
+        let nn = self.w.b.nets.len() as u32;
+        let failing: Vec<u32> = (0..nn).filter(|&x| self.deficit(x) > 0 && !self.is_plane(x)).collect();
+        for net in failing {
+            if self.deficit(net) == 0 || self.elapsed() > self.cfg.seconds * 1.5 || self.stopped() {
+                continue;
+            }
+            // the net's pads that sit in a pin row (the sealed pin's own group may well be the largest)
+            let open: Vec<u32> = self.net_pads[net as usize].clone();
+            for row in rows.iter() {
+                let k = match row.iter().position(|x| open.contains(&x.0)) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                for parity in 0..2 {
+                    if self.deficit(net) == 0 {
+                        break;
+                    }
+                    let lo = k.saturating_sub(3);
+                    let hi = (k + 4).min(row.len());
+                    let plans: Vec<(u32, u32, P2, P2, f64)> = (lo..hi).filter_map(|i| self.escape_plan(row, i, parity)).collect();
+                    let mut nets: Vec<u32> = plans.iter().map(|p| p.1).collect();
+                    nets.sort_by_key(|&x| (x != net, x));
+                    nets.dedup();
+                    if !nets.contains(&net) {
+                        continue;
+                    }
+                    let before = self.total_deficit();
+                    let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone(), self.esc_plans.clone());
+                    let dsnap = self.pair_diag.clone();
+                    // only their copper near this stretch of pins: the rest of each net stays as the target
+                    let ends: Vec<P2> = (lo..hi).map(|i| row[i].1).collect();
+                    let near = |q: P2| ends.windows(2).any(|e| seg_point_dist(e[0], e[1], q) < 1.5) || ends.iter().any(|e| e.dist(q) < 1.5);
+                    let mut rip: Vec<u32> = Vec::new();
+                    for (pi, pc) in self.w.pieces.iter().enumerate() {
+                        if pc.alive && nets.contains(&pc.net) && pc.poly.iter().any(|&q| near(q)) {
+                            rip.push(pi as u32);
+                        }
+                    }
+                    for (oi, o) in self.w.objs.iter().enumerate() {
+                        if o.alive && o.s.kind == Kind::Via && nets.contains(&o.s.net) && near(o.s.center) {
+                            rip.extend(self.w.obj_pieces[oi].iter().cloned().filter(|&q| self.w.pieces[q as usize].alive));
+                        }
+                    }
+                    rip.sort();
+                    rip.dedup();
+                    for q in rip {
+                        self.rip_piece(q);
+                    }
+                    let first = self.esc_plans.len();
+                    self.esc_plans.extend(plans.iter().cloned());
+                    let dbg = std::env::var("TOPOR_SEALDBG").is_ok();
+                    for i in first..self.esc_plans.len() {
+                        let ok = self.plant_escape(i);
+                        if dbg {
+                            let (o, x, a, ax, len) = self.esc_plans[i];
+                            eprintln!("SEAL stub {} {} from ({:.2},{:.2}) dir ({:.2},{:.2}) len {:.2}: {}", self.w.objs[o as usize].s.name, self.w.b.nets[x as usize].name, a.x, a.y, ax.x, ax.y, len, if ok { "laid" } else { "no room" });
+                        }
+                    }
+                    for &x in &nets {
+                        self.route_net(x);
+                    }
+                    self.settle(8);
+                    let after = self.total_deficit();
+                    if std::env::var("TOPOR_SEALDBG").is_ok() {
+                        let open: Vec<String> = (0..nn).filter(|&x| self.deficit(x) > 0).map(|x| self.w.b.nets[x as usize].name.clone()).collect();
+                        eprintln!("SEAL after re-escape of {}: open {:?}", self.w.b.nets[net as usize].name, open);
+                    }
+                    let kept = after < before;
+                    let ev = format!("{} was sealed in at {} by its neighbours' escapes: re-escaped {} pins of that row ({} nets), deficit {} -> {}{}", self.w.b.nets[net as usize].name, self.w.objs[row[k].0 as usize].s.name, plans.len(), nets.len(), before, after, if kept { "" } else { ", undone" });
+                    if self.cfg.verbose {
+                        eprintln!("[{:.1}s] {}", self.elapsed(), ev);
+                    }
+                    if kept {
+                        self.events.push(ev);
+                    } else {
+                        self.w = snap.0;
+                        self.ties = snap.1;
+                        self.history = snap.2;
+                        self.junctions = snap.3;
+                        self.esc_plans = snap.4;
+                        self.pair_diag = dsnap;
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_escape_end(&self, o: u32) -> bool {
+        self.w.objs.get(o as usize).map_or(false, |ob| ob.alive && ob.s.name.starts_with("junction:esc:"))
+    }
+
+    /// Lay planned escape i (a straight stub from the pad to a junction), unless the pad already has a wire.
+    fn plant_escape(&mut self, i: usize) -> bool {
+        let (o, net, a, ax, len) = self.esc_plans[i];
+        if !self.w.objs[o as usize].alive || self.w.obj_pieces[o as usize].iter().any(|&p| self.w.pieces[p as usize].alive) {
+            return false;
+        }
+        let ni = &self.w.b.nets[net as usize];
+        let l = match (0..self.w.nsig()).find(|&l| self.w.objs[o as usize].s.layers & ni.allowed & (1 << l) != 0) {
+            Some(l) => l,
+            None => return false,
+        };
+        let r = ni.wpref[l] / 2.0;
+        let at = a + ax * len;
+        if !self.w.point_fits(net, at, r, l) {
+            return false;
+        }
+        let j = match self.w.add_junction(net, at, r, l) {
+            Ok(j) => j,
+            Err(_) => return false,
+        };
+        self.w.objs[j as usize].s.name = format!("junction:esc:{}", self.w.b.nets[net as usize].name);
+        self.junctions.push(j);
+        if self.connect_within(net, o, j, NONE, len + 0.6) {
+            return true;
+        }
+        let _ = self.w.remove_via(j);
+        self.junctions.retain(|&x| x != j);
+        false
     }
 
     /// Nets with pins on fine-pitch parts (16+ pads, neighbours of other nets under 0.7 mm apart), in
@@ -2222,6 +2646,9 @@ impl Router {
         }
         if let Some(name) = self.cfg.only.clone() {
             if let Some(&net) = self.w.b.net_index.get(&name) {
+                if std::env::var("TOPOR_ESCPLAN").is_ok() {
+                    self.plan_escapes();
+                }
                 let d = self.route_net(net);
                 eprintln!("only {}: deficit {}", name, d);
             }
@@ -2246,15 +2673,16 @@ impl Router {
         // attempt in this order always wins.
         let has_fanout = !self.fanout_order().is_empty();
         let forced: Option<usize> = std::env::var("TOPOR_ATTEMPT").ok().and_then(|x| x.parse().ok());
-        // (long nets first, with or without the fan-out, did worse on every test board: TOPOR_ATTEMPT=2, 3)
-        let variants: Vec<(bool, bool)> = if forced.is_some() { vec![(false, false), (true, false), (false, true), (true, true)] } else if has_fanout { vec![(false, false), (true, false)] } else { vec![(false, false)] };
+        // (planned escapes everywhere and long nets first did worse on every test board: TOPOR_ATTEMPT=2..4)
+        let all = vec![(false, false, false), (true, false, false), (true, false, true), (false, true, false), (true, true, false)];
+        let variants: Vec<(bool, bool, bool)> = if forced.is_some() { all } else if has_fanout { all[..3].to_vec() } else { vec![all[0]] };
         if let Some(k) = forced {
-            let (fan, long) = variants[k.min(variants.len() - 1)];
-            self.route_rest(fan, long);
+            let (fan, long, esc) = variants[k.min(variants.len() - 1)];
+            self.route_rest(fan, long, esc);
         } else if std::env::var("TOPOR_FANOUT").is_ok() {
-            self.route_rest(true, false);
+            self.route_rest(true, false, false);
         } else if self.cfg.single_attempt || variants.len() == 1 {
-            self.route_rest(false, false);
+            self.route_rest(false, false, false);
         } else {
             let stops: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = variants.iter().map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
             let mut others: Vec<Router> = (1..variants.len())
@@ -2275,10 +2703,10 @@ impl Router {
                     .drain(..)
                     .enumerate()
                     .map(|(i, mut o)| {
-                        let (fan, long) = variants[i + 1];
+                        let (fan, long, esc) = variants[i + 1];
                         let stops = &stops;
                         sc.spawn(move || {
-                            o.route_rest(fan, long);
+                            o.route_rest(fan, long, esc);
                             if !o.stopped() && o.total_deficit() == 0 {
                                 call_off_after(i + 1, stops);
                             }
@@ -2286,17 +2714,18 @@ impl Router {
                         })
                     })
                     .collect();
-                self.route_rest(false, false);
+                self.route_rest(false, false, false);
                 if self.total_deficit() == 0 {
                     call_off_after(0, &stops);
                 }
                 hs.into_iter().enumerate().map(|(i, h)| (i + 1, h.join().expect("routing attempt"))).collect()
             });
             let name = |k: usize| match variants[k] {
-                (false, false) => "plain order",
-                (true, false) => "fine-pitch parts fanned out first",
-                (false, true) => "long nets first",
-                (true, true) => "fan-out first, then long nets first",
+                (true, _, true) => "fine-pitch parts given a planned fan-out first",
+                (false, false, _) => "plain order",
+                (true, false, _) => "fine-pitch parts fanned out first",
+                (false, true, _) => "long nets first",
+                (true, true, _) => "fan-out first, then long nets first",
             };
             let first = self.total_deficit();
             let mut best: Option<(usize, usize)> = None;
@@ -2335,8 +2764,15 @@ impl Router {
     }
 
     /// Planes, signals, rip-up and the end-game repairs, after the pairs.
-    fn route_rest(&mut self, fanout: bool, long_first: bool) {
+    fn route_rest(&mut self, fanout: bool, long_first: bool, escapes: bool) {
         let nn = self.w.b.nets.len() as u32;
+        if escapes {
+            if std::env::var("TOPOR_STUBS").is_ok() {
+                self.plan_escapes();
+            } else {
+                self.plan_fanout();
+            }
+        }
         if fanout {
             let fan = self.fanout_order();
             for &net in &fan {
@@ -2475,6 +2911,7 @@ impl Router {
             return;
         }
         self.clear_area_repairs();
+        self.re_escape_repairs();
         self.rescue_pairs();
     }
 
@@ -2667,6 +3104,17 @@ impl Router {
 
     /// Remove vias that connect nothing (one piece or none) and their lone pieces.
     pub fn cleanup(&mut self) {
+        // planned escape stubs nothing continues from: dead ends
+        for j in 0..self.w.objs.len() as u32 {
+            if !self.is_escape_end(j) {
+                continue;
+            }
+            let live: Vec<u32> = self.w.obj_pieces[j as usize].iter().cloned().filter(|&p| self.w.pieces[p as usize].alive).collect();
+            if live.len() == 1 {
+                self.rip_piece(live[0]);
+            }
+        }
+        self.esc_plans.clear();
         loop {
             let mut changed = false;
             for o in 0..self.w.objs.len() as u32 {
@@ -2718,6 +3166,9 @@ impl Router {
                 continue;
             }
             let net = ob.s.net;
+            // kept only if the net reconnects without it and nothing else comes apart
+            let before = self.total_deficit();
+            let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
             for p in live {
                 self.rip_piece(p);
             }
@@ -2728,6 +3179,12 @@ impl Router {
                 for v in self.repair_net(net) {
                     self.route_net(v);
                 }
+            }
+            if self.total_deficit() > before {
+                self.w = snap.0;
+                self.ties = snap.1;
+                self.history = snap.2;
+                self.junctions = snap.3;
             }
         }
     }

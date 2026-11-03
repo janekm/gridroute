@@ -502,11 +502,20 @@ impl Board {
     }
 
     pub fn in_plane(&self, net: u32, pos: P2, r: f64) -> bool {
+        self.in_plane_on(net, pos, r, None)
+    }
+
+    /// in_plane() for copper on one layer only (an SMD pad): a region of its net on that layer. A plane
+    /// net without any region joins its plane anywhere, as through copper.
+    pub fn in_plane_on(&self, net: u32, pos: P2, r: f64, layer: Option<usize>) -> bool {
         let mut any = false;
         let m = r + 0.25;
         let near = |poly: &[P2]| point_in_poly(poly, pos) || poly_edge_dist(poly, pos) < m;
         for reg in self.plane_regions.iter().filter(|x| x.net == net) {
             any = true;
+            if layer.map_or(false, |l| l != reg.layer) {
+                continue;
+            }
             if !point_in_poly(&reg.poly, pos) || poly_edge_dist(&reg.poly, pos) < m || reg.holes.iter().any(|h| near(h)) {
                 continue;
             }
@@ -518,7 +527,7 @@ impl Board {
             }
             return true;
         }
-        !any
+        !any && layer.is_none()
     }
 
     /// Via (diameter, drill) for a net.

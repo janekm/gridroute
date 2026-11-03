@@ -314,7 +314,10 @@ impl World {
         let first = objs.len() as u32;
         let (merged, map, mut warnings) = merge_overlaps(specs, nsig);
         for s in merged {
-            let plane = s.through && s.net != NONE && b.nets[s.net as usize].plane.is_some() && pad_in_plane(&b, &s);
+            // through copper joins its plane in any region of the net; an SMD pad only in one on its layer
+            // (an outer-layer pour that is the net's plane, as for a module's ground)
+            let smd_layer = (0..b.signal.len()).find(|&l| s.layers == 1 << l).map(|l| b.signal[l]);
+            let plane = s.net != NONE && b.nets[s.net as usize].plane.is_some() && s.kind == Kind::Pad && !s.name.starts_with("zone:") && if s.through { pad_in_plane(&b, &s) } else { smd_layer.map_or(false, |l| b.in_plane_on(s.net, s.center, 0.0, Some(l))) };
             objs.push(Obj { s, alive: true, plane, lv: Vec::new() });
         }
         let spec_obj: Vec<u32> = map.iter().map(|&k| first + k as u32).collect();
