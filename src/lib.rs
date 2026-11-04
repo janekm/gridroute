@@ -6,6 +6,7 @@
 //! - `gr_field`: cost-to-target field (Metal tiled relaxation or CPU Dijkstra); `gr_astar_hybrid`: A* that switches
 //!   to field guidance when a search gets expensive.
 //! - `gr_hash_*`: content hashes for memoising searches across runs.
+//! - `relax`: elastic relaxation of routed copper (wires and vias pulled tight together), CPU or Metal.
 //!
 //! All grids are dense row-major arrays owned by the caller; nothing is retained between calls.
 
@@ -15,8 +16,11 @@ pub mod field;
 pub mod flood;
 pub mod hash;
 pub mod reach;
+pub mod relax;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod gpu;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub mod relax_gpu;
 
 use dilate::{Element, Grid3, Window};
 use std::sync::atomic::{AtomicI64, Ordering};
