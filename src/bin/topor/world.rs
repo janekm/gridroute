@@ -3256,6 +3256,14 @@ pub fn clr_in(b: &Board, x: &Attr, y: &Attr) -> Option<f64> {
     if x.net != NONE && x.net == y.net {
         return None;
     }
+    // a pair's ribbon (its two members as one wire while it is routed) and the pair's own copper may touch: it
+    // starts at the members' pads and runs over their fixed copper; the members keep their gap to each other
+    if b.ribbon_touch && x.net != NONE && y.net != NONE {
+        let (a, c) = (x.net as usize, y.net as usize);
+        if a < b.family.len() && c < b.family.len() && b.family[a] == b.family[c] && (b.nets[a].ribbon.is_some() || b.nets[c].ribbon.is_some()) {
+            return None;
+        }
+    }
     let c = if x.kind == Kind::Outline || y.kind == Kind::Outline {
         b.edge_clear
     } else if x.kind == Kind::Hole || y.kind == Kind::Hole {

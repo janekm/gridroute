@@ -43,6 +43,19 @@ pub struct Blocker {
     pub near_parts: Vec<String>,
 }
 
+/// What became of the suggested copper (see import_suggestions).
+#[derive(Clone, Debug, Default)]
+pub struct Suggested {
+    pub vias_kept: usize,
+    pub vias_left_out: usize,
+    pub tracks_kept: usize,
+    pub tracks_left_out: usize,
+    pub notes: Vec<String>,
+    /// Indices into the model's suggested vias and tracks that broke a rule (not those reaching no pad).
+    pub bad_vias: Vec<usize>,
+    pub bad_tracks: Vec<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Way {
     /// The nets it crosses, with how many of their wires.
@@ -113,9 +126,19 @@ pub struct Router {
     /// whether pairs may be crossed, the budget): other nets' copper is passable to them, so the same search
     /// fails again until one of those changes, and is not run again.
     pub soft_dead: std::collections::HashSet<(u32, u64)>,
+    /// Pieces imported from the model's suggested copper (hand-drawn tracks routed as the router's own), and
+    /// their nets: rip-up moves them at a small premium, pair stations treat them like fixed copper.
+    pub suggested: std::collections::HashSet<u32>,
+    pub suggested_nets: std::collections::HashSet<u32>,
+    /// Per net: the coupled length (mm) of the differential pair it belongs to, as last measured; crossing it
+    /// costs in proportion, so rip-up does not break good coupling for a short cut.
+    pub pair_coupled: Vec<f64>,
     /// Pair stations that fixed copper already joins are merged into one (see pair_stations); off for the
-    /// attempts that route the pairs split at every station, as before, to compare.
+    /// attempts that route the pairs as before, to compare.
     pub merge_stations: bool,
+    /// Pairs routed as before: no merged stations, no ribbon start at the pad tips, no ribbon over the pair's own
+    /// copper, no lane retreat for a member's stub, no cost for lost coupling (see route_all).
+    pub legacy_pairs: bool,
     /// Wall time and calls per phase of the run (the attempt that is kept), for the time report.
     pub prof: std::collections::BTreeMap<&'static str, (f64, usize)>,
 }
@@ -139,6 +162,12 @@ pub struct Stats {
     pub soft_fail: usize,
     pub soft_fail_s: f64,
     pub soft_skipped: usize,
+}
+
+/// Extra cost per millimetre of coupling a rip of a pair would lose (TOPOR_COUPLE_COST).
+fn couple_cost() -> f64 {
+    static C: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TOPOR_COUPLE_COST").ok().and_then(|x| x.parse().ok()).unwrap_or(2.0))
 }
 
 /// A segment failure in words for the design side.
@@ -204,7 +233,7 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), merge_stations: true, prof: Default::default() }
+        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default() }
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -346,7 +375,11 @@ impl Router {
             };
             // an RF line can only go back on its one layer: as costly to move as a pair
             let rf = self.w.b.rf_nets.iter().any(|x| x.0 as usize == i);
-            cross_cost[i] = if self.w.b.nets[i].plane.is_some() { 2.5 } else if paired || rf { pair_cost } else { 6.0 } + h;
+            // (a coupled pair costs more for every millimetre of coupling a rip would lose)
+            let coupled = if paired && !self.legacy_pairs { couple_cost() * self.pair_coupled.get(i).cloned().unwrap_or(0.0) } else { 0.0 };
+            // (suggested copper stays unless the net in the way needs it: a small premium)
+            let sug = if self.suggested_nets.contains(&(i as u32)) { 10.0 } else { 0.0 };
+            cross_cost[i] = if self.w.b.nets[i].plane.is_some() { 2.5 } else if paired || rf { pair_cost + coupled } else { 6.0 } + h + sug;
         }
         Query {
             net,
@@ -1161,6 +1194,11 @@ impl Router {
         }
         let rr = ri.wpref[l] / 2.0;
         let room = if split { rr + 0.08 } else { rr };
+        // pads already about as far apart as the coupled members (fine-pitch pins side by side): the members are
+        // together at the pad tips, so the ribbon may start right there, without room to fan in
+        let coupled = self.w.b.nets[op.s.net as usize].wpref[l].max(self.w.b.nets[on.s.net as usize].wpref[l]) + self.w.b.pair_gap[op.s.net as usize];
+        let close = !self.legacy_pairs && !split && cp.dist(cn) <= coupled + 0.1;
+        let extras: &[f64] = if close { &[0.05, 0.15, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0, 2.8] } else { &[0.35, 0.5, 0.7, 1.0, 1.4, 2.0, 2.8] };
         for e in sides {
             let mut ext: f64 = 0.0;
             for o in [op, on] {
@@ -1168,7 +1206,7 @@ impl Router {
                     ext = ext.max((*q - m).dot(e) + o.s.r);
                 }
             }
-            for &extra in &[0.35, 0.5, 0.7, 1.0, 1.4, 2.0, 2.8] {
+            for &extra in extras {
                 for &tilt in &[0.0f64, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0] {
                     let (sn, cs) = tilt.to_radians().sin_cos();
                     let e2 = p2(e.x * cs - e.y * sn, e.x * sn + e.y * cs);
@@ -1893,13 +1931,33 @@ impl Router {
             index.entry(o).or_insert(i);
         }
         let mut par: Vec<usize> = (0..objs.len()).collect();
-        for &(x, y) in &self.ties {
+        let join = |x: u32, y: u32, par: &mut Vec<usize>| {
             if let (Some(&i), Some(&j)) = (index.get(&x), index.get(&y)) {
-                let (a, b) = (find(&mut par, i), find(&mut par, j));
+                let (a, b) = (find(par, i), find(par, j));
                 if a != b {
                     par[b] = a;
                 }
             }
+        };
+        for &(x, y) in &self.ties {
+            join(x, y, &mut par);
+        }
+        // suggested copper counts as drawn: chains of its pieces through vias and junctions join what they reach
+        let mut sug: Vec<(u32, u32)> = self.suggested.iter().filter(|&&q| self.w.pieces[q as usize].alive && self.w.pieces[q as usize].net == net).map(|&q| (self.w.pieces[q as usize].a.obj, self.w.pieces[q as usize].b.obj)).collect();
+        sug.sort();
+        // a via or junction between two pieces is not a station object itself: join through it
+        let mut through: HashMap<u32, Vec<u32>> = HashMap::default();
+        for &(a, b) in &sug {
+            through.entry(a).or_default().push(b);
+            through.entry(b).or_default().push(a);
+        }
+        for (_, ends) in through.iter() {
+            for w in ends.windows(2) {
+                join(w[0], w[1], &mut par);
+            }
+        }
+        for &(a, b) in &sug {
+            join(a, b, &mut par);
         }
         objs.iter().enumerate().map(|(i, &o)| (o, find(&mut par, i))).collect()
     }
@@ -2074,7 +2132,7 @@ impl Router {
             let mut failed = Vec::new();
             for &(net, j, pad) in &left {
                 let cap = 3.0 * self.w.objs[j as usize].s.center.dist(self.w.objs[pad as usize].s.center) + 2.0 + 2.0 * self.cfg.via_cost;
-                if !(self.connect_within(net, j, pad, NONE, cap) || self.connect_within(net, pad, j, NONE, cap)) {
+                if !(self.connect_within(net, j, pad, NONE, cap) || self.connect_within(net, pad, j, NONE, cap) || self.stub_after_retreat(net, j, pad, cap)) {
                     failed.push((net, j, pad));
                 }
             }
@@ -2092,6 +2150,67 @@ impl Router {
             return Err("members not joined station to station".into());
         }
         Ok(())
+    }
+
+    /// A member's stub from its lane end `j` to `pad` that did not fit: the lane ends earlier instead (0.3, 0.6 or
+    /// 1 mm back along it, this member only), which leaves its stub room to turn. Kept if the stub then joins.
+    fn stub_after_retreat(&mut self, net: u32, j: u32, pad: u32, cap: f64) -> bool {
+        if self.legacy_pairs {
+            return false;
+        }
+        for d in [0.3, 0.6, 1.0] {
+            let snap = (self.w.clone(), self.junctions.clone());
+            if let Some(nj) = self.retreat_lane_end(net, j, d) {
+                if self.connect_within(net, nj, pad, NONE, cap + d) || self.connect_within(net, pad, nj, NONE, cap + d) {
+                    self.junctions.retain(|&x| x != j);
+                    self.junctions.push(nj);
+                    return true;
+                }
+            }
+            self.w = snap.0;
+            self.junctions = snap.1;
+        }
+        false
+    }
+
+    /// End the member lane of `net` that ends at junction `j` a length `d` earlier, at a new junction (returned).
+    /// The board may be left half changed on failure: the caller restores it.
+    fn retreat_lane_end(&mut self, net: u32, j: u32, d: f64) -> Option<u32> {
+        let pid = self.w.obj_pieces[j as usize].iter().cloned().find(|&q| self.w.pieces[q as usize].alive && self.w.pieces[q as usize].net == net)?;
+        let pc = self.w.pieces[pid as usize].clone();
+        let l = pc.layer as usize;
+        // the lane from its other end to j
+        let (other, mut poly) = if pc.b.obj == j { (pc.a, pc.poly.clone()) } else { (pc.b, pc.poly.iter().rev().cloned().collect::<Vec<_>>()) };
+        let total: f64 = poly.windows(2).map(|x| x[0].dist(x[1])).sum();
+        if total < d + 0.2 {
+            return None;
+        }
+        let mut left = d;
+        while poly.len() >= 2 {
+            let k = poly.len();
+            let seg = poly[k - 1].dist(poly[k - 2]);
+            if seg > left + 1e-9 {
+                poly[k - 1] = poly[k - 1].lerp(poly[k - 2], left / seg);
+                break;
+            }
+            left -= seg;
+            poly.pop();
+        }
+        let cut = *poly.last()?;
+        let r = self.w.objs[j as usize].s.r;
+        self.w.remove_piece(pid);
+        self.w.remove_via(j).ok()?;
+        let nj = self.w.add_junction(net, cut, r, l).ok()?;
+        let tb = Term { obj: nj, vtx: self.w.objs[nj as usize].lv[l] };
+        if other.vtx != NONE {
+            poly[0] = self.w.vpos(l, other.vtx);
+        }
+        *poly.last_mut().unwrap() = self.w.vpos(l, tb.vtx);
+        let cx = self.w.thread_poly(l, &poly, other, tb)?;
+        let np = self.w.add_piece(net, l, pc.width, other, tb, &cx);
+        self.w.seed_poly(np, poly);
+        self.w.realize_dirty();
+        Some(nj)
     }
 
     /// Replace a routed ribbon by its two members: each member threaded through the triangulation along
@@ -2417,10 +2536,15 @@ impl Router {
         if self.deficit(n) > 0 {
             self.route_net(n);
         }
-        let cf = self.pair_report().into_iter().find(|x| self.w.b.net_index.get(&x.0) == Some(&p)).map(|x| x.4).unwrap_or(0.0);
+        self.note_rebuild(p, n, "rebuilt");
+    }
+
+    /// Add how a rip-up rebuild of pair (p, n) ended to its last displacement note.
+    fn note_rebuild(&mut self, p: u32, n: u32, how: &str) {
+        let cf = self.pair_measure_routed(p, n).map_or(0.0, |x| x.2);
         let done = self.deficit(p) + self.deficit(n) == 0;
         if let Some(m) = self.pair_diag.entry(p).or_default().moved.last_mut() {
-            m.push_str(&format!("; rebuilt {}, {:.0}% coupled", if done { "complete" } else { "incomplete" }, cf * 100.0));
+            m.push_str(&format!("; {} {}, {:.0}% coupled", how, if done { "complete" } else { "incomplete" }, cf * 100.0));
         }
     }
 
@@ -2853,45 +2977,190 @@ impl Router {
     }
 
     /// Per pair: member path lengths between the pair's ends, mismatch, and the coupled fraction.
+    /// Measure each pair's coupled length again (for the rip-up costs).
+    pub fn update_pair_coupling(&mut self) {
+        let mut v = vec![0.0; self.w.b.nets.len()];
+        for (a, b, lp, ln, cf) in self.pair_report() {
+            let len = if lp.is_finite() && ln.is_finite() { lp.min(ln) } else { 0.0 };
+            for name in [a, b] {
+                if let Some(&i) = self.w.b.net_index.get(&name) {
+                    v[i as usize] = cf * len;
+                }
+            }
+        }
+        self.pair_coupled = v;
+    }
+
+    /// Per pair (p, n): member path lengths between the pair's ends and the coupled fraction, on the router's own
+    /// wires: what routing decisions go by (pair order, attempts, rip-up costs, rebuilds).
     pub fn pair_report(&self) -> Vec<(String, String, f64, f64, f64)> {
+        self.pairs_with(|me, p, n| me.pair_measure_routed(p, n))
+    }
+
+    /// The same as reported: fixed copper counts too (a pair kept as drawn is measured), between the pads.
+    pub fn pair_report_full(&self) -> Vec<(String, String, f64, f64, f64)> {
+        self.pairs_with(|me, p, n| me.pair_measure(p, n))
+    }
+
+    fn pairs_with(&self, f: impl Fn(&Router, u32, u32) -> Option<(f64, f64, f64)>) -> Vec<(String, String, f64, f64, f64)> {
         let mut out = Vec::new();
         for p in 0..self.w.b.nets.len() as u32 {
             let n = self.w.b.partner.get(p as usize).cloned().unwrap_or(NONE);
             if n == NONE || n < p {
                 continue;
             }
-            let ((pa, na), (pb, nb)) = match self.pair_ends(p, n) {
-                Some(x) => x,
-                None => continue,
-            };
-            let lp = self.net_path_len(p, pa, pb).unwrap_or(f64::NAN);
-            let ln = self.net_path_len(n, na, nb).unwrap_or(f64::NAN);
-            // coupled fraction: length of n's pad-to-pad path within the coupling distance of p's copper
-            // on the same layer (sampled every 50 um)
-            let gap = self.w.b.pair_gap[p as usize];
-            let mut tot = 0.0;
-            let mut cpl = 0.0;
-            let chain: Vec<u32> = self.piece_chain(n, na, nb).map(|c| c.iter().map(|x| x.0).collect()).unwrap_or_default();
-            for &pi in &chain {
-                let pc = &self.w.pieces[pi as usize];
-                for sgm in pc.poly.windows(2) {
-                    let len = sgm[0].dist(sgm[1]);
-                    let k = (len / 0.05).ceil().max(1.0) as usize;
-                    for i in 0..k {
-                        let m = sgm[0].lerp(sgm[1], (i as f64 + 0.5) / k as f64);
-                        tot += len / k as f64;
-                        let near = self.w.pieces.iter().filter(|x| x.alive && x.net == p && x.layer == pc.layer).any(|q| {
-                            q.poly.windows(2).any(|t| seg_point_dist(t[0], t[1], m) < (q.width + pc.width) / 2.0 + gap + 0.03)
-                        });
-                        if near {
-                            cpl += len / k as f64;
-                        }
+            if let Some((lp, ln, cf)) = f(self, p, n) {
+                out.push((self.w.b.nets[p as usize].name.clone(), self.w.b.nets[n as usize].name.clone(), lp, ln, cf));
+            }
+        }
+        out
+    }
+
+    /// One pair on the router's wires: (p's length, n's length, coupled fraction: the length of n's pad-to-pad path
+    /// within the coupling distance of p's wires on the same layer, sampled every 50 um).
+    pub fn pair_measure_routed(&self, p: u32, n: u32) -> Option<(f64, f64, f64)> {
+        let ((pa, na), (pb, nb)) = self.pair_ends(p, n)?;
+        let lp = self.net_path_len(p, pa, pb).unwrap_or(f64::NAN);
+        let ln = self.net_path_len(n, na, nb).unwrap_or(f64::NAN);
+        let chain: Vec<u32> = self.piece_chain(n, na, nb).map(|c| c.iter().map(|x| x.0).collect()).unwrap_or_default();
+        let steps: Vec<(Vec<P2>, usize, f64)> = chain.iter().map(|&pi| { let q = &self.w.pieces[pi as usize]; (q.poly.clone(), q.layer as usize, q.width) }).collect();
+        Some((lp, ln, self.coupled_fraction(p, &steps, false)))
+    }
+
+    /// One pair as reported: lengths between its outermost pads (stations not merged through fixed copper) and the
+    /// coupled fraction, both through fixed copper too (the lines between the centres of tied pieces).
+    pub fn pair_measure(&self, p: u32, n: u32) -> Option<(f64, f64, f64)> {
+        let st = self.pair_stations_with(p, n, false);
+        if st.len() < 2 {
+            return None;
+        }
+        let ((pa, na), (pb, nb)) = (st[0], st[st.len() - 1]);
+        let path_p = self.report_path(p, pa, pb);
+        let path_n = self.report_path(n, na, nb);
+        let len = |x: &Option<Vec<(Vec<P2>, usize, f64)>>| x.as_ref().map_or(f64::NAN, |v| v.iter().map(|s| s.0.windows(2).map(|t| t[0].dist(t[1])).sum::<f64>()).sum());
+        Some((len(&path_p), len(&path_n), path_n.as_ref().map_or(0.0, |st| self.coupled_fraction(p, st, true))))
+    }
+
+    /// The part of the path `steps` (polyline, layer, width) of p's partner within the coupling distance of p's
+    /// copper on the same layer (its wires, and with `fixed` its fixed copper ties), sampled every 50 um.
+    fn coupled_fraction(&self, p: u32, steps: &[(Vec<P2>, usize, f64)], fixed: bool) -> f64 {
+        // p's copper by layer, indexed once
+        let mut pcu: Vec<Vec<(P2, P2, f64)>> = vec![Vec::new(); self.w.nsig()];
+        for q in self.w.pieces.iter().filter(|x| x.alive && x.net == p) {
+            for t in q.poly.windows(2) {
+                pcu[q.layer as usize].push((t[0], t[1], q.width));
+            }
+        }
+        if fixed {
+            for (x, y, l, w) in self.tie_links(p) {
+                pcu[l].push((self.w.objs[x as usize].s.center, self.w.objs[y as usize].s.center, w));
+            }
+        }
+        let gap = self.w.b.pair_gap[p as usize];
+        let (mut tot, mut cpl) = (0.0, 0.0);
+        for (poly, l, w) in steps {
+            for sgm in poly.windows(2) {
+                let len = sgm[0].dist(sgm[1]);
+                let k = (len / 0.05).ceil().max(1.0) as usize;
+                for i in 0..k {
+                    let m = sgm[0].lerp(sgm[1], (i as f64 + 0.5) / k as f64);
+                    tot += len / k as f64;
+                    if pcu[*l].iter().any(|&(a, b, qw)| seg_point_dist(a, b, m) < (qw + w) / 2.0 + gap + 0.03) {
+                        cpl += len / k as f64;
                     }
                 }
             }
-            out.push((self.w.b.nets[p as usize].name.clone(), self.w.b.nets[n as usize].name.clone(), lp, ln, if tot > 0.0 { cpl / tot } else { 0.0 }));
+        }
+        if tot > 0.0 { cpl / tot } else { 0.0 }
+    }
+
+    /// A net's fixed copper ties (a line between the tied objects' centres): (from, to, layer, width).
+    fn tie_links(&self, net: u32) -> Vec<(u32, u32, usize, f64)> {
+        let width = |s: &crate::model::ObjSpec| -> f64 {
+            if s.pts.len() < 3 {
+                return 2.0 * s.r;
+            }
+            let m = s.pts.len();
+            let inner = (0..m).map(|i| seg_point_dist(s.pts[i], s.pts[(i + 1) % m], s.center)).fold(f64::INFINITY, f64::min);
+            2.0 * (inner + s.r)
+        };
+        let mut out = Vec::new();
+        for &(x, y) in &self.ties {
+            let (sx, sy) = (&self.w.objs[x as usize].s, &self.w.objs[y as usize].s);
+            if sx.net != net || sy.net != net || sx.layers & sy.layers == 0 {
+                continue;
+            }
+            let w = width(sx).min(width(sy));
+            let mut ls = sx.layers & sy.layers;
+            while ls != 0 {
+                let l = ls.trailing_zeros() as usize;
+                ls &= ls - 1;
+                if l < self.w.nsig() {
+                    out.push((x, y, l, w));
+                }
+            }
         }
         out
+    }
+
+    /// The shortest path of a net between two of its objects through its wires and its fixed copper ties, as steps
+    /// (polyline, layer, width).
+    fn report_path(&self, net: u32, a: u32, b: u32) -> Option<Vec<(Vec<P2>, usize, f64)>> {
+        let objs = self.net_objs(net);
+        let ix: HashMap<u32, usize> = objs.iter().enumerate().map(|(i, &o)| (o, i)).collect();
+        let mut adj: Vec<Vec<(usize, Vec<P2>, usize, f64)>> = vec![Vec::new(); objs.len()];
+        for (i, &o) in objs.iter().enumerate() {
+            for &pc in &self.w.obj_pieces[o as usize] {
+                let q = &self.w.pieces[pc as usize];
+                if !q.alive || q.net != net || q.poly.len() < 2 {
+                    continue;
+                }
+                let other = if q.a.obj == o { q.b.obj } else { q.a.obj };
+                if let Some(&j) = ix.get(&other) {
+                    let mut poly = q.poly.clone();
+                    if q.a.obj != o {
+                        poly.reverse();
+                    }
+                    adj[i].push((j, poly, q.layer as usize, q.width));
+                }
+            }
+        }
+        for (x, y, l, w) in self.tie_links(net) {
+            if let (Some(&i), Some(&j)) = (ix.get(&x), ix.get(&y)) {
+                let (cx, cy) = (self.w.objs[x as usize].s.center, self.w.objs[y as usize].s.center);
+                adj[i].push((j, vec![cx, cy], l, w));
+                adj[j].push((i, vec![cy, cx], l, w));
+            }
+        }
+        let (ia, ib) = (*ix.get(&a)?, *ix.get(&b)?);
+        let mut dist = vec![f64::INFINITY; objs.len()];
+        let mut prev: Vec<Option<(usize, usize)>> = vec![None; objs.len()];
+        let mut done = vec![false; objs.len()];
+        dist[ia] = 0.0;
+        loop {
+            let u = (0..objs.len()).filter(|&i| !done[i] && dist[i].is_finite()).min_by(|&x, &y| dist[x].partial_cmp(&dist[y]).unwrap())?;
+            if u == ib {
+                break;
+            }
+            done[u] = true;
+            for (k, (j, poly, _, _)) in adj[u].iter().enumerate() {
+                let d = dist[u] + poly.windows(2).map(|t| t[0].dist(t[1])).sum::<f64>();
+                if d < dist[*j] {
+                    dist[*j] = d;
+                    prev[*j] = Some((u, k));
+                }
+            }
+        }
+        let mut steps = Vec::new();
+        let mut cur = ib;
+        while cur != ia {
+            let (u, k) = prev[cur]?;
+            let (_, poly, l, w) = &adj[u][k];
+            steps.push((poly.clone(), *l, *w));
+            cur = u;
+        }
+        steps.reverse();
+        Some(steps)
     }
 
     fn trace_pairs(&self, stage: &str) {
@@ -2924,19 +3193,22 @@ impl Router {
                 self.pair_len[p as usize] = self.w.objs[pa as usize].s.center.dist(self.w.objs[pb as usize].s.center);
             }
         }
-        // where fixed copper joins stations of a pair, the pairs are routed both with those stations merged and
-        // split as before, at once; the routing attempts then run on both, the merged ones first, and the board
-        // keeps whichever comes out more complete (coupling never costs a connection)
+        // the pairs are routed both as they are now (stations fixed copper joins merged, ribbons from the pad tips,
+        // member stubs that may end the lane earlier, rip-up charged for lost coupling) and as before, at once;
+        // the routing attempts then run on both, the new ones first, and the board keeps whichever comes out more
+        // complete: the coupling never costs a connection (TOPOR_NOSPLITPAIRS: the new ones alone)
         let mut split_pairs: Option<Router> = None;
         {
             let _t = Instant::now();
-            let differs = !self.cfg.fast && !self.cfg.single_attempt && std::env::var("TOPOR_NOSPLITPAIRS").is_err() && (0..nn).any(|p| {
+            let pairs = !self.cfg.fast && !self.cfg.single_attempt && std::env::var("TOPOR_NOSPLITPAIRS").is_err() && (0..nn).any(|p| {
                 let n = self.w.b.partner.get(p as usize).cloned().unwrap_or(NONE);
-                n != NONE && p < n && self.pair_stations_with(p, n, true) != self.pair_stations_with(p, n, false)
+                n != NONE && p < n && self.pair_stations_with(p, n, false).len() >= 2
             });
-            if differs {
+            if pairs {
                 let mut other = self.clone();
                 other.merge_stations = false;
+                other.legacy_pairs = true;
+                other.w.b.ribbon_touch = false;
                 other.cfg.verbose = false;
                 split_pairs = std::thread::scope(|sc| {
                     let h = sc.spawn(move || {
@@ -2944,10 +3216,14 @@ impl Router {
                         other
                     });
                     self.route_pairs();
-                    Some(h.join().expect("pairs split at every station"))
+                    Some(h.join().expect("pairs routed as before"))
                 });
             } else {
                 self.route_pairs();
+            }
+            self.update_pair_coupling();
+            if let Some(o) = split_pairs.as_mut() {
+                o.update_pair_coupling();
             }
             self.prof_add("pairs", _t);
         }
@@ -2974,7 +3250,7 @@ impl Router {
         } else if (self.cfg.single_attempt || variants.len() == 1) && split_pairs.is_none() {
             self.route_rest(false, false, false);
         } else {
-            // the orders on these pairs, then (if they were routed so too) on the pairs split at every station
+            // the orders on these pairs, then (if they were routed so too) on the pairs routed as before
             let mut atts: Vec<(bool, (bool, bool, bool))> = variants.iter().map(|&v| (false, v)).collect();
             if split_pairs.is_some() {
                 atts.extend(variants.iter().map(|&v| (true, v)));
@@ -2988,27 +3264,36 @@ impl Router {
                     o
                 })
                 .collect();
+            // a complete board calls off the later attempts on the same pairs (the other pairs still finish, to
+            // compare their coupling)
+            let group_end = |k: usize| if k < variants.len() { variants.len() } else { atts.len() };
             let call_off_after = |k: usize, stops: &[std::sync::Arc<std::sync::atomic::AtomicBool>]| {
-                for s in &stops[k + 1..] {
+                for s in &stops[k + 1..group_end(k)] {
                     s.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             };
             // a race: once the first attempt is done, the others get as long again as it took (at least 5 s;
-            // TOPOR_GRACE: another fraction of it), then wrap up with what they have, which still counts
+            // TOPOR_GRACE: another fraction of it), then wrap up with what they have, which still counts. Once one
+            // is done complete, the others can only win by coupling more, complete too: they get half as long
+            // again, then those still running are called off (the first, on this thread, wraps up)
             let hurry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let finished = std::sync::Arc::new(std::sync::Mutex::new((0usize, None::<Instant>)));
+            type Fin = (Vec<bool>, Option<Instant>, Option<Instant>);
+            let finished = std::sync::Arc::new(std::sync::Mutex::new((vec![false; atts.len()], None::<Instant>, None::<Instant>)));
             let grace_frac: f64 = std::env::var("TOPOR_GRACE").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
-            let n_attempts = atts.len();
-            let finish = |f: &std::sync::Mutex<(usize, Option<Instant>)>| {
+            let finish = |f: &std::sync::Mutex<Fin>, k: usize, complete: bool| {
                 let mut g = f.lock().unwrap();
-                g.0 += 1;
+                g.0[k] = true;
                 g.1.get_or_insert_with(Instant::now);
+                if complete {
+                    g.2.get_or_insert_with(Instant::now);
+                }
             };
             for o in others.iter_mut() {
                 o.hurry = Some(hurry.clone());
             }
             self.hurry = Some(hurry.clone());
-            let done: Vec<(usize, Router)> = std::thread::scope(|sc| {
+            let mut at0 = 0.0;
+            let done: Vec<(usize, Router, f64)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = others
                     .drain(..)
                     .enumerate()
@@ -3018,37 +3303,46 @@ impl Router {
                         let finished = &finished;
                         sc.spawn(move || {
                             o.route_rest(fan, long, esc);
-                            if !o.stopped() && o.total_deficit() == 0 {
+                            let complete = !o.stopped() && o.total_deficit() == 0;
+                            if complete {
                                 call_off_after(i + 1, stops);
                             }
-                            finish(finished);
-                            o
+                            finish(finished, i + 1, complete);
+                            let at = o.elapsed();
+                            (o, at)
                         })
                     })
                     .collect();
                 {
-                    let (hurry, finished) = (hurry.clone(), finished.clone());
+                    let (hurry, finished, stops) = (hurry.clone(), finished.clone(), &stops);
                     sc.spawn(move || loop {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         let g = finished.lock().unwrap();
-                        if g.0 >= n_attempts {
+                        if g.0.iter().all(|&x| x) {
                             break;
                         }
-                        if let Some(t) = g.1 {
-                            let grace = (grace_frac * t.duration_since(t_attempts).as_secs_f64()).max(5.0);
-                            if t.elapsed().as_secs_f64() > grace {
-                                hurry.store(true, std::sync::atomic::Ordering::Relaxed);
-                                break;
+                        let late = |t: Option<Instant>, frac: f64| t.map_or(false, |t| t.elapsed().as_secs_f64() > (frac * grace_frac * t.duration_since(t_attempts).as_secs_f64()).max(5.0));
+                        if late(g.2, 0.5) {
+                            for k in 1..g.0.len() {
+                                if !g.0[k] {
+                                    stops[k].store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
+                        }
+                        if late(g.1, 1.0) || late(g.2, 0.5) {
+                            hurry.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
                         }
                     });
                 }
                 self.route_rest(false, false, false);
-                if self.total_deficit() == 0 {
+                let complete = !self.stopped() && self.total_deficit() == 0;
+                if complete {
                     call_off_after(0, &stops);
                 }
-                finish(&finished);
-                hs.into_iter().enumerate().map(|(i, h)| (i + 1, h.join().expect("routing attempt"))).collect()
+                finish(&finished, 0, complete);
+                at0 = self.elapsed();
+                hs.into_iter().enumerate().map(|(i, h)| { let (o, at) = h.join().expect("routing attempt"); (i + 1, o, at) }).collect()
             });
             let hurried = hurry.load(std::sync::atomic::Ordering::Relaxed);
             self.hurry = None;
@@ -3061,29 +3355,34 @@ impl Router {
                     (true, true, _) => "fan-out first, then long nets first",
                 };
                 if atts[k].0 {
-                    format!("{} (pairs split at every station)", order)
+                    format!("{} (pairs as before)", order)
                 } else {
                     order.to_string()
                 }
             };
+            // the most complete board wins; between equally complete ones, the one with the most coupled length
+            let coupled_len = |r: &Router| -> f64 { r.pair_report().iter().map(|x| if x.2.is_finite() && x.3.is_finite() { x.4 * x.2.min(x.3) } else { 0.0 }).sum() };
             let first = self.total_deficit();
-            let mut best: Option<(usize, usize)> = None;
-            let mut summary = vec![format!("{}: deficit {}", name(0), first)];
-            for (k, o) in &done {
+            let first_c = coupled_len(self);
+            let mut best: Option<(usize, usize, f64)> = None;
+            let mut summary = vec![format!("{}: deficit {}, {:.0} mm coupled (done at {:.1}s)", name(0), first, first_c, at0)];
+            for (k, o, at) in &done {
                 if o.stopped() {
-                    summary.push(format!("{}: called off", name(*k)));
+                    summary.push(format!("{}: called off (at {:.1}s)", name(*k), at));
                     continue;
                 }
                 let d = o.total_deficit();
-                summary.push(format!("{}: deficit {}", name(*k), d));
-                if d < best.map_or(first, |b| b.1) {
-                    best = Some((*k, d));
+                let c = coupled_len(o);
+                summary.push(format!("{}: deficit {}, {:.0} mm coupled (done at {:.1}s)", name(*k), d, c, at));
+                let (bd, bc) = best.map_or((first, first_c), |b| (b.1, b.2));
+                if d < bd || (d == bd && c > bc + 1e-6) {
+                    best = Some((*k, d, c));
                 }
             }
             if self.cfg.verbose {
                 eprintln!("[{:.1}s] {}{}", self.elapsed(), summary.join("; "), if hurried { " (the slower ones wrapped up after their grace)" } else { "" });
             }
-            if let Some((k, d)) = best {
+            if let Some((k, d, _)) = best {
                 let mut o = done.into_iter().find(|x| x.0 == k).unwrap().1;
                 o.cfg.verbose = self.cfg.verbose;
                 o.stop = None;
@@ -3098,7 +3397,11 @@ impl Router {
             return;
         }
         { let _t = Instant::now(); self.improve_pairs(); self.prof_add("improve pairs", _t); }
+        let d0 = self.total_deficit();
         { let _t = Instant::now(); self.cleanup(); self.prof_add("clean-up", _t); }
+        if self.cfg.verbose {
+            eprintln!("[{:.1}s] after the pair improvements: deficit {}, after clean-up {}", self.elapsed(), d0, self.total_deficit());
+        }
         // the spring relaxation: every free wire and via pulls tight together (TOPOR_NOSPRING: off)
         if std::env::var("TOPOR_NOSPRING").is_err() {
             { let _t = Instant::now(); self.spring(); self.prof_add("spring", _t); }
@@ -3126,8 +3429,10 @@ impl Router {
             if self.cfg.verbose {
                 eprintln!("[{:.1}s] via bridges: {} of {} removed", self.elapsed(), removed, bridges);
             }
+            // (one solve: the board has relaxed once already, and a second try's gain is a few mm; the retries
+            // holding the nets it could not join up were dropped every time on the test boards)
             if std::env::var("TOPOR_NOSPRING").is_err() {
-                { let _t = Instant::now(); self.spring(); self.prof_add("spring", _t); }
+                { let _t = Instant::now(); self.spring_tries(1); self.prof_add("spring", _t); }
             }
         } else if self.cfg.verbose && bridges > 0 {
             eprintln!("[{:.1}s] via bridges: none of {} removable", self.elapsed(), bridges);
@@ -3235,6 +3540,7 @@ impl Router {
                 break;
             }
             self.round = round as i32;
+            self.update_pair_coupling();
             // rounds that no longer make progress go to the pair rescue instead
             let d = self.total_deficit();
             if best_state.as_ref().map_or(true, |b| d < b.0) {
@@ -3468,44 +3774,73 @@ impl Router {
     }
 
     /// On the finished board, rebuild poorly coupled pairs as ribbons; a rebuild is kept only if the
-    /// board stays as complete and the pair comes out better coupled.
+    /// board stays as complete and the pair comes out better coupled. The rebuilds are tried at once, each on its
+    /// own copy of the board; taken in order, the first one kept is adopted and those after it are tried again on
+    /// that board: the outcome of trying them one after another.
     fn improve_pairs(&mut self) {
-        let report = self.pair_report();
+        use rayon::prelude::*;
         let total = self.total_deficit();
-        for (a, _, lp0, ln0, cf) in report {
-            if cf >= 0.6 || self.elapsed() > self.cfg.seconds * 1.5 {
-                continue;
+        let mut todo: Vec<(String, f64, f64, f64)> = self.pair_report().into_iter().filter(|x| x.4 < 0.6).map(|(a, _, lp, ln, cf)| (a, lp, ln, cf)).collect();
+        while !todo.is_empty() && self.elapsed() <= self.cfg.seconds * 1.5 {
+            let copies: Vec<Router> = todo
+                .iter()
+                .map(|_| {
+                    let mut r = self.clone();
+                    r.cfg.verbose = false;
+                    r
+                })
+                .collect();
+            let tried: Vec<(Option<String>, bool, Router)> = copies
+                .into_par_iter()
+                .zip(todo.par_iter())
+                .map(|(mut r, c)| {
+                    let (msg, keep) = r.improve_pair(c, total);
+                    (msg, keep, r)
+                })
+                .collect();
+            let mut rest = Vec::new();
+            for (k, (msg, keep, r)) in tried.into_iter().enumerate() {
+                if let (Some(m), true) = (&msg, self.cfg.verbose) {
+                    eprintln!("[{:.1}s] {}", self.elapsed(), m);
+                }
+                if keep {
+                    let (verbose, t0) = (self.cfg.verbose, self.t0);
+                    *self = r;
+                    self.cfg.verbose = verbose;
+                    self.t0 = t0;
+                    rest = todo[k + 1..].to_vec();
+                    break;
+                }
             }
-            let len0 = if lp0.is_finite() && ln0.is_finite() { lp0.max(ln0) } else { f64::INFINITY };
-            let p = self.w.b.net_index[&a];
-            let n = self.w.b.partner[p as usize];
-            let (p, n) = (p.min(n), p.max(n));
-            let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
-            let dsnap = self.pair_diag.clone();
-            self.clear_pair(p, n);
-            self.route_pair(p, n);
-            self.route_net(p);
-            self.route_net(n);
-            let rep = self.pair_report().into_iter().find(|x| x.0 == a);
-            let after = rep.as_ref().map(|x| x.4).unwrap_or(0.0);
-            let len1 = rep.as_ref().map(|x| x.2.max(x.3)).unwrap_or(f64::INFINITY);
-            // better coupled, not bought with a detour
-            let keep = self.total_deficit() <= total && after > cf + 0.05 && len1 <= len0 * 1.15 + 1.0;
-            if self.cfg.verbose {
-                eprintln!("[{:.1}s] improve pair {}: {:.0}% -> {:.0}% {}", self.elapsed(), a, cf * 100.0, after * 100.0, if keep { "kept" } else { "reverted" });
-            }
-            if keep {
-                let note = format!("rebuilt as ribbon on the finished board: {:.0}% -> {:.0}% coupled", cf * 100.0, after * 100.0);
-                self.pair_diag.entry(p).or_default().notes.push(note);
-            }
-            if !keep {
-                self.w = snap.0;
-                self.ties = snap.1;
-                self.history = snap.2;
-                self.junctions = snap.3;
-                self.pair_diag = dsnap;
-            }
+            todo = rest;
         }
+    }
+
+    /// Rebuild pair (named by its member a; its report before: lengths, coupled fraction) as a ribbon on this
+    /// board: the line for the log (none when out of time) and whether the board is better for it.
+    fn improve_pair(&mut self, c: &(String, f64, f64, f64), total: usize) -> (Option<String>, bool) {
+        let (a, lp0, ln0, cf) = (c.0.as_str(), c.1, c.2, c.3);
+        if self.elapsed() > self.cfg.seconds * 1.5 {
+            return (None, false);
+        }
+        let len0 = if lp0.is_finite() && ln0.is_finite() { lp0.max(ln0) } else { f64::INFINITY };
+        let p = self.w.b.net_index[a];
+        let n = self.w.b.partner[p as usize];
+        let (p, n) = (p.min(n), p.max(n));
+        self.clear_pair(p, n);
+        self.route_pair(p, n);
+        self.route_net(p);
+        self.route_net(n);
+        let rep = self.pair_measure_routed(p, n);
+        let after = rep.map(|x| x.2).unwrap_or(0.0);
+        let len1 = rep.map(|x| x.0.max(x.1)).unwrap_or(f64::INFINITY);
+        // better coupled, not bought with a detour
+        let keep = self.total_deficit() <= total && after > cf + 0.05 && len1 <= len0 * 1.15 + 1.0;
+        if keep {
+            let note = format!("rebuilt as ribbon on the finished board: {:.0}% -> {:.0}% coupled", cf * 100.0, after * 100.0);
+            self.pair_diag.entry(p).or_default().notes.push(note);
+        }
+        (Some(format!("improve pair {}: {:.0}% -> {:.0}% {}", a, cf * 100.0, after * 100.0, if keep { "kept" } else { "reverted" })), keep)
     }
 
     /// A pair still incomplete after rip-up: route its members as plain nets (pads in any order), kept
@@ -3572,7 +3907,8 @@ impl Router {
         }
     }
 
-    /// Remove vias that connect nothing (one piece or none) and their lone pieces.
+    /// Remove vias that connect nothing (one piece or none) and their lone pieces (unless the net comes apart: a
+    /// via on fixed copper of its net, such as suggested copper kept as drawn, connects through it).
     pub fn cleanup(&mut self) {
         loop {
             let mut changed = false;
@@ -3585,6 +3921,8 @@ impl Router {
                 // a plane drop has one wire; a via of a plane net off its pour is just a dangling via
                 let plane = ob.plane;
                 if live.is_empty() || (live.len() == 1 && !plane) {
+                    let net = ob.s.net;
+                    let (before, drops) = (self.deficit(net), self.w.thread_drops);
                     self.w.begin();
                     for p in live {
                         self.w.remove_piece(p);
@@ -3596,7 +3934,8 @@ impl Router {
                             for &q in &re {
                                 self.w.check_piece(q, &mut v);
                             }
-                            if v.is_empty() {
+                            // (a wire of another net that no longer threads the new triangles is dropped: not worth it)
+                            if v.is_empty() && self.deficit(net) <= before && self.w.thread_drops == drops {
                                 self.w.commit();
                                 changed = true;
                             } else {
@@ -3837,6 +4176,233 @@ impl Router {
 
     pub fn total_deficit(&self) -> usize {
         (0..self.w.b.nets.len() as u32).map(|n| self.deficit(n)).sum()
+    }
+
+    /// Hand-drawn copper given as suggestions (model `suggested_copper`: `tracks` [{net, layer, width, pts}],
+    /// `vias` [{net, x, y}]), imported before routing as the router's own copper of its nets: it bootstraps a board
+    /// that is hard to route, while rip-up may still move it (at a small premium) and the spring relaxation improves
+    /// it like any wire. Vias become router vias; track segments are joined into polylines between pads, vias and
+    /// branch points and threaded into the triangulation along their course. What breaks a rule is left out (each
+    /// noted) for the router to do itself. Returns (vias kept, vias left out, polylines kept, left out, notes, and
+    /// the indices of the vias and tracks left out for a rule, which the caller may keep as fixed copper instead).
+    pub fn import_suggestions(&mut self, v: &serde_json::Value) -> Suggested {
+        let f = |x: &serde_json::Value| x.as_f64().unwrap_or(0.0);
+        let mut notes = Vec::new();
+        let (mut vok, mut vbad, mut tok, mut tbad) = (0, 0, 0, 0);
+        let (mut bad_vias, mut bad_tracks): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        let mut vias: Vec<(u32, P2, u32)> = Vec::new();
+        for (vi, x) in v["vias"].as_array().into_iter().flatten().enumerate() {
+            let Some(&net) = x["net"].as_str().and_then(|n| self.w.b.net_index.get(n)) else {
+                vbad += 1;
+                continue;
+            };
+            let pos = p2(f(&x["x"]), f(&x["y"]));
+            self.w.begin();
+            let res = self.w.add_via(net, pos).map_err(|e| e.to_string()).and_then(|o| {
+                let mut viol = Vec::new();
+                self.w.check_via_at(net, pos, o, &mut viol, true);
+                match viol.first() {
+                    Some(x) => {
+                        let with = x.objs.first().map(|&q| self.w.objs[q as usize].s.name.clone())
+                            .or(x.pieces.first().map(|&q| format!("a wire of {}", self.w.b.nets[self.w.pieces[q as usize].net as usize].name)));
+                        Err(match with {
+                            Some(wn) if x.dist >= 0.0 => format!("{} ({:.3} mm from {}, needs {:.3})", x.what, x.dist, wn, x.need),
+                            Some(wn) => format!("{} ({})", x.what, wn),
+                            None => x.what.clone(),
+                        })
+                    }
+                    None => Ok(o),
+                }
+            });
+            match res {
+                Ok(o) => {
+                    self.w.commit();
+                    vias.push((net, pos, o));
+                    vok += 1;
+                }
+                Err(e) => {
+                    self.w.rollback();
+                    vbad += 1;
+                    bad_vias.push(vi);
+                    notes.push(format!("via of {} at ({:.2},{:.2}) left out: {}", self.w.b.nets[net as usize].name, pos.x, pos.y, e));
+                }
+            }
+        }
+        // segments by (net, layer, width), their end points joined at 1 um
+        let key = |p: P2| ((p.x * 1000.0).round() as i64, (p.y * 1000.0).round() as i64);
+        let mut segs: Vec<(u32, usize, f64, P2, P2)> = Vec::new();
+        let mut seg_track: Vec<usize> = Vec::new();
+        for (ti, t) in v["tracks"].as_array().into_iter().flatten().enumerate() {
+            let net = t["net"].as_str().and_then(|n| self.w.b.net_index.get(n)).cloned();
+            let l = (0..self.w.nsig()).find(|&l| Some(self.w.b.sig_name(l)) == t["layer"].as_str());
+            let (Some(net), Some(l)) = (net, l) else {
+                tbad += 1;
+                continue;
+            };
+            let w = f(&t["width"]).max(self.w.b.nets[net as usize].wmin[l]);
+            let pts: Vec<P2> = t["pts"].as_array().into_iter().flatten().map(|q| p2(f(&q[0]), f(&q[1]))).collect();
+            for k in 0..pts.len().saturating_sub(1) {
+                if pts[k].dist(pts[k + 1]) > 1e-6 {
+                    segs.push((net, l, w, pts[k], pts[k + 1]));
+                    seg_track.push(ti);
+                }
+            }
+        }
+        // stops: points where a chain must end (a pad or via of the net there, a branch, an end, a width change)
+        let mut deg: HashMap<(u32, usize, (i64, i64)), usize> = HashMap::default();
+        for &(net, l, _, a, b) in &segs {
+            *deg.entry((net, l, key(a))).or_insert(0) += 1;
+            *deg.entry((net, l, key(b))).or_insert(0) += 1;
+        }
+        let on_terminal = |me: &Router, net: u32, l: usize, p: P2| -> bool {
+            vias.iter().any(|&(n, q, _)| n == net && q.dist(p) < 0.02)
+                || me.net_pads[net as usize].iter().any(|&o| {
+                    let s = &me.w.objs[o as usize].s;
+                    s.layers & (1 << l) != 0 && point_hull_dist(&s.pts, p) - s.r <= 1e-3
+                })
+        };
+        let mut used = vec![false; segs.len()];
+        let mut chains: Vec<(u32, usize, f64, Vec<P2>, Vec<usize>)> = Vec::new();
+        for i in 0..segs.len() {
+            if used[i] {
+                continue;
+            }
+            used[i] = true;
+            let (net, l, w, a, b) = segs[i];
+            let mut poly = vec![a, b];
+            let mut from = vec![seg_track[i]];
+            // grow both ways through points of degree two that are no terminal, at the same width
+            for dir in 0..2 {
+                loop {
+                    let end = if dir == 0 { *poly.last().unwrap() } else { poly[0] };
+                    if deg.get(&(net, l, key(end))).cloned().unwrap_or(0) != 2 || on_terminal(self, net, l, end) {
+                        break;
+                    }
+                    let next = (0..segs.len()).find(|&j| !used[j] && segs[j].0 == net && segs[j].1 == l && (segs[j].2 - w).abs() < 1e-6 && (key(segs[j].3) == key(end) || key(segs[j].4) == key(end)));
+                    let Some(j) = next else { break };
+                    used[j] = true;
+                    from.push(seg_track[j]);
+                    let other = if key(segs[j].3) == key(end) { segs[j].4 } else { segs[j].3 };
+                    if dir == 0 {
+                        poly.push(other);
+                    } else {
+                        poly.insert(0, other);
+                    }
+                }
+            }
+            chains.push((net, l, w, poly, from));
+        }
+        // thread each chain between its end terminals (pad, via, or a junction shared by chains meeting there)
+        let mut joints: Vec<(u32, usize, P2, u32)> = Vec::new();
+        for (net, l, w, mut poly, from) in chains {
+            let name = self.w.b.nets[net as usize].name.clone();
+            self.w.begin();
+            let mut fresh: Vec<u32> = Vec::new();
+            let mut terms = [Term { obj: NONE, vtx: NONE }; 2];
+            let mut bad: Option<String> = None;
+            for side in 0..2 {
+                let at = if side == 0 { poly[0] } else { *poly.last().unwrap() };
+                let via = vias.iter().find(|&&(n, q, _)| n == net && q.dist(at) < 0.02).map(|x| x.2);
+                let pad = self.net_pads[net as usize].iter().cloned().find(|&o| {
+                    let s = &self.w.objs[o as usize].s;
+                    s.layers & (1 << l) != 0 && point_hull_dist(&s.pts, at) - s.r <= 1e-3
+                });
+                let joint = joints.iter().find(|x| x.0 == net && x.1 == l && x.2.dist(at) < 1e-3).map(|x| x.3);
+                let (tm, q) = if let Some(o) = via {
+                    (Term { obj: o, vtx: self.w.objs[o as usize].lv[l] }, None)
+                } else if let Some(o) = pad {
+                    match self.pad_term(o, l, at) {
+                        Some((tm, q)) => (tm, Some(q)),
+                        None => {
+                            bad = Some("its pad end".into());
+                            break;
+                        }
+                    }
+                } else if let Some(j) = joint {
+                    (Term { obj: j, vtx: self.w.objs[j as usize].lv[l] }, None)
+                } else {
+                    match self.w.add_junction(net, at, w / 2.0, l) {
+                        Ok(j) => {
+                            fresh.push(j);
+                            (Term { obj: j, vtx: self.w.objs[j as usize].lv[l] }, None)
+                        }
+                        Err(e) => {
+                            bad = Some(format!("an end: {}", e));
+                            break;
+                        }
+                    }
+                };
+                terms[side] = tm;
+                // the wire ends at its terminal's vertex, or at a polygon pad's centre
+                let p = if tm.vtx != NONE { self.w.vpos(l, tm.vtx) } else { q.unwrap_or(at) };
+                if side == 0 {
+                    if tm.vtx == NONE { poly.insert(0, p) } else { poly[0] = p }
+                } else if tm.vtx == NONE {
+                    poly.push(p)
+                } else {
+                    *poly.last_mut().unwrap() = p
+                }
+            }
+            poly.dedup_by(|a, b| a.dist(*b) < 1e-6);
+            let res = match bad {
+                Some(e) => Err(e),
+                None if poly.len() < 2 || terms[0].obj == terms[1].obj => Err("too short".into()),
+                None => match self.w.thread_poly(l, &poly, terms[0], terms[1]) {
+                    None => Err("does not thread through the triangulation".into()),
+                    Some(cx) => {
+                        let pid = self.w.add_piece(net, l, w, terms[0], terms[1], &cx);
+                        self.w.seed_poly(pid, poly.clone());
+                        self.w.realize_dirty();
+                        let mut viol = Vec::new();
+                        self.w.check_piece(pid, &mut viol);
+                        match viol.first() {
+                            Some(x) => Err(format!("{} at ({:.2},{:.2})", x.what, x.at.x, x.at.y)),
+                            None => Ok(pid),
+                        }
+                    }
+                },
+            };
+            match res {
+                Ok(pid) => {
+                    self.w.commit();
+                    for &j in &fresh {
+                        joints.push((net, l, self.w.objs[j as usize].s.center, j));
+                        self.junctions.push(j);
+                    }
+                    self.suggested.insert(pid);
+                    self.suggested_nets.insert(net);
+                    tok += 1;
+                }
+                Err(e) => {
+                    self.w.rollback();
+                    tbad += 1;
+                    bad_tracks.extend(from.iter().cloned());
+                    notes.push(format!("track of {} on {} from ({:.2},{:.2}) left out: {}", name, self.w.b.sig_name(l), poly[0].x, poly[0].y, e));
+                }
+            }
+        }
+        // copper that reaches none of its net's pads or vias is of no use as a start: dropped
+        for net in self.suggested_nets.clone() {
+            for g in self.components(net) {
+                if g.iter().all(|&o| self.w.objs[o as usize].s.name.starts_with("junction:")) {
+                    for &o in &g {
+                        for p in self.w.obj_pieces[o as usize].clone() {
+                            if self.w.pieces[p as usize].alive {
+                                self.rip_piece(p);
+                                tok -= 1;
+                                tbad += 1;
+                            }
+                        }
+                        let _ = self.w.remove_via(o);
+                    }
+                    notes.push(format!("suggested copper of {} reaching none of its pads left out", self.w.b.nets[net as usize].name));
+                }
+            }
+        }
+        self.junctions.retain(|&j| self.w.objs[j as usize].alive);
+        bad_tracks.sort();
+        bad_tracks.dedup();
+        Suggested { vias_kept: vok, vias_left_out: vbad, tracks_kept: tok, tracks_left_out: tbad, notes, bad_vias, bad_tracks }
     }
 
     /// The blocker report: for each open group of each incomplete net (two per net, forty in all), the cheapest

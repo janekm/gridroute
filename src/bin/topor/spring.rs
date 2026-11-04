@@ -442,8 +442,13 @@ impl Router {
     /// The spring relaxation phase (see the module notes). Returns whether the board took the result. Nets
     /// that cannot be joined up again after a relaxation are held as they were in another, up to twice.
     pub fn spring(&mut self) -> bool {
+        self.spring_tries(3)
+    }
+
+    /// The spring relaxation in at most `tries` solves (each holding the nets the one before could not join up).
+    pub fn spring_tries(&mut self, tries: usize) -> bool {
         let mut hold = std::collections::HashSet::new();
-        for _ in 0..3 {
+        for _ in 0..tries {
             match self.spring_once(&hold) {
                 Ok(kept) => return kept,
                 Err(nets) => {

@@ -20,6 +20,113 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Move the suggested tracks and vias at these indices into the model's fixed copper: each track segment a zone
+/// piece (its capsule outline), each via a fixed via pad, as drawn. Returns the tracks and vias moved, for the
+/// layout (they are not in the source board).
+fn fix_suggestions(m: &mut serde_json::Value, tracks: &[usize], vias: &[usize]) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let cls = |m: &serde_json::Value, net: &str| -> Vec<f64> {
+        let c = m["net_class"][net].as_str().unwrap_or("Default");
+        let r = if m["classes"][c].is_array() { &m["classes"][c] } else { &m["rules"] };
+        (0..4).map(|i| r[i].as_f64().unwrap_or(0.0)).collect()
+    };
+    let sug = m["suggested_copper"].clone();
+    // (ids go on from earlier rounds' fixed copper)
+    let z0 = m["zones"].as_array().map_or(0, |a| a.iter().filter(|z| z["island"].as_u64().unwrap_or(0) >= 1_000_000).count());
+    let v0 = m["pads"].as_array().map_or(0, |a| a.iter().filter(|p| p["ref"].as_str().map_or(false, |r| r.starts_with("via_s"))).count());
+    let mut zones = Vec::new();
+    for (k, &ti) in tracks.iter().enumerate() {
+        let t = &sug["tracks"][ti];
+        let pts: Vec<[f64; 2]> = t["pts"].as_array().into_iter().flatten().map(|q| [q[0].as_f64().unwrap_or(0.0), q[1].as_f64().unwrap_or(0.0)]).collect();
+        let w = t["width"].as_f64().unwrap_or(0.1);
+        for (i, s) in pts.windows(2).enumerate() {
+            // the copper as an outline: half discs round both ends, circumscribed (the polygon covers the copper)
+            let n = 8;
+            let r = w / 2.0 / (std::f64::consts::PI / (2.0 * n as f64)).cos();
+            let (a, b) = (s[0], s[1]);
+            let ang = if a != b { (b[1] - a[1]).atan2(b[0] - a[0]) } else { 0.0 };
+            let mut poly = Vec::new();
+            for (c, a0) in [(b, ang - std::f64::consts::FRAC_PI_2), (a, ang + std::f64::consts::FRAC_PI_2)] {
+                for j in 0..=n {
+                    let u = a0 + std::f64::consts::PI * j as f64 / n as f64;
+                    poly.push(json!([c[0] + r * u.cos(), c[1] + r * u.sin()]));
+                }
+            }
+            zones.push(json!({"net": t["net"], "layer": t["layer"], "island": 1_000_000 + (z0 + k) * 1000 + i, "clearance": 0.0, "points": poly}));
+        }
+    }
+    let mut pads = Vec::new();
+    let mut out_vias = Vec::new();
+    for &vi in vias {
+        let v = &sug["vias"][vi];
+        let net = v["net"].as_str().unwrap_or("");
+        let c = cls(m, net);
+        let (d, dr) = (v["d"].as_f64().unwrap_or(c[2]), v["drill"].as_f64().unwrap_or(c[3]));
+        let id = v0 + pads.len();
+        pads.push(json!({"ref": format!("via_s{}", id), "original_ref": "via", "original_pin": format!("s{}", id), "num": "1", "x": v["x"], "y": v["y"], "w": d, "h": d, "rot": 0, "angle": 0,
+                         "shape": "circle", "layers": "all", "npth": false, "drill": dr, "drill_w": dr, "drill_h": dr, "net": net, "clearance": c[1], "rr": 0}));
+        out_vias.push(json!({"net": net, "x": v["x"], "y": v["y"], "d": d, "drill": dr}));
+    }
+    let out_tracks: Vec<serde_json::Value> = tracks.iter().map(|&ti| sug["tracks"][ti].clone()).collect();
+    if let Some(a) = m["zones"].as_array_mut() {
+        a.extend(zones);
+    } else {
+        m["zones"] = json!(zones);
+    }
+    if let Some(a) = m["pads"].as_array_mut() {
+        a.extend(pads);
+    }
+    let keep = |arr: &serde_json::Value, drop: &[usize]| -> serde_json::Value { json!(arr.as_array().into_iter().flatten().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, x)| x.clone()).collect::<Vec<_>>()) };
+    m["suggested_copper"]["tracks"] = keep(&sug["tracks"], tracks);
+    m["suggested_copper"]["vias"] = keep(&sug["vias"], vias);
+    (out_tracks, out_vias)
+}
+
+/// The suggested tracks and vias at these indices, with the partner's suggested copper beside them (within 1 mm, on
+/// the same layer, or any via) for those of a differential pair member.
+fn with_partner_copper(sug: &serde_json::Value, tracks: &[usize], vias: &[usize], partner: &dyn Fn(&str) -> Option<String>) -> (Vec<usize>, Vec<usize>) {
+    use geom::{p2, seg_point_dist, seg_seg_dist, P2};
+    let f = |x: &serde_json::Value| x.as_f64().unwrap_or(0.0);
+    let segs = |t: &serde_json::Value| -> Vec<(P2, P2)> {
+        let pts: Vec<P2> = t["pts"].as_array().into_iter().flatten().map(|q| p2(f(&q[0]), f(&q[1]))).collect();
+        pts.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    let at = |v: &serde_json::Value| p2(f(&v["x"]), f(&v["y"]));
+    let st = sug["tracks"].as_array().cloned().unwrap_or_default();
+    let sv = sug["vias"].as_array().cloned().unwrap_or_default();
+    let (mut bt, mut bv) = (tracks.to_vec(), vias.to_vec());
+    // fixed copper of a pair member: (partner, layer or None for a via, segments)
+    let mut fixed: Vec<(String, Option<String>, Vec<(P2, P2)>)> = Vec::new();
+    for &i in tracks {
+        if let Some(p) = partner(st[i]["net"].as_str().unwrap_or("")) {
+            fixed.push((p, st[i]["layer"].as_str().map(String::from), segs(&st[i])));
+        }
+    }
+    for &i in vias {
+        if let Some(p) = partner(sv[i]["net"].as_str().unwrap_or("")) {
+            fixed.push((p, None, vec![(at(&sv[i]), at(&sv[i]))]));
+        }
+    }
+    let near = 1.0;
+    for (pn, layer, fs) in &fixed {
+        for (i, t) in st.iter().enumerate() {
+            if bt.contains(&i) || t["net"].as_str() != Some(pn.as_str()) || (layer.is_some() && t["layer"].as_str() != layer.as_deref()) {
+                continue;
+            }
+            if segs(t).iter().any(|&(a, b)| fs.iter().any(|&(c, d)| seg_seg_dist(a, b, c, d) < near)) {
+                bt.push(i);
+            }
+        }
+        for (i, v) in sv.iter().enumerate() {
+            if !bv.contains(&i) && v["net"].as_str() == Some(pn.as_str()) && fs.iter().any(|&(c, d)| seg_point_dist(c, d, at(v)) < near) {
+                bv.push(i);
+            }
+        }
+    }
+    bt.sort();
+    bv.sort();
+    (bt, bv)
+}
+
 fn arg(args: &[String], k: &str) -> Option<String> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned())
 }
@@ -97,13 +204,48 @@ fn main() {
     let dir = PathBuf::from(&args[2]);
     let t0 = Instant::now();
     let text = std::fs::read_to_string(dir.join("model.json")).expect("model.json");
-    let m: serde_json::Value = serde_json::from_str(&text).expect("json");
-    let mut b = model::Board::load(&m).expect("model");
+    let mut m: serde_json::Value = serde_json::from_str(&text).expect("json");
     let project: Option<serde_json::Value> = std::fs::read_to_string(dir.join("unrouted.kicad_pro")).ok().and_then(|t| serde_json::from_str(&t).ok());
-    b.detect_pairs(if args.iter().any(|a| a == "--no-pairs") { None } else { project.as_ref() });
-    if args.iter().any(|a| a == "--no-pairs") {
-        b.partner.iter_mut().for_each(|x| *x = cdt::NONE);
+    let no_pairs = args.iter().any(|a| a == "--no-pairs");
+    let board_of = |m: &serde_json::Value| {
+        let mut b = model::Board::load(m).expect("model");
+        b.detect_pairs(if no_pairs { None } else { project.as_ref() });
+        if no_pairs {
+            b.partner.iter_mut().for_each(|x| *x = cdt::NONE);
+        }
+        b
+    };
+    // suggested copper the router cannot take as its own (it breaks a rule, e.g. runs through a keepout drawn round a
+    // crystal, or does not thread) stays as drawn: it becomes fixed copper before the board is built
+    // (repeated: copper fixed in one round can make other suggested copper fail against it, e.g. of two vias drawn
+    // too close the first is taken and the second fixed, and then the first fails against it; both stay as drawn.
+    // Later rounds fix only vias and pair members' copper: other tracks failing then mostly overlap the fixed copper
+    // at a joint, and fixing them walks the whole drawing of a power net; they are left out for the router as
+    // before. A pair member's copper kept as drawn takes the partner's beside it along, so the pair stays together.)
+    let mut kept_fixed = (Vec::new(), Vec::new());
+    if !m["suggested_copper"].is_null() {
+        let b0 = board_of(&m);
+        let partner = |net: &str| -> Option<String> {
+            let &i = b0.net_index.get(net)?;
+            let &p = b0.partner.get(i as usize)?;
+            (p != cdt::NONE).then(|| b0.nets[p as usize].name.clone())
+        };
+        for round in 0..8 {
+            let w = world::World::new(board_of(&m)).expect("world");
+            let cfg = router::Cfg { only: None, via_cost: 4.0, max_exp: 20000, seconds: 60.0, rip_rounds: 0, verbose: false, single_attempt: true, fast: true };
+            let mut r = router::Router::new(w, cfg);
+            let sg = r.import_suggestions(&m["suggested_copper"]);
+            let tracks: Vec<usize> = sg.bad_tracks.iter().cloned().filter(|&i| round == 0 || partner(m["suggested_copper"]["tracks"][i]["net"].as_str().unwrap_or("")).is_some()).collect();
+            if tracks.is_empty() && sg.bad_vias.is_empty() {
+                break;
+            }
+            let (bt, bv) = with_partner_copper(&m["suggested_copper"], &tracks, &sg.bad_vias, &partner);
+            let (t, v) = fix_suggestions(&mut m, &bt, &bv);
+            kept_fixed.0.extend(t);
+            kept_fixed.1.extend(v);
+        }
     }
+    let b = board_of(&m);
     let npairs = b.partner.iter().filter(|&&x| x != cdt::NONE).count() / 2;
     eprintln!("{} differential pairs", npairs);
     if std::env::var("TOPOR_PAIRS").is_ok() {
@@ -148,6 +290,19 @@ fn main() {
         fast,
     };
     let mut r = router::Router::new(w, cfg);
+    // hand-drawn copper given as suggestions: routed copper to start from, not fixed copper
+    let mut suggested = json!(null);
+    if !m["suggested_copper"].is_null() {
+        let sg = r.import_suggestions(&m["suggested_copper"]);
+        eprintln!(
+            "suggested copper: {} vias and {} track chains taken as routed copper; {} tracks and {} vias kept as drawn (fixed: they break a rule as routed copper); left out {} vias, {} chains",
+            sg.vias_kept, sg.tracks_kept, kept_fixed.0.len(), kept_fixed.1.len(), sg.vias_left_out, sg.tracks_left_out
+        );
+        for n in sg.notes.iter().take(20) {
+            eprintln!("  suggestion: {}", n);
+        }
+        suggested = json!({"vias_kept": sg.vias_kept, "chains_kept": sg.tracks_kept, "tracks_fixed": kept_fixed.0.len(), "vias_fixed": kept_fixed.1.len(), "vias_left_out": sg.vias_left_out, "chains_left_out": sg.tracks_left_out, "notes": sg.notes});
+    }
     let t_world = t0.elapsed().as_secs_f64();
     r.route_all();
     let secs = t0.elapsed().as_secs_f64();
@@ -267,7 +422,7 @@ fn main() {
     for n in incomplete.iter().take(40) {
         eprintln!("  incomplete: {} (deficit {})", r.w.b.nets[*n as usize].name, r.deficit(*n));
     }
-    let pairs = r.pair_report();
+    let pairs = r.pair_report_full();
     // per pair: what the router did and why, so the design side can act (move parts, free corridors)
     let mut pair_json = Vec::new();
     for (a, b, lp, ln, cf) in &pairs {
@@ -324,7 +479,10 @@ fn main() {
     if let Some(out) = arg(&args, "--out") {
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("layout.json"), serde_json::to_string(&layout_json(&r)).unwrap()).unwrap();
+        let mut layout = layout_json(&r);
+        layout["tracks"].as_array_mut().unwrap().extend(kept_fixed.0.iter().cloned());
+        layout["vias"].as_array_mut().unwrap().extend(kept_fixed.1.iter().cloned());
+        std::fs::write(out.join("layout.json"), serde_json::to_string(&layout).unwrap()).unwrap();
         // incomplete nets with their separate pad groups (where the gap is)
         let missing: Vec<serde_json::Value> = incomplete
             .iter()
@@ -342,7 +500,7 @@ fn main() {
             "case": r.w.b.name, "algorithm": "topor-engine", "cold": true, "routing_seconds": secs,
             "routable_nets": routable.len(), "complete_nets": routable.len() - incomplete.iter().filter(|n| routable.contains(n)).count(),
             "deficit": r.total_deficit(), "tracks": ntracks, "vias": nvias, "length_mm": length,
-            "internal_violations": viol.len(), "internal_violations_by_kind": by_kind, "fast": fast, "blockers": blockers_json,
+            "internal_violations": viol.len(), "internal_violations_by_kind": by_kind, "fast": fast, "blockers": blockers_json, "suggested_copper": suggested,
             "phase_seconds": r.prof.iter().map(|(k, v)| (k.to_string(), json!({"seconds": v.0, "calls": v.1}))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "neck_stubs": r.w.b.necks.iter().map(|n| json!({"pad": n.pad, "net": r.w.b.nets[n.net as usize].name, "width": n.width, "length": n.from.dist(n.to)})).collect::<Vec<_>>(), "neck_failed": r.w.b.neck_failed, "missing": missing,
             "pairs": pair_json,

@@ -120,6 +120,8 @@ pub struct Board {
     pub pair_gap: Vec<f64>,
     /// Net family: a pair's members and its ribbon share the first member's id (others: own id).
     pub family: Vec<u32>,
+    /// A ribbon may touch its own pair's copper (off for pair routing as it was, to compare).
+    pub ribbon_touch: bool,
     /// Ribbon net of each pair member (NONE if none).
     pub ribbon_of: Vec<u32>,
 }
@@ -493,6 +495,7 @@ impl Board {
             partner: Vec::new(),
             pair_gap: Vec::new(),
             family: Vec::new(),
+            ribbon_touch: true,
             ribbon_of: Vec::new(),
         })
     }
