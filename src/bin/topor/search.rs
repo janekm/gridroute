@@ -943,7 +943,7 @@ impl<'a> Search<'a> {
                 if n.kind == NK::Gap {
                     if let Err(v) = self.corner_ok(l, t, &cy, n.k as usize, n.gap as usize, k2, width) {
                         if self.trace {
-                            eprintln!("      corner rejects edge {} ({} victims)", e2, v.len());
+                            eprintln!("      corner rejects edge {} ({} victims: {:?})", e2, v.len(), v.iter().map(|&p| format!("{} {:?}", w.b.nets[w.pieces[p as usize].net as usize].name, w.pieces[p as usize].poly.first().zip(w.pieces[p as usize].poly.last()).map(|(a, b)| ((a.x * 100.0).round() / 100.0, (a.y * 100.0).round() / 100.0, (b.x * 100.0).round() / 100.0, (b.y * 100.0).round() / 100.0)))).collect::<Vec<_>>());
                         }
                         if !q.soft || v.is_empty() {
                             continue;

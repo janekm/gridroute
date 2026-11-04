@@ -6,6 +6,7 @@ mod geom;
 mod model;
 mod router;
 mod search;
+mod spring;
 mod svg;
 mod world;
 
@@ -106,6 +107,9 @@ fn main() {
     }
     let w = world::World::new(b).expect("world");
     eprintln!("world built in {:.2}s", t0.elapsed().as_secs_f64());
+    if !w.b.rf_nets.is_empty() {
+        eprintln!("RF frontend nets kept on one layer (no vias): {}", w.b.rf_nets.iter().map(|x| x.1.as_str()).collect::<Vec<_>>().join("; "));
+    }
     for x in w.warnings.iter().take(10) {
         eprintln!("warning: {}", x);
     }
@@ -254,6 +258,7 @@ fn main() {
             "internal_violations": viol.len(), "missing": missing,
             "pairs": pair_json,
             "events": r.events,
+            "rf_nets_single_layer": r.w.b.rf_nets.iter().map(|x| x.1.clone()).collect::<Vec<_>>(),
             "stats": format!("{:?}", r.stats),
             "validation": "internal rules only; KiCad DRC deferred"
         });

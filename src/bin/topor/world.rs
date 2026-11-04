@@ -732,30 +732,7 @@ impl World {
     }
     /// Required gap between two items, or None when they may touch (same net, or free vertex).
     pub fn clr(&self, x: &Attr, y: &Attr) -> Option<f64> {
-        if x.clear < 0.0 || y.clear < 0.0 {
-            return None;
-        }
-        if x.net != NONE && x.net == y.net {
-            return None;
-        }
-        let c = if x.kind == Kind::Outline || y.kind == Kind::Outline {
-            self.b.edge_clear
-        } else if x.kind == Kind::Hole || y.kind == Kind::Hole {
-            if x.kind == Kind::Hole { x.clear } else { y.clear }
-        } else if x.kind == Kind::Keepout || y.kind == Kind::Keepout {
-            if x.kind == Kind::Keepout { x.clear } else { y.clear }
-        } else {
-            let mut c = x.clear.max(y.clear);
-            if x.class != NONE && x.class == y.class {
-                c = c.max(self.b.class_pair[x.class as usize]);
-            }
-            // the two members of a differential pair keep exactly their coupling gap
-            if x.net != NONE && (x.net as usize) < self.b.partner.len() && self.b.partner[x.net as usize] == y.net {
-                c = c.max(self.b.pair_gap[x.net as usize]);
-            }
-            c
-        };
-        Some(c + MARGIN)
+        clr_in(&self.b, x, y)
     }
 
     // ------------------------------------------------------------------ topology helpers
@@ -1598,6 +1575,15 @@ impl World {
     }
 
     /// Replace a piece's polyline if the result is clean (final geometry edits such as meanders).
+    /// Replace a piece's geometry without checking it (the caller checks the result as a whole).
+    pub fn set_poly(&mut self, p: u32, poly: Vec<P2>) {
+        self.unindex_piece(p);
+        self.save_piece(p);
+        self.pieces[p as usize].poly = poly;
+        self.index_piece(p);
+        self.refresh_cparam(p);
+    }
+
     pub fn try_set_poly(&mut self, p: u32, poly: Vec<P2>) -> bool {
         let old = (self.pieces[p as usize].poly.clone(), self.pieces[p as usize].cparam.clone());
         self.unindex_piece(p);
@@ -3198,4 +3184,32 @@ fn merge_overlaps(specs: Vec<ObjSpec>, nsig: usize) -> (Vec<ObjSpec>, Vec<usize>
         });
     }
     (out, map, warnings)
+}
+
+/// World::clr on the board's rules alone.
+pub fn clr_in(b: &Board, x: &Attr, y: &Attr) -> Option<f64> {
+    if x.clear < 0.0 || y.clear < 0.0 {
+        return None;
+    }
+    if x.net != NONE && x.net == y.net {
+        return None;
+    }
+    let c = if x.kind == Kind::Outline || y.kind == Kind::Outline {
+        b.edge_clear
+    } else if x.kind == Kind::Hole || y.kind == Kind::Hole {
+        if x.kind == Kind::Hole { x.clear } else { y.clear }
+    } else if x.kind == Kind::Keepout || y.kind == Kind::Keepout {
+        if x.kind == Kind::Keepout { x.clear } else { y.clear }
+    } else {
+        let mut c = x.clear.max(y.clear);
+        if x.class != NONE && x.class == y.class {
+            c = c.max(b.class_pair[x.class as usize]);
+        }
+        // the two members of a differential pair keep exactly their coupling gap
+        if x.net != NONE && (x.net as usize) < b.partner.len() && b.partner[x.net as usize] == y.net {
+            c = c.max(b.pair_gap[x.net as usize]);
+        }
+        c
+    };
+    Some(c + MARGIN)
 }

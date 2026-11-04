@@ -73,6 +73,8 @@ pub struct Board {
     pub fill_keepouts: Vec<(usize, Vec<P2>)>,
     /// Rule areas that forbid vias but not tracks (e.g. along an RF line): wires pass, vias stay out.
     pub via_keepouts: Vec<Vec<P2>>,
+    /// RF frontend nets (bench/pcb/topor_rf.py): each kept on the one layer it starts on, no vias, with why.
+    pub rf_nets: Vec<(u32, String)>,
     pub name: String,
     pub size: [f64; 2],
     pub layers: Vec<String>,
@@ -398,10 +400,22 @@ impl Board {
                 fill_keepouts.push((l, ppoly(&k["points"])));
             }
         }
+        // RF frontend nets keep to their pads' layer: a via in an RF line is an impedance step and a stub
+        let mut rf_nets = Vec::new();
+        for r in m["rf_nets"].as_array().into_iter().flatten() {
+            let (Some(name), Some(ln)) = (r["net"].as_str(), r["layer"].as_str()) else { continue };
+            let (Some(&id), Some(si)) = (net_index.get(name), signal.iter().position(|&li| layers[li] == ln)) else { continue };
+            let ni = &mut nets[id as usize];
+            if ni.allowed & (1 << si) != 0 {
+                ni.allowed = 1 << si;
+                rf_nets.push((id, format!("{} on {} ({})", name, ln, r["why"].as_str().unwrap_or(""))));
+            }
+        }
         Ok(Board {
             plane_regions,
             fill_keepouts,
             via_keepouts,
+            rf_nets,
             name,
             size,
             layers,
