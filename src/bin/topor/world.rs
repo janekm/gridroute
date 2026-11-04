@@ -99,13 +99,27 @@ pub struct Grid {
     /// Items per cell, each with the first cell (x, y) of its box: an item spanning several cells is
     /// reported only from the first cell of its box that lies in the query (no sort, no duplicates).
     pub cells: Vec<Vec<(Item, u16, u16)>>,
+    /// The wire segments of each cell alone, with their geometry, in the order they have in `cells`: the
+    /// clearance scans along a stretch read these without going through the pieces.
+    pub segs: Vec<Vec<SegE>>,
+}
+
+/// A wire segment as the grid keeps it for the clearance scans.
+#[derive(Clone, Copy, Debug)]
+pub struct SegE {
+    pub id: u32,
+    pub sub: u32,
+    pub a: P2,
+    pub b: P2,
+    pub net: u32,
+    pub width: f64,
 }
 
 impl Grid {
     fn new(lo: P2, hi: P2, cell: f64) -> Grid {
         let nx = (((hi.x - lo.x) / cell).ceil() as usize).max(1);
         let ny = (((hi.y - lo.y) / cell).ceil() as usize).max(1);
-        Grid { cell, nx, ny, ox: lo.x, oy: lo.y, cells: vec![Vec::new(); nx * ny] }
+        Grid { cell, nx, ny, ox: lo.x, oy: lo.y, cells: vec![Vec::new(); nx * ny], segs: vec![Vec::new(); nx * ny] }
     }
     #[inline]
     pub fn range(&self, lo: P2, hi: P2) -> (usize, usize, usize, usize) {
@@ -120,12 +134,36 @@ impl Grid {
             }
         }
     }
+    /// A wire segment (part): in `cells` and, with its geometry, in `segs`.
+    pub fn add_seg(&mut self, lo: P2, hi: P2, it: Item, e: SegE) {
+        let (x0, y0, x1, y1) = self.range(lo, hi);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.cells[y * self.nx + x].push((it, x0 as u16, y0 as u16));
+                self.segs[y * self.nx + x].push(e);
+            }
+        }
+    }
     pub fn remove(&mut self, lo: P2, hi: P2, it: Item) {
         let (x0, y0, x1, y1) = self.range(lo, hi);
         for y in y0..=y1 {
             for x in x0..=x1 {
-                let c = &mut self.cells[y * self.nx + x];
+                let k = y * self.nx + x;
+                let c = &mut self.cells[k];
                 if let Some(i) = c.iter().position(|q| q.0 == it) {
+                    // `segs` keeps the order the segments have in `cells`: the swap there moves the last item
+                    // into the gap, which is the last segment if it is one; otherwise the segments stay in order
+                    if it.kind == IT_SEG {
+                        let last_seg = c.last().map_or(false, |q| q.0.kind == IT_SEG);
+                        let sg = &mut self.segs[k];
+                        if let Some(j) = sg.iter().position(|e| e.id == it.id && e.sub == it.sub) {
+                            if last_seg {
+                                sg.swap_remove(j);
+                            } else {
+                                sg.remove(j);
+                            }
+                        }
+                    }
                     c.swap_remove(i);
                 }
             }
@@ -700,7 +738,9 @@ impl World {
         }
         let l = self.pieces[p as usize].layer as usize;
         for (lo, hi, it) in self.seg_items(p) {
-            self.layers[l].grid.add(lo, hi, it);
+            let pc = &self.pieces[p as usize];
+            let e = SegE { id: p, sub: it.sub, a: pc.poly[it.sub as usize], b: pc.poly[it.sub as usize + 1], net: pc.net, width: pc.width };
+            self.layers[l].grid.add_seg(lo, hi, it, e);
         }
     }
     fn unindex_piece(&mut self, p: u32) {
@@ -2469,28 +2509,20 @@ impl World {
             let (xs, xe) = (cx(xa.min(xb) - reach).max(x0), cx(xa.max(xb) + reach).min(x1));
             for x in xs..=xe {
                 // segments are indexed in parts, so an entry may come up more than once: harmless here
-                for &(it, _, _) in &g.cells[y * g.nx + x] {
-                    if it.kind != IT_SEG {
+                for e in &g.segs[y * g.nx + x] {
+                    if e.net == net {
                         continue;
                     }
-                    let q = &self.pieces[it.id as usize];
-                    if !q.alive || q.net == net {
-                        continue;
-                    }
-                    let k = it.sub as usize;
-                    if k + 1 >= q.poly.len() {
-                        continue;
-                    }
-                    let (s0, s1) = (q.poly[k], q.poly[k + 1]);
+                    let (s0, s1) = (e.a, e.b);
                     if s0.x.max(s1.x) < lo.x || s0.x.min(s1.x) > hi.x || s0.y.max(s1.y) < lo.y || s0.y.min(s1.y) > hi.y {
                         continue;
                     }
-                    if q.net != last_net {
-                        last_net = q.net;
-                        last_g = self.clr(&me, &self.net_attr(q.net, q.layer as usize));
+                    if e.net != last_net {
+                        last_net = e.net;
+                        last_g = self.clr(&me, &self.net_attr(e.net, l));
                     }
                     if let Some(gap) = last_g {
-                        if seg_seg_dist(a, b, s0, s1) < gap + (width + q.width) / 2.0 + extra && !f(it.id) {
+                        if seg_seg_dist(a, b, s0, s1) < gap + (width + e.width) / 2.0 + extra && !f(e.id) {
                             return;
                         }
                     }

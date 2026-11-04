@@ -133,14 +133,19 @@ fn main() {
         }
         return;
     }
+    // --fast: a quick look for layout iteration (one routing order, short rip-up, no end-game repairs or
+    // polishing); the blocker report then says what keeps each open net out
+    let fast = args.iter().any(|a| a == "--fast");
     let cfg = router::Cfg {
         only: arg(&args, "--only"),
         via_cost: arg(&args, "--via-cost").map(|s| s.parse().unwrap()).unwrap_or(4.0),
-        max_exp: arg(&args, "--max-exp").map(|s| s.parse().unwrap()).unwrap_or(20000),
-        seconds: arg(&args, "--seconds").map(|s| s.parse().unwrap()).unwrap_or(300.0),
-        rip_rounds: arg(&args, "--rip-rounds").map(|s| s.parse().unwrap()).unwrap_or(40),
+        // (successful searches rarely need more than 8000 expansions: the quick look stops failing ones there)
+        max_exp: arg(&args, "--max-exp").map(|s| s.parse().unwrap()).unwrap_or(if fast { 8000 } else { 20000 }),
+        seconds: arg(&args, "--seconds").map(|s| s.parse().unwrap()).unwrap_or(if fast { 60.0 } else { 300.0 }),
+        rip_rounds: arg(&args, "--rip-rounds").map(|s| s.parse().unwrap()).unwrap_or(if fast { 12 } else { 40 }),
         verbose: true,
-        single_attempt: args.iter().any(|a| a == "--single-attempt"),
+        single_attempt: fast || args.iter().any(|a| a == "--single-attempt"),
+        fast,
     };
     let mut r = router::Router::new(w, cfg);
     let t_world = t0.elapsed().as_secs_f64();
@@ -149,6 +154,52 @@ fn main() {
     let t_check = Instant::now();
     let viol = r.w.check_all();
     r.prof_add("final exact check", t_check);
+    let t_blk = Instant::now();
+    let blockers = r.blockers();
+    r.prof_add("blocker report", t_blk);
+    let xy = |p: &P2| [(p.x * 100.0).round() / 100.0, (p.y * 100.0).round() / 100.0];
+    for b in &blockers {
+        let open = b.open_pads.iter().take(3).map(|(n, p)| format!("{} @ ({:.2},{:.2})", n, p.x, p.y)).collect::<Vec<_>>().join(", ");
+        let next = format!(
+            "next to: {}{}",
+            b.near_nets.iter().take(6).map(|(n, k, f)| format!("{} ({}{})", n, if *k > 0 { format!("{} routed", k) } else { String::new() }, if *f > 0 { format!("{}{} fixed", if *k > 0 { ", " } else { "" }, f) } else { String::new() })).collect::<Vec<_>>().join(", "),
+            if b.near_parts.is_empty() { String::new() } else { format!("; parts {}", b.near_parts.join(", ")) }
+        );
+        match &b.way {
+            Some(w) => {
+                let layers: Vec<&str> = w.legs.iter().map(|x| x.0.as_str()).collect();
+                eprintln!(
+                    "  blocked: {} ({}): way through {} on {}{}; {}",
+                    b.net,
+                    open,
+                    if w.through.is_empty() { "nothing (room the exact checks reject)".to_string() } else { w.through.iter().map(|(n, k)| format!("{} x{}", n, k)).collect::<Vec<_>>().join(", ") },
+                    layers.join(" > "),
+                    if w.vias.is_empty() { String::new() } else { format!(" with {} via(s) at {}", w.vias.len(), w.vias.iter().map(|v| format!("({:.2},{:.2})", v.x, v.y)).collect::<Vec<_>>().join(" ")) },
+                    next
+                );
+            }
+            None if b.sealed => eprintln!("  blocked: {} ({}): sealed in: no way even through other nets' routed copper (fixed copper, keepouts or the outline close it off; move a part or hand copper); {}", b.net, open, next),
+            None => eprintln!("  blocked: {} ({}): no way found within the search budget, even through other nets' copper; {}", b.net, open, next),
+        }
+    }
+    let blockers_json: Vec<serde_json::Value> = blockers
+        .iter()
+        .map(|b| {
+            json!({
+                "net": b.net,
+                "open_pads": b.open_pads.iter().map(|(n, p)| json!({"pad": n, "at": xy(p)})).collect::<Vec<_>>(),
+                "way": b.way.as_ref().map(|w| json!({
+                    "through": w.through.iter().map(|(n, k)| json!({"net": n, "wires": k})).collect::<Vec<_>>(),
+                    "crossings": w.crossings.iter().map(|(l, p)| json!({"layer": l, "at": xy(p)})).collect::<Vec<_>>(),
+                    "legs": w.legs.iter().map(|(l, pts)| json!({"layer": l, "pts": pts.iter().map(|p| xy(p)).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                    "vias": w.vias.iter().map(|p| xy(p)).collect::<Vec<_>>(),
+                })),
+                "sealed": b.sealed,
+                "near_nets": b.near_nets.iter().map(|(n, k, f)| json!({"net": n, "routed": k, "fixed": f})).collect::<Vec<_>>(),
+                "near_parts": b.near_parts,
+            })
+        })
+        .collect();
     // where the time went: the phases of the kept attempt (the parallel attempts overlap in wall time), and the
     // searches by kind (summed over every attempt's thread)
     {
@@ -291,7 +342,7 @@ fn main() {
             "case": r.w.b.name, "algorithm": "topor-engine", "cold": true, "routing_seconds": secs,
             "routable_nets": routable.len(), "complete_nets": routable.len() - incomplete.iter().filter(|n| routable.contains(n)).count(),
             "deficit": r.total_deficit(), "tracks": ntracks, "vias": nvias, "length_mm": length,
-            "internal_violations": viol.len(), "internal_violations_by_kind": by_kind,
+            "internal_violations": viol.len(), "internal_violations_by_kind": by_kind, "fast": fast, "blockers": blockers_json,
             "phase_seconds": r.prof.iter().map(|(k, v)| (k.to_string(), json!({"seconds": v.0, "calls": v.1}))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "neck_stubs": r.w.b.necks.iter().map(|n| json!({"pad": n.pad, "net": r.w.b.nets[n.net as usize].name, "width": n.width, "length": n.from.dist(n.to)})).collect::<Vec<_>>(), "neck_failed": r.w.b.neck_failed, "missing": missing,
             "pairs": pair_json,

@@ -19,6 +19,39 @@ pub struct Cfg {
     pub seconds: f64,
     pub rip_rounds: usize,
     pub verbose: bool,
+    /// Quick look for layout iteration: one routing order, short rip-up, no end-game repairs, no polishing
+    /// (pairs, spring, via bridges); the blocker report says what keeps each open net out.
+    pub fast: bool,
+}
+
+/// What keeps an open group of a net out, for the design side: the cheapest way to it through other nets'
+/// copper (the nets it would cross, and where it runs: a route to draw by hand, or nets to move), or none if
+/// fixed copper and the outline seal it in (then a part must move); and what is next to its open pads.
+#[derive(Clone, Debug)]
+pub struct Blocker {
+    pub net: String,
+    pub open_pads: Vec<(String, P2)>,
+    /// None: no way even through other nets' copper.
+    pub way: Option<Way>,
+    /// With no way: true if the search ran out of places to go (sealed in by fixed copper, keepouts or the
+    /// outline), false if it ran out of budget first.
+    pub sealed: bool,
+    /// Other nets' copper within 1 mm of the open pads: (net, routed wires and vias, fixed copper: pads, hand
+    /// drawn tracks and vias).
+    pub near_nets: Vec<(String, usize, usize)>,
+    /// Other parts with pads within 1 mm of the open pads.
+    pub near_parts: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Way {
+    /// The nets it crosses, with how many of their wires.
+    pub through: Vec<(String, usize)>,
+    /// Where it crosses them (triangle centres, layer name).
+    pub crossings: Vec<(String, P2)>,
+    /// Its course per layer: from its start over the edges it crosses to its end.
+    pub legs: Vec<(String, Vec<P2>)>,
+    pub vias: Vec<P2>,
 }
 
 /// What happened to one differential pair, for the design side to act on (move a part, free a corridor).
@@ -206,10 +239,27 @@ impl Router {
     /// Connected components of a net's objects through its pieces; plane objects join through the plane.
     pub fn components(&self, net: u32) -> Vec<Vec<u32>> {
         let objs = self.net_objs(net);
-        let idx = |o: u32| objs.iter().position(|&x| x == o);
+        // (an index and one pass over the ties: the groups come out as before, in the same order, without the
+        // quadratic lookups that big nets made expensive)
+        let mut index: HashMap<u32, usize> = HashMap::default();
+        for (i, &o) in objs.iter().enumerate() {
+            index.entry(o).or_insert(i);
+        }
+        let idx = |o: u32| index.get(&o).cloned();
         let mut par: Vec<usize> = (0..objs.len()).collect();
         let plane = self.is_plane(net);
         let mut plane_root: Option<usize> = None;
+        for &(x, y) in &self.ties {
+            if let (Some(i), Some(j)) = (idx(x), idx(y)) {
+                // as seen from either end: the other end must be alive
+                if self.w.objs[y as usize].alive || self.w.objs[x as usize].alive {
+                    let (a, b) = (find(&mut par, i), find(&mut par, j));
+                    if a != b {
+                        par[b] = a;
+                    }
+                }
+            }
+        }
         for (i, &o) in objs.iter().enumerate() {
             for &p in &self.w.obj_pieces[o as usize] {
                 let pc = &self.w.pieces[p as usize];
@@ -217,20 +267,6 @@ impl Router {
                     continue;
                 }
                 for other in [pc.a.obj, pc.b.obj] {
-                    if let Some(j) = idx(other) {
-                        let (a, b) = (find(&mut par, i), find(&mut par, j));
-                        if a != b {
-                            par[b] = a;
-                        }
-                    }
-                }
-            }
-            for &(x, y) in &self.ties {
-                if x == o || y == o {
-                    let other = if x == o { y } else { x };
-                    if !self.w.objs[other as usize].alive {
-                        continue;
-                    }
                     if let Some(j) = idx(other) {
                         let (a, b) = (find(&mut par, i), find(&mut par, j));
                         if a != b {
@@ -926,7 +962,8 @@ impl Router {
         }
         let mut q = self.query(net, src.clone(), targets.clone(), true);
         q.soft = true;
-        q.max_exp = (self.cfg.max_exp as f64 * self.budget_scale) as usize * 7;
+        // (the quick look takes a smaller soft budget: what still needs more is reported as blocked)
+        q.max_exp = (self.cfg.max_exp as f64 * self.budget_scale) as usize * if self.cfg.fast { 3 } else { 7 };
         if self.is_plane(net) {
             q.plane_goal = true;
             q.max_len = 5.0;
@@ -2339,37 +2376,43 @@ impl Router {
         }
         // which pair goes first decides who has to make way where pairs crowd a chip's pad row or
         // cross: try short-first and long-first, keep the better coupled result
-        let start = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
         let mut best: Option<(f64, (World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>), HashMap<u32, PairDiag>)> = None;
         let orders: Vec<&str> = match std::env::var("TOPOR_PAIRORDER").as_deref() {
             Ok("long") => vec!["long"],
             Ok("short") => vec!["short"],
             _ => vec!["short", "long"],
         };
-        for (oi, order) in orders.iter().enumerate() {
-            if oi > 0 {
-                self.w = start.0.clone();
-                self.ties = start.1.clone();
-                self.history = start.2.clone();
-                self.junctions = start.3.clone();
-            }
-            let mut ps = pairs.clone();
-            if *order == "long" {
-                ps.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            } else {
-                ps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            }
-            for &(_, p, n) in &ps {
-                self.route_pair(p, n);
-                self.route_net(p);
-                self.route_net(n);
-            }
-            let score: f64 = ps.iter().map(|&(_, p, n)| if self.deficit(p) + self.deficit(n) > 0 { -1.0 } else { 0.0 }).sum::<f64>() + self.pair_report().iter().map(|x| x.4).sum::<f64>();
-            if std::env::var("TOPOR_PAIRDBG").is_ok() {
-                eprintln!("pair order {}: score {:.2}", order, score);
-            }
+        // (the two orders are independent: each runs on its own copy, at once)
+        let runs: Vec<(f64, Router)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = orders
+                .iter()
+                .map(|order| {
+                    let mut r = self.clone();
+                    let mut ps = pairs.clone();
+                    sc.spawn(move || {
+                        if *order == "long" {
+                            ps.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                        } else {
+                            ps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                        }
+                        for &(_, p, n) in &ps {
+                            r.route_pair(p, n);
+                            r.route_net(p);
+                            r.route_net(n);
+                        }
+                        let score: f64 = ps.iter().map(|&(_, p, n)| if r.deficit(p) + r.deficit(n) > 0 { -1.0 } else { 0.0 }).sum::<f64>() + r.pair_report().iter().map(|x| x.4).sum::<f64>();
+                        if std::env::var("TOPOR_PAIRDBG").is_ok() {
+                            eprintln!("pair order {}: score {:.2}", order, score);
+                        }
+                        (score, r)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("pair order")).collect()
+        });
+        for (score, r) in runs {
             if best.as_ref().map_or(true, |b| score > b.0) {
-                best = Some((score, (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone()), self.pair_diag.clone()));
+                best = Some((score, (r.w, r.ties, r.history, r.junctions), r.pair_diag));
             }
         }
         let mut score = 0.0;
@@ -2940,6 +2983,9 @@ impl Router {
             }
         }
         self.prof_add("routing attempts (in parallel; their phases below)", t_attempts);
+        if self.cfg.fast {
+            return;
+        }
         { let _t = Instant::now(); self.improve_pairs(); self.prof_add("improve pairs", _t); }
         { let _t = Instant::now(); self.cleanup(); self.prof_add("clean-up", _t); }
         // the spring relaxation: every free wire and via pulls tight together (TOPOR_NOSPRING: off)
@@ -3098,13 +3144,16 @@ impl Router {
                     break;
                 }
                 // with pairs released, rounds are cheap and the last few nets need patience
-                if stale >= if self.relax_pairs { 10 } else { 4 } {
-                    // stuck with pairs held: let the remaining nets move them, once
-                    if self.relax_pairs {
+                if stale >= if self.cfg.fast { 2 } else if self.relax_pairs { 10 } else { 4 } {
+                    // stuck with pairs held: let the remaining nets move them, once (the quick look stops here:
+                    // its blocker report searches with pairs crossable, so a pair in the way shows there)
+                    if self.relax_pairs || self.cfg.fast {
                         break;
                     }
                     self.relax_pairs = true;
-                    self.budget_scale = 3.0;
+                    // (TOPOR_RELAX_BUDGET: another factor; 1 was faster, no success needed more on dut-pi or EXT,
+                    // but the changed searches cost EXT its last net)
+                    self.budget_scale = std::env::var("TOPOR_RELAX_BUDGET").ok().and_then(|x| x.parse().ok()).unwrap_or(if self.cfg.fast { 1.0 } else { 3.0 });
                     stale = 0;
                     let stuck: Vec<String> = (0..nn).filter(|&x| self.deficit(x) > 0).map(|x| self.w.b.nets[x as usize].name.clone()).collect();
                     let ev = format!("rip-up stalled at round {} with deficit {} ({}) while moving differential pairs was costly (and barred to plane drops); from here on any net may move pairs", round, d, stuck.join(", "));
@@ -3168,7 +3217,7 @@ impl Router {
                 self.pair_diag = st.4;
             }
         }
-        if self.hurried() {
+        if self.hurried() || self.cfg.fast {
             return;
         }
         { let _t = Instant::now(); self.clear_area_repairs(); self.prof_add("end game: clear areas", _t); }
@@ -3677,6 +3726,114 @@ impl Router {
 
     pub fn total_deficit(&self) -> usize {
         (0..self.w.b.nets.len() as u32).map(|n| self.deficit(n)).sum()
+    }
+
+    /// The blocker report: for each open group of each incomplete net (two per net, forty in all), the cheapest
+    /// way to the rest of the net through other nets' copper (pairs included, the normal budget), and what is next
+    /// to its open pads. Nothing on the board changes.
+    pub fn blockers(&mut self) -> Vec<Blocker> {
+        let mut out = Vec::new();
+        let saved = (self.relax_pairs, self.protect_pairs, self.budget_scale);
+        self.relax_pairs = true;
+        self.protect_pairs = false;
+        self.budget_scale = 1.0;
+        for net in self.incomplete_nets() {
+            let comps = self.components(net);
+            let plane = self.is_plane(net);
+            let groups: Vec<Vec<u32>> = if plane { comps.iter().filter(|c| !self.plane_ok(net, c)).cloned().collect() } else { comps.iter().skip(1).cloned().collect() };
+            for g in groups.into_iter().take(2) {
+                if out.len() >= 40 {
+                    break;
+                }
+                let pad = |o: u32| {
+                    let s = &self.w.objs[o as usize].s;
+                    s.kind == Kind::Pad && !crate::world::fixed_copper(&s.name) && !s.name.starts_with("junction:")
+                };
+                let open_pads: Vec<(String, P2)> = g.iter().filter(|&&o| pad(o)).map(|&o| (self.w.objs[o as usize].s.name.clone(), self.w.objs[o as usize].s.center)).collect();
+                if open_pads.is_empty() {
+                    continue;
+                }
+                let targets: Vec<u32> = if plane { vec![] } else { comps.iter().filter(|c| **c != g).flatten().cloned().collect() };
+                let mut q = self.query(net, g.clone(), targets, true);
+                q.soft = true;
+                q.max_exp = self.cfg.max_exp * 3;
+                if plane {
+                    q.plane_goal = true;
+                    q.max_len = 5.0;
+                    q.allowed &= g.iter().fold(0u32, |m, &o| m | self.w.objs[o as usize].s.layers);
+                }
+                let found = self.search(&q);
+                let sealed = found.is_none() && self.last_exp < q.max_exp;
+                let way = found.filter(|p| p.cost.is_finite()).map(|p| self.way_of(&p));
+                // what is next to the open pads: other nets' wires and vias, their fixed copper, other parts
+                let near = |q: P2| open_pads.iter().any(|(_, c)| c.dist(q) < 1.0);
+                let mut nets: HashMap<u32, (usize, usize)> = HashMap::default();
+                for pc in self.w.pieces.iter().filter(|p| p.alive && p.net != net) {
+                    if pc.poly.windows(2).any(|sg| open_pads.iter().any(|(_, c)| seg_point_dist(sg[0], sg[1], *c) < 1.0)) {
+                        nets.entry(pc.net).or_insert((0, 0)).0 += 1;
+                    }
+                }
+                let mut parts: Vec<String> = Vec::new();
+                let own: Vec<String> = open_pads.iter().map(|(n, _)| n.split('.').next().unwrap_or("").to_string()).collect();
+                for o in self.w.objs.iter().filter(|o| o.alive && o.s.net != net) {
+                    if o.s.kind == Kind::Via && near(o.s.center) {
+                        nets.entry(o.s.net).or_insert((0, 0)).0 += 1;
+                        continue;
+                    }
+                    if o.s.kind != Kind::Pad || o.s.name.starts_with("junction:") || !open_pads.iter().any(|(_, c)| point_hull_dist(&o.s.pts, *c) - o.s.r < 1.0) {
+                        continue;
+                    }
+                    if o.s.net != NONE {
+                        nets.entry(o.s.net).or_insert((0, 0)).1 += 1;
+                    }
+                    // a real part (hand-drawn copper comes as pads of a "via"/"track" part, or as zone pieces)
+                    let part = o.s.name.split('.').next().unwrap_or("").to_string();
+                    if !crate::world::fixed_copper(&o.s.name) && !matches!(part.as_str(), "via" | "track" | "copper") && !own.contains(&part) && !parts.contains(&part) {
+                        parts.push(part);
+                    }
+                }
+                let mut near_nets: Vec<(String, usize, usize)> = nets.into_iter().map(|(n, (k, f))| (self.w.b.nets[n as usize].name.clone(), k, f)).collect();
+                near_nets.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then(a.0.cmp(&b.0)));
+                parts.sort();
+                out.push(Blocker { net: self.w.b.nets[net as usize].name.clone(), open_pads, way, sealed, near_nets, near_parts: parts });
+            }
+        }
+        (self.relax_pairs, self.protect_pairs, self.budget_scale) = saved;
+        out
+    }
+
+    /// A found (soft) path as a way for the blocker report.
+    fn way_of(&self, p: &PathOut) -> Way {
+        let mut by: HashMap<u32, usize> = HashMap::default();
+        for &v in &p.victims {
+            *by.entry(self.w.pieces[v as usize].net).or_insert(0) += 1;
+        }
+        let mut through: Vec<(String, usize)> = by.into_iter().map(|(n, k)| (self.w.b.nets[n as usize].name.clone(), k)).collect();
+        through.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let tri_at = |l: usize, t: u32| {
+            let tr = self.w.layers[l].cdt.tris[t as usize];
+            (self.w.vpos(l, tr.v[0]) + self.w.vpos(l, tr.v[1]) + self.w.vpos(l, tr.v[2])) * (1.0 / 3.0)
+        };
+        let crossings = p.cross_tris.iter().map(|&(l, t)| (self.w.b.sig_name(l as usize).to_string(), tri_at(l as usize, t))).collect();
+        let end_pos = |l: usize, e: &End| match e {
+            End::Obj(t) => if t.vtx != NONE { self.w.vpos(l, t.vtx) } else { self.w.objs[t.obj as usize].s.center },
+            End::NewVia(i) => p.vias[*i],
+        };
+        let legs = p
+            .segs
+            .iter()
+            .map(|sg| {
+                let l = sg.layer;
+                let mut pts = vec![end_pos(l, &sg.a)];
+                for &(e, _, _) in &sg.cx {
+                    let ed = self.w.layers[l].cdt.edges[e as usize];
+                    pts.push((self.w.vpos(l, ed.a) + self.w.vpos(l, ed.b)) * 0.5);
+                }
+                pts.push(end_pos(l, &sg.b));
+                (self.w.b.sig_name(l).to_string(), pts)
+            })
+            .collect();
+        Way { through, crossings, legs, vias: p.vias.clone() }
     }
 
     pub fn incomplete_nets(&self) -> Vec<u32> {
