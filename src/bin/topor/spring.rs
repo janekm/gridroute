@@ -460,7 +460,10 @@ impl Router {
     /// One relaxation with `hold` fixed: Ok(kept), or the nets that could not be joined up again.
     fn spring_once(&mut self, hold: &std::collections::HashSet<u32>) -> Result<bool, Vec<u32>> {
         let t0 = self.elapsed();
+        let _t = std::time::Instant::now();
         let mut m = self.spring_model(hold);
+        self.prof_add("spring: model", _t);
+        let t_solve = std::time::Instant::now();
         if m.vias.is_empty() && m.chains.is_empty() {
             return Ok(false);
         }
@@ -555,6 +558,7 @@ impl Router {
             }
         }
         let relaxed_len = Self::chain_len(&m);
+        self.prof_add("spring: solve (lists + Metal)", t_solve);
         // what the solve left unmet
         let (mut short, mut worst) = (0usize, 0.0f64);
         for &e in &m.mobile {
@@ -584,7 +588,9 @@ impl Router {
                 self.elapsed(), m.r.pos.len(), m.vias.len(), m.chains.len(), its, batches, if gpu { "Metal" } else { "CPU" }, builds, t_build, redone, t_run, start_len, relaxed_len
             );
         }
+        let _t = std::time::Instant::now();
         let ok = self.spring_write_back(&m);
+        self.prof_add("spring: write-back", _t);
         if self.cfg.verbose {
             eprintln!("[{:.1}s] spring relaxation {} ({:.1}s)", self.elapsed(), if ok.as_ref().map_or(false, |&k| k) { "kept" } else { "dropped" }, self.elapsed() - t0);
         }
@@ -596,9 +602,17 @@ impl Router {
     /// keeps the result only if it is as complete and clean as before and shorter.
     fn spring_write_back(&mut self, m: &Model) -> Result<bool, Vec<u32>> {
         let before_def = self.total_deficit();
+        // nets open before the relaxation: the write-back does not try them again (they cost full searches and
+        // will not come in now)
+        let was_open: std::collections::HashSet<u32> = self.incomplete_nets().into_iter().collect();
+        let _t = std::time::Instant::now();
         let before_viol = self.w.check_all().len();
+        self.prof_add("spring wb: exact checks", _t);
         let before_len = wire_len(&self.w);
+        let _t = std::time::Instant::now();
         let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
+        self.prof_add("spring wb: snapshot", _t);
+        let t_thread = std::time::Instant::now();
         let restore = |r: &mut Router, s: (crate::world::World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>)| {
             r.w = s.0;
             r.ties = s.1;
@@ -746,6 +760,8 @@ impl Router {
                 }
             }
         }
+        self.prof_add("spring wb: thread, realise, check", t_thread);
+        let t_pending = std::time::Instant::now();
         // the wires left short or not threaded: searched again between their own ends on their own layer
         let mut found = 0;
         for &(net, l, width, ta, tb) in &pending {
@@ -771,8 +787,10 @@ impl Router {
         if dbg {
             eprintln!("  spring: {} wires left short, {} did not thread, {} found again on their layer, {} kept as relaxed, {} ripped for clashes; {} nets to join up", skipped, unthreaded, found, kept, ripped, open.len());
         }
+        self.prof_add("spring wb: re-search short wires", t_pending);
+        let t_join = std::time::Instant::now();
         // 5. join up what is open
-        for &net in &open {
+        for &net in open.iter().filter(|n| !was_open.contains(n)) {
             for _ in 0..3 {
                 if self.route_net(net) == 0 {
                     break;
@@ -783,7 +801,7 @@ impl Router {
             }
         }
         if self.total_deficit() > before_def {
-            self.settle(8);
+            self.settle_except(8, &was_open);
         }
         self.cleanup();
         if dbg {
@@ -792,7 +810,10 @@ impl Router {
             }
         }
         let rerouted = open.len();
+        self.prof_add("spring wb: join up, settle, clean-up", t_join);
+        let _t = std::time::Instant::now();
         let (def, viol, len) = (self.total_deficit(), self.w.check_all().len(), wire_len(&self.w));
+        self.prof_add("spring wb: exact checks", _t);
         let moved = m.vias.iter().filter(|&&(o, n)| snap.0.objs[o as usize].s.center.dist(m.pos(n)) > 1e-3).count();
         if def > before_def || viol > before_viol || len >= before_len {
             if self.cfg.verbose {

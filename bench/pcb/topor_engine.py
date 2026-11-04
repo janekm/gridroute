@@ -6,10 +6,11 @@ acceptance steps read exactly the model the engine routed. Internal rules come f
 native export, DRC and baseline comparison. RF frontend nets are marked on the copy first (topor_rf.py, KiCad
 Python) unless the model already lists them, so the engine keeps each on one layer. Overlapping rule areas
 are merged into their union first (topor_keepouts.py), so the engine does not hull them, and custom design
-rules (unrouted.kicad_dru) are read into the model (topor_rules.py).
+rules (unrouted.kicad_dru) are read into the model (topor_rules.py). $TOPOR overrides the engine binary.
 """
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -46,7 +47,7 @@ def main():
         r = subprocess.run([a.kicad_python, str(ROOT / 'topor_rf.py'), str(a.out / 'input')], capture_output=True, text=True)
         if r.returncode:
             print('RF frontend detection failed:', r.stderr.strip().splitlines()[-1:], flush=True)
-    exe = ROOT.parents[1] / 'target/release/topor'
+    exe = os.environ.get('TOPOR') or ROOT.parents[1] / 'target/release/topor'
     cmd = [str(exe), 'route', str(a.out / 'input'), '--out', str(a.out), '--seconds', str(a.seconds)] + a.engine_args.split()
     with (a.out / 'engine.log').open('w') as log:
         code = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode

@@ -98,6 +98,21 @@ pub struct Query {
 
 #[derive(Clone, Copy, PartialEq)]
 struct HeapE(f64, u32);
+
+/// Weight of the distance heuristic (weighted A*), 1 (plain A*) by default: TOPOR_HARD_W / TOPOR_SOFT_W set
+/// one. A greedy soft search (1.5) was faster but ripped other victims, and lost connections on 1BP and EXT.
+fn heuristic_weight(soft: bool) -> f64 {
+    static W: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    let w = W.get_or_init(|| {
+        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.parse().ok()).unwrap_or(d);
+        (env("TOPOR_HARD_W", 1.0), env("TOPOR_SOFT_W", 1.0))
+    });
+    if soft {
+        w.1
+    } else {
+        w.0
+    }
+}
 impl Eq for HeapE {}
 impl PartialOrd for HeapE {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
@@ -223,7 +238,7 @@ impl<'a> Search<'a> {
 
     fn h(&self, l: usize, p: P2) -> f64 {
         let k = if self.q.couple != NONE { self.q.couple_factor } else { 1.0 };
-        k * self.h_raw(l, p)
+        k * self.h_raw(l, p) * heuristic_weight(self.q.soft)
     }
 
     fn h_raw(&self, l: usize, p: P2) -> f64 {

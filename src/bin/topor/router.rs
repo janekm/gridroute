@@ -73,6 +73,15 @@ pub struct Router {
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Negotiated congestion history per (layer, triangle).
     pub tri_hist: std::sync::Arc<HashMap<(u8, u32), f64>>,
+    /// Set when the other routing attempts are done and this one has had its grace: wrap up (keep the best
+    /// state so far, start no more repairs); the result still counts.
+    pub hurry: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Soft searches that found nothing, by net and what they depend on (the net's source group and targets,
+    /// whether pairs may be crossed, the budget): other nets' copper is passable to them, so the same search
+    /// fails again until one of those changes, and is not run again.
+    pub soft_dead: std::collections::HashSet<(u32, u64)>,
+    /// Wall time and calls per phase of the run (the attempt that is kept), for the time report.
+    pub prof: std::collections::BTreeMap<&'static str, (f64, usize)>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -90,6 +99,10 @@ pub struct Stats {
     pub fail_exp: usize,
     pub fail_s: f64,
     pub soft_s: f64,
+    /// Soft searches that found nothing, and their time; repeats of one that is known to fail, skipped.
+    pub soft_fail: usize,
+    pub soft_fail_s: f64,
+    pub soft_skipped: usize,
 }
 
 /// A segment failure in words for the design side.
@@ -155,11 +168,18 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()) }
+        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), prof: Default::default() }
     }
 
     pub fn elapsed(&self) -> f64 {
         self.t0.elapsed().as_secs_f64()
+    }
+
+    /// Add the time since `since` to phase `name` of the time report.
+    pub fn prof_add(&mut self, name: &'static str, since: Instant) {
+        let e = self.prof.entry(name).or_insert((0.0, 0));
+        e.0 += since.elapsed().as_secs_f64();
+        e.1 += 1;
     }
 
     pub fn is_plane(&self, net: u32) -> bool {
@@ -335,6 +355,10 @@ impl Router {
         }
         if q.soft {
             self.stats.soft_s += t.elapsed().as_secs_f64();
+            if r.is_none() {
+                self.stats.soft_fail += 1;
+                self.stats.soft_fail_s += t.elapsed().as_secs_f64();
+            }
         }
         r
     }
@@ -888,6 +912,18 @@ impl Router {
             }
             (comps[0].clone(), comps[1..].iter().flatten().cloned().collect())
         };
+        let dead_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut sorted = src.clone();
+            sorted.sort();
+            (sorted, targets.len(), self.relax_pairs, self.protect_pairs, self.budget_scale.to_bits(), self.w.b.nets[net as usize].allowed).hash(&mut h);
+            (net, h.finish())
+        };
+        if self.soft_dead.contains(&dead_key) {
+            self.stats.soft_skipped += 1;
+            return vec![];
+        }
         let mut q = self.query(net, src.clone(), targets.clone(), true);
         q.soft = true;
         q.max_exp = (self.cfg.max_exp as f64 * self.budget_scale) as usize * 7;
@@ -909,6 +945,9 @@ impl Router {
                 None => {
                     if dbg {
                         eprintln!("repair {}: soft search failed (src {:?} targets {:?}) after {} expansions", self.w.b.nets[net as usize].name, src.iter().map(|&o| self.w.objs[o as usize].s.name.clone()).collect::<Vec<_>>(), targets.iter().map(|&o| self.w.objs[o as usize].s.name.clone()).collect::<Vec<_>>(), self.last_exp);
+                    }
+                    if ripped_nets.is_empty() {
+                        self.soft_dead.insert(dead_key);
                     }
                     return ripped_nets;
                 }
@@ -1439,128 +1478,123 @@ impl Router {
     fn re_fan_repairs(&mut self) {
         let rows = self.escape_rows();
         let nn = self.w.b.nets.len() as u32;
-        let failing: Vec<u32> = (0..nn).filter(|&x| self.deficit(x) > 0 && !self.is_plane(x)).collect();
-        for net in failing {
-            if self.deficit(net) == 0 || self.elapsed() > self.cfg.seconds * 1.5 || self.stopped() {
-                continue;
+        // each stretch rebuild is a trial on its own copy of the board, all at once; the best that pays is kept
+        // and the rest try again from there
+        loop {
+            if self.elapsed() > self.cfg.seconds * 1.5 || self.hurried() {
+                return;
             }
-            let pads = self.net_pads[net as usize].clone();
-            for row in rows.iter() {
-                let k = match row.iter().position(|x| pads.contains(&x.0)) {
-                    Some(k) => k,
-                    None => continue,
-                };
-                if self.deficit(net) == 0 {
-                    break;
-                }
-                let (lo, hi) = (k.saturating_sub(3), (k + 4).min(row.len()));
-                let before = self.total_deficit();
-                let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
-                let dsnap = self.pair_diag.clone();
-                // the window in row coordinates: along the stretch and 0.6 mm beyond, out to 1.8 mm, and as
-                // far as the nearby pads its pins go to (a lane's target left outside kept its old wires)
-                let (a0, ax) = (row[0].1, row[0].2);
-                let perp = ax.perp();
-                let (mut ul, mut uh, mut sh) = ((row[lo].1 - a0).dot(perp) - 0.6, (row[hi - 1].1 - a0).dot(perp) + 0.6, 1.8f64);
-                for i in lo..hi {
-                    let (o, a, _) = row[i];
-                    let s0 = &self.w.objs[o as usize].s;
-                    let part = s0.name.split('.').next().unwrap_or("").to_string();
-                    for &q in &self.net_pads[s0.net as usize] {
-                        let t = &self.w.objs[q as usize].s;
-                        if q == o || t.name.split('.').next().unwrap_or("") == part || t.center.dist(a) > 3.5 {
-                            continue;
-                        }
-                        let (tu, ts) = ((t.center - a0).dot(perp), (t.center - a0).dot(ax));
-                        ul = ul.min(tu - 0.6);
-                        uh = uh.max(tu + 0.6);
-                        sh = sh.max(ts + 0.4);
+            let failing: Vec<u32> = (0..nn).filter(|&x| self.deficit(x) > 0 && !self.is_plane(x)).collect();
+            let mut jobs: Vec<(u32, usize, usize)> = Vec::new();
+            for &net in &failing {
+                let pads = &self.net_pads[net as usize];
+                for (ri, row) in rows.iter().enumerate() {
+                    if let Some(k) = row.iter().position(|x| pads.contains(&x.0)) {
+                        jobs.push((net, ri, k));
                     }
                 }
-                let inside = |q: P2| {
-                    let d = q - a0;
-                    let (uu, ss) = (d.dot(perp), d.dot(ax));
-                    uu > ul && uu < uh && ss > -0.05 && ss < sh
-                };
-                let mut rip: Vec<u32> = Vec::new();
-                for (pi, pc) in self.w.pieces.iter().enumerate() {
-                    if pc.alive && (pc.poly.iter().any(|&q| inside(q)) || pc.poly.windows(2).any(|sg| inside(sg[0].lerp(sg[1], 0.5)))) {
-                        rip.push(pi as u32);
-                    }
+            }
+            if !self.adopt_best_trial(&jobs, |r, &(net, ri, k)| r.re_fan_trial(net, &rows[ri], k)) {
+                break;
+            }
+        }
+    }
+
+    /// One stretch rebuild for `net` round pin k of `row`, on this copy of the board: its event line.
+    fn re_fan_trial(&mut self, net: u32, row: &[(u32, P2, P2)], k: usize) -> Option<String> {
+        if self.deficit(net) == 0 {
+            return None;
+        }
+        let (lo, hi) = (k.saturating_sub(3), (k + 4).min(row.len()));
+        let before = self.total_deficit();
+        // the window in row coordinates: along the stretch and 0.6 mm beyond, out to 1.8 mm, and as
+        // far as the nearby pads its pins go to (a lane's target left outside kept its old wires)
+        let (a0, ax) = (row[0].1, row[0].2);
+        let perp = ax.perp();
+        let (mut ul, mut uh, mut sh) = ((row[lo].1 - a0).dot(perp) - 0.6, (row[hi - 1].1 - a0).dot(perp) + 0.6, 1.8f64);
+        for i in lo..hi {
+            let (o, a, _) = row[i];
+            let s0 = &self.w.objs[o as usize].s;
+            let part = s0.name.split('.').next().unwrap_or("").to_string();
+            for &q in &self.net_pads[s0.net as usize] {
+                let t = &self.w.objs[q as usize].s;
+                if q == o || t.name.split('.').next().unwrap_or("") == part || t.center.dist(a) > 3.5 {
+                    continue;
                 }
-                for (oi, o) in self.w.objs.iter().enumerate() {
-                    if o.alive && o.s.kind == Kind::Via && inside(o.s.center) {
-                        rip.extend(self.w.obj_pieces[oi].iter().cloned().filter(|&p| self.w.pieces[p as usize].alive));
-                    }
-                }
-                rip.sort();
-                rip.dedup();
-                let mut moved: Vec<u32> = rip.iter().map(|&p| self.w.pieces[p as usize].net).collect();
-                moved.push(net);
-                moved.sort();
-                moved.dedup();
-                for p in rip {
-                    self.rip_piece(p);
-                }
-                let dbg = std::env::var("TOPOR_FANDBG").is_ok();
-                let open = |me: &Router| -> Vec<String> { moved.iter().filter(|&&x| me.deficit(x) > 0).map(|&x| me.w.b.nets[x as usize].name.clone()).collect() };
-                let (made, wanted, nested, pending) = self.fan_row(row, lo, hi, true);
+                let (tu, ts) = ((t.center - a0).dot(perp), (t.center - a0).dot(ax));
+                ul = ul.min(tu - 0.6);
+                uh = uh.max(tu + 0.6);
+                sh = sh.max(ts + 0.4);
+            }
+        }
+        let inside = |q: P2| {
+            let d = q - a0;
+            let (uu, ss) = (d.dot(perp), d.dot(ax));
+            uu > ul && uu < uh && ss > -0.05 && ss < sh
+        };
+        let mut rip: Vec<u32> = Vec::new();
+        for (pi, pc) in self.w.pieces.iter().enumerate() {
+            if pc.alive && (pc.poly.iter().any(|&q| inside(q)) || pc.poly.windows(2).any(|sg| inside(sg[0].lerp(sg[1], 0.5)))) {
+                rip.push(pi as u32);
+            }
+        }
+        for (oi, o) in self.w.objs.iter().enumerate() {
+            if o.alive && o.s.kind == Kind::Via && inside(o.s.center) {
+                rip.extend(self.w.obj_pieces[oi].iter().cloned().filter(|&p| self.w.pieces[p as usize].alive));
+            }
+        }
+        rip.sort();
+        rip.dedup();
+        let mut moved: Vec<u32> = rip.iter().map(|&p| self.w.pieces[p as usize].net).collect();
+        moved.push(net);
+        moved.sort();
+        moved.dedup();
+        for p in rip {
+            self.rip_piece(p);
+        }
+        let dbg = std::env::var("TOPOR_FANDBG").is_ok();
+        let open = |me: &Router| -> Vec<String> { moved.iter().filter(|&&x| me.deficit(x) > 0).map(|&x| me.w.b.nets[x as usize].name.clone()).collect() };
+        let (made, wanted, nested, pending) = self.fan_row(row, lo, hi, true);
+        if dbg {
+            eprintln!("re-fan {}: moved {:?}; vias {} of {}; nested {:?}", self.w.b.nets[net as usize].name, moved.iter().map(|&x| self.w.b.nets[x as usize].name.clone()).collect::<Vec<_>>(), made, wanted, nested.iter().map(|&o| self.w.objs[o as usize].s.name.clone()).collect::<Vec<_>>());
+        }
+        // the lanes stay on the pins' layer (left free, a lane took a via wherever that was cheaper)
+        for &o in &nested {
+            let x = self.w.objs[o as usize].s.net;
+            if self.deficit(x) > 0 {
+                let ok = self.route_on_layer(x, o);
                 if dbg {
-                    eprintln!("re-fan {}: moved {:?}; vias {} of {}; nested {:?}", self.w.b.nets[net as usize].name, moved.iter().map(|&x| self.w.b.nets[x as usize].name.clone()).collect::<Vec<_>>(), made, wanted, nested.iter().map(|&o| self.w.objs[o as usize].s.name.clone()).collect::<Vec<_>>());
+                    eprintln!("   lane {} ({}): {}", self.w.objs[o as usize].s.name, self.w.b.nets[x as usize].name, if ok { "on its layer".to_string() } else { format!("failed after {} expansions", self.last_exp) });
                 }
-                // the lanes stay on the pins' layer (left free, a lane took a via wherever that was cheaper)
-                for &o in &nested {
-                    let x = self.w.objs[o as usize].s.net;
-                    if self.deficit(x) > 0 {
-                        let ok = self.route_on_layer(x, o);
-                        if dbg {
-                            eprintln!("   lane {} ({}): {}", self.w.objs[o as usize].s.name, self.w.b.nets[x as usize].name, if ok { "on its layer".to_string() } else { format!("failed after {} expansions", self.last_exp) });
-                        }
-                        if !ok {
-                            self.route_net(x);
-                        }
-                    }
-                }
-                for (o, vid, reach) in pending {
-                    let x = self.w.objs[o as usize].s.net;
-                    if !self.connect_within(x, o, vid, NONE, reach) {
-                        let _ = self.w.remove_via(vid);
-                    }
-                }
-                if dbg {
-                    eprintln!("   after nested lanes, open: {:?}", open(self));
-                    if let Ok(dir) = std::env::var("TOPOR_FANSVG") {
-                        let c = row[k].1;
-                        let svg = crate::svg::render(&self.w, &crate::svg::Opts { mesh: false, box_: Some([c.x - 2.8, c.y - 2.8, c.x + 2.8, c.y + 1.2]), scale: 120.0, marks: vec![], unrouted: vec![] });
-                        let _ = std::fs::write(format!("{}/refan-{}.svg", dir, self.w.objs[row[k].0 as usize].s.name), svg);
-                    }
-                }
-                for &x in &moved {
-                    if self.deficit(x) > 0 {
-                        self.reroute(x);
-                    }
-                }
-                if dbg {
-                    eprintln!("   after rerouting the rest, open: {:?}", open(self));
-                }
-                self.settle(8);
-                let after = self.total_deficit();
-                let kept = after < before;
-                let ev = format!("{} was sealed in at {} by its neighbours' escapes: rebuilt that stretch of the row with dogbone vias and nested lanes ({} nets moved), deficit {} -> {}{}", self.w.b.nets[net as usize].name, self.w.objs[row[k].0 as usize].s.name, moved.len(), before, after, if kept { "" } else { ", undone" });
-                if self.cfg.verbose {
-                    eprintln!("[{:.1}s] {}", self.elapsed(), ev);
-                }
-                if kept {
-                    self.events.push(ev);
-                } else {
-                    self.w = snap.0;
-                    self.ties = snap.1;
-                    self.history = snap.2;
-                    self.junctions = snap.3;
-                    self.pair_diag = dsnap;
+                if !ok {
+                    self.route_net(x);
                 }
             }
         }
+        for (o, vid, reach) in pending {
+            let x = self.w.objs[o as usize].s.net;
+            if !self.connect_within(x, o, vid, NONE, reach) {
+                let _ = self.w.remove_via(vid);
+            }
+        }
+        if dbg {
+            eprintln!("   after nested lanes, open: {:?}", open(self));
+            if let Ok(dir) = std::env::var("TOPOR_FANSVG") {
+                let c = row[k].1;
+                let svg = crate::svg::render(&self.w, &crate::svg::Opts { mesh: false, box_: Some([c.x - 2.8, c.y - 2.8, c.x + 2.8, c.y + 1.2]), scale: 120.0, marks: vec![], unrouted: vec![] });
+                let _ = std::fs::write(format!("{}/refan-{}.svg", dir, self.w.objs[row[k].0 as usize].s.name), svg);
+            }
+        }
+        for &x in &moved {
+            if self.deficit(x) > 0 {
+                self.reroute(x);
+            }
+        }
+        if dbg {
+            eprintln!("   after rerouting the rest, open: {:?}", open(self));
+        }
+        self.settle(8);
+        Some(format!("{} was sealed in at {} by its neighbours' escapes: rebuilt that stretch of the row with dogbone vias and nested lanes ({} nets moved), deficit {} -> {}", self.w.b.nets[net as usize].name, self.w.objs[row[k].0 as usize].s.name, moved.len(), before, self.total_deficit()))
     }
 
     /// Connect pad o to the rest of its net without leaving the pad's layer (no vias).
@@ -1593,6 +1627,11 @@ impl Router {
     /// A few rip-up rounds over whatever is still open (after a local rebuild), ending on the best board
     /// they reach.
     pub(crate) fn settle(&mut self, rounds: usize) {
+        self.settle_except(rounds, &Default::default());
+    }
+
+    /// `settle`, leaving out the nets in `skip` (ones that were open already and will not come in now).
+    pub(crate) fn settle_except(&mut self, rounds: usize, skip: &std::collections::HashSet<u32>) {
         let nn = self.w.b.nets.len() as u32;
         let mut best: Option<(usize, (World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>))> = None;
         for _ in 0..rounds {
@@ -1600,7 +1639,7 @@ impl Router {
             if best.as_ref().map_or(true, |b| d < b.0) {
                 best = Some((d, (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone())));
             }
-            let failing: Vec<u32> = (0..nn).filter(|&n| self.deficit(n) > 0 && self.net_pads[n as usize].len() >= 1).collect();
+            let failing: Vec<u32> = (0..nn).filter(|&n| !skip.contains(&n) && self.deficit(n) > 0 && self.net_pads[n as usize].len() >= 1).collect();
             if failing.is_empty() || self.elapsed() > self.cfg.seconds * 1.5 || self.stopped() {
                 break;
             }
@@ -2769,7 +2808,7 @@ impl Router {
                 self.pair_len[p as usize] = self.w.objs[pa as usize].s.center.dist(self.w.objs[pb as usize].s.center);
             }
         }
-        self.route_pairs();
+        { let _t = Instant::now(); self.route_pairs(); self.prof_add("pairs", _t); }
         if self.cfg.verbose {
             eprintln!("[{:.1}s] pairs done", self.elapsed());
         }
@@ -2779,6 +2818,7 @@ impl Router {
         // the best one kept. An attempt that
         // completes the board calls off the ones after it; the earlier ones run on, so the first complete
         // attempt in this order always wins.
+        let t_attempts = Instant::now();
         let has_fanout = !self.fanout_order().is_empty();
         let forced: Option<usize> = std::env::var("TOPOR_ATTEMPT").ok().and_then(|x| x.parse().ok());
         // (long nets first, with or without the fan-out, did worse on every test board: TOPOR_ATTEMPT=3, 4)
@@ -2806,6 +2846,21 @@ impl Router {
                     s.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             };
+            // a race: once the first attempt is done, the others get as long again as it took (at least 5 s;
+            // TOPOR_GRACE: another fraction of it), then wrap up with what they have, which still counts
+            let hurry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let finished = std::sync::Arc::new(std::sync::Mutex::new((0usize, None::<Instant>)));
+            let grace_frac: f64 = std::env::var("TOPOR_GRACE").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
+            let n_attempts = variants.len();
+            let finish = |f: &std::sync::Mutex<(usize, Option<Instant>)>| {
+                let mut g = f.lock().unwrap();
+                g.0 += 1;
+                g.1.get_or_insert_with(Instant::now);
+            };
+            for o in others.iter_mut() {
+                o.hurry = Some(hurry.clone());
+            }
+            self.hurry = Some(hurry.clone());
             let done: Vec<(usize, Router)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = others
                     .drain(..)
@@ -2813,21 +2868,43 @@ impl Router {
                     .map(|(i, mut o)| {
                         let (fan, long, esc) = variants[i + 1];
                         let stops = &stops;
+                        let finished = &finished;
                         sc.spawn(move || {
                             o.route_rest(fan, long, esc);
                             if !o.stopped() && o.total_deficit() == 0 {
                                 call_off_after(i + 1, stops);
                             }
+                            finish(finished);
                             o
                         })
                     })
                     .collect();
+                {
+                    let (hurry, finished) = (hurry.clone(), finished.clone());
+                    sc.spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        let g = finished.lock().unwrap();
+                        if g.0 >= n_attempts {
+                            break;
+                        }
+                        if let Some(t) = g.1 {
+                            let grace = (grace_frac * t.duration_since(t_attempts).as_secs_f64()).max(5.0);
+                            if t.elapsed().as_secs_f64() > grace {
+                                hurry.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    });
+                }
                 self.route_rest(false, false, false);
                 if self.total_deficit() == 0 {
                     call_off_after(0, &stops);
                 }
+                finish(&finished);
                 hs.into_iter().enumerate().map(|(i, h)| (i + 1, h.join().expect("routing attempt"))).collect()
             });
+            let hurried = hurry.load(std::sync::atomic::Ordering::Relaxed);
+            self.hurry = None;
             let name = |k: usize| match variants[k] {
                 (true, _, true) => "fine-pitch parts given a planned fan-out first",
                 (false, false, _) => "plain order",
@@ -2850,22 +2927,24 @@ impl Router {
                 }
             }
             if self.cfg.verbose {
-                eprintln!("[{:.1}s] {}", self.elapsed(), summary.join("; "));
+                eprintln!("[{:.1}s] {}{}", self.elapsed(), summary.join("; "), if hurried { " (the slower ones wrapped up after their grace)" } else { "" });
             }
             if let Some((k, d)) = best {
                 let mut o = done.into_iter().find(|x| x.0 == k).unwrap().1;
                 o.cfg.verbose = self.cfg.verbose;
                 o.stop = None;
+                o.hurry = None;
                 o.t0 = self.t0;
                 o.events.push(format!("the board completed better with the {} (deficit {} instead of {} in plain order)", name(k), d, first));
                 *self = o;
             }
         }
-        self.improve_pairs();
-        self.cleanup();
+        self.prof_add("routing attempts (in parallel; their phases below)", t_attempts);
+        { let _t = Instant::now(); self.improve_pairs(); self.prof_add("improve pairs", _t); }
+        { let _t = Instant::now(); self.cleanup(); self.prof_add("clean-up", _t); }
         // the spring relaxation: every free wire and via pulls tight together (TOPOR_NOSPRING: off)
         if std::env::var("TOPOR_NOSPRING").is_err() {
-            self.spring();
+            { let _t = Instant::now(); self.spring(); self.prof_add("spring", _t); }
             // (experiment: TOPOR_SPRING2 relaxes twice, the control for teleportation's second pass)
             if std::env::var("TOPOR_SPRING2").is_ok() {
                 self.spring();
@@ -2882,14 +2961,16 @@ impl Router {
             }
         }
         // via bridges the relaxed board no longer needs; then the board relaxes again around the change
+        let _t = Instant::now();
         let (bridges, removed) = self.remove_bridges();
+        self.prof_add("via bridges", _t);
         if removed > 0 {
             self.events.push(format!("{} of {} via bridges removed (a net hopping to another layer and straight back)", removed, bridges));
             if self.cfg.verbose {
                 eprintln!("[{:.1}s] via bridges: {} of {} removed", self.elapsed(), removed, bridges);
             }
             if std::env::var("TOPOR_NOSPRING").is_err() {
-                self.spring();
+                { let _t = Instant::now(); self.spring(); self.prof_add("spring", _t); }
             }
         } else if self.cfg.verbose && bridges > 0 {
             eprintln!("[{:.1}s] via bridges: none of {} removable", self.elapsed(), bridges);
@@ -2902,38 +2983,50 @@ impl Router {
         self.stop.as_ref().map_or(false, |s| s.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Called off, or asked to wrap up (see `hurry`).
+    fn hurried(&self) -> bool {
+        self.stopped() || self.hurry.as_ref().map_or(false, |s| s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Planes, signals, rip-up and the end-game repairs, after the pairs.
     fn route_rest(&mut self, fanout: bool, long_first: bool, escapes: bool) {
         let nn = self.w.b.nets.len() as u32;
         // RF frontends first: kept to one layer, short, beside their radios; they take the straight lines
         let rf: Vec<u32> = self.w.b.rf_nets.iter().map(|x| x.0).collect();
+        let _t = Instant::now();
         for &net in &rf {
             self.route_net(net);
         }
+        self.prof_add("RF frontends", _t);
         if self.cfg.verbose && !rf.is_empty() {
             eprintln!("[{:.1}s] RF frontends: {} nets, deficit {}", self.elapsed(), rf.len(), rf.iter().map(|&n| self.deficit(n)).sum::<usize>());
         }
         if escapes {
-            self.plan_fanout();
+            { let _t = Instant::now(); self.plan_fanout(); self.prof_add("planned fan-out", _t); }
         }
         if fanout {
             let fan = self.fanout_order();
+            let _t = Instant::now();
             for &net in &fan {
                 self.route_net(net);
             }
+            self.prof_add("fan-out", _t);
             if self.cfg.verbose {
                 eprintln!("[{:.1}s] fan-out of fine-pitch parts: {} nets, deficit {}", self.elapsed(), fan.len(), fan.iter().map(|&n| self.deficit(n)).sum::<usize>());
             }
         }
+        let _t = Instant::now();
         for net in 0..nn {
             if self.is_plane(net) {
                 self.route_net(net);
             }
         }
+        self.prof_add("plane drops", _t);
         if self.cfg.verbose {
             eprintln!("[{:.1}s] planes done", self.elapsed());
         }
         self.trace_pairs("planes");
+        let t_first = Instant::now();
         let mut order: Vec<(f64, u32)> = Vec::new();
         for net in 0..nn {
             if self.is_plane(net) || self.net_pads[net as usize].len() < 2 {
@@ -2954,20 +3047,26 @@ impl Router {
         }
         for &(_, net) in &order {
             self.route_net(net);
-            if self.elapsed() > self.cfg.seconds || self.stopped() {
+            if self.elapsed() > self.cfg.seconds || self.hurried() {
                 break;
             }
         }
         if self.stopped() {
             return;
         }
+        self.prof_add("first pass", t_first);
         if self.cfg.verbose {
             eprintln!("[{:.1}s] first pass: deficit {}", self.elapsed(), self.total_deficit());
         }
         self.trace_pairs("first pass");
         // rip-up and reroute
+        let t_rip = Instant::now();
         let mut best_def = usize::MAX;
         let mut stale = 0;
+        // rip-up stops when it no longer pays: no new best for half the time it has run (and 4 rounds), the
+        // end-game repairs do better from there than more rounds of the same
+        let rip_start = self.elapsed();
+        let mut best_at = rip_start;
         // the best board seen: a round can make things worse, the flow then goes on from the best
         type Snap = (World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>, HashMap<u32, PairDiag>);
         let mut best_state: Option<(usize, Snap)> = None;
@@ -2975,17 +3074,29 @@ impl Router {
             if self.stopped() {
                 return;
             }
+            if self.hurried() {
+                break;
+            }
             self.round = round as i32;
             // rounds that no longer make progress go to the pair rescue instead
             let d = self.total_deficit();
             if best_state.as_ref().map_or(true, |b| d < b.0) {
+                let _t = Instant::now();
                 best_state = Some((d, (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone(), self.pair_diag.clone())));
+                self.prof_add("rip-up: snapshots", _t);
             }
             if d < best_def {
                 best_def = d;
                 stale = 0;
+                best_at = self.elapsed();
             } else {
                 stale += 1;
+                if stale >= 4 && self.elapsed() - best_at > 0.5 * (self.elapsed() - rip_start) && std::env::var("TOPOR_NOSTALL").is_err() {
+                    if self.cfg.verbose {
+                        eprintln!("[{:.1}s] rip-up stops: no gain since {:.1}s (deficit {})", self.elapsed(), best_at, best_def);
+                    }
+                    break;
+                }
                 // with pairs released, rounds are cheap and the last few nets need patience
                 if stale >= if self.relax_pairs { 10 } else { 4 } {
                     // stuck with pairs held: let the remaining nets move them, once
@@ -3016,7 +3127,9 @@ impl Router {
                 if self.deficit(net) == 0 {
                     continue;
                 }
+                let _t = Instant::now();
                 let victims = self.repair_net(net);
+                self.prof_add("rip-up: find what to rip (soft search)", _t);
                 // a ripped pair is rebuilt first: it needs a corridor, the net only a track
                 let paired = |me: &Router, v: u32| me.w.b.partner.get(v as usize).map_or(false, |&x| x != NONE);
                 if std::env::var("TOPOR_PAIRFIRST").is_ok() {
@@ -3026,18 +3139,23 @@ impl Router {
                         }
                     }
                 }
+                let _t = Instant::now();
                 self.route_net(net);
+                self.prof_add("rip-up: route the net", _t);
+                let _t = Instant::now();
                 for &v in &victims {
                     if !paired(self, v) || std::env::var("TOPOR_PAIRFIRST").is_err() {
                         self.reroute(v);
                     }
                 }
+                self.prof_add("rip-up: reroute the ripped", _t);
             }
             if self.cfg.verbose {
                 eprintln!("[{:.1}s] rip round {}: deficit {}", self.elapsed(), round, self.total_deficit());
             }
             self.trace_pairs(&format!("rip round {}", round));
         }
+        self.prof_add("rip-up rounds", t_rip);
         if let Some((d, st)) = best_state {
             if d < self.total_deficit() {
                 if self.cfg.verbose {
@@ -3050,94 +3168,143 @@ impl Router {
                 self.pair_diag = st.4;
             }
         }
-        if self.stopped() {
+        if self.hurried() {
             return;
         }
-        self.clear_area_repairs();
-        self.re_fan_repairs();
-        self.rescue_pairs();
+        { let _t = Instant::now(); self.clear_area_repairs(); self.prof_add("end game: clear areas", _t); }
+        { let _t = Instant::now(); self.re_fan_repairs(); self.prof_add("end game: re-fan rows", _t); }
+        { let _t = Instant::now(); self.rescue_pairs(); self.prof_add("end game: rescue pairs", _t); }
     }
 
     /// Nets still open after rip-up: a pad sealed in by other nets' vias and wires the soft search cannot
     /// pass. Clear other copper round the open pads, route the net first, then the displaced nets;
-    /// kept only if the board ends up less incomplete.
+    /// kept only if the board ends up less incomplete. The trials are independent (nearly all are undone), so
+    /// they run at once, each on its own copy of the board: the best one that pays is kept and the others try
+    /// again from there, until a wave brings nothing.
     fn clear_area_repairs(&mut self) {
         let nn = self.w.b.nets.len() as u32;
         for radius in [1.2, 2.5] {
-            let failing: Vec<u32> = (0..nn).filter(|&x| self.deficit(x) > 0 && self.net_pads[x as usize].len() >= 1).collect();
-            for net in failing {
-                if self.deficit(net) == 0 || self.elapsed() > self.cfg.seconds * 1.5 {
-                    continue;
+            loop {
+                if self.elapsed() > self.cfg.seconds * 1.5 || self.hurried() {
+                    return;
                 }
-                // pads of the groups that are not connected (all but the largest; every group for planes)
-                let comps = self.components(net);
-                let open: Vec<P2> = comps
-                    .iter()
-                    .skip(if self.is_plane(net) { 0 } else { 1 })
-                    .filter(|c| !self.is_plane(net) || !self.plane_ok(net, c))
-                    .flatten()
-                    .filter(|&&o| self.w.objs[o as usize].s.kind == Kind::Pad)
-                    .map(|&o| self.w.objs[o as usize].s.center)
-                    .collect();
-                if open.is_empty() {
-                    continue;
-                }
-                let near = |q: P2| open.iter().any(|c| c.dist(q) < radius);
-                let mut victims: Vec<u32> = Vec::new();
-                for (i, pc) in self.w.pieces.iter().enumerate() {
-                    if pc.alive && pc.net != net && pc.poly.windows(2).any(|sg| open.iter().any(|&c| seg_point_dist(sg[0], sg[1], c) < radius)) {
-                        victims.push(i as u32);
-                    }
-                }
-                for (oi, o) in self.w.objs.iter().enumerate() {
-                    if o.alive && o.s.kind == Kind::Via && o.s.net != net && near(o.s.center) {
-                        victims.extend(self.w.obj_pieces[oi].iter().cloned().filter(|&p| self.w.pieces[p as usize].alive));
-                    }
-                }
-                victims.sort();
-                victims.dedup();
-                if victims.is_empty() {
-                    continue;
-                }
+                let failing: Vec<u32> = (0..nn).filter(|&x| self.deficit(x) > 0 && self.net_pads[x as usize].len() >= 1).collect();
                 let before = self.total_deficit();
-                let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
-                let dsnap = self.pair_diag.clone();
-                let mut vnets: Vec<u32> = victims.iter().map(|&p| self.w.pieces[p as usize].net).collect();
-                vnets.sort();
-                vnets.dedup();
-                for p in victims {
-                    self.rip_piece(p);
-                }
-                self.route_net(net);
-                for v in &vnets {
-                    self.reroute(*v);
-                }
-                for v in &vnets {
-                    if self.deficit(*v) > 0 {
-                        let more = self.repair_net(*v);
-                        self.route_net(*v);
-                        for m in more {
-                            self.reroute(m);
-                        }
-                    }
-                }
-                let after = self.total_deficit();
-                let kept = after < before;
-                let ev = format!("{} was sealed in near {}: cleared {:.1} mm round its open pads ({} nets moved), deficit {} -> {}{}", self.w.b.nets[net as usize].name, open.iter().take(2).map(|c| format!("({:.2},{:.2})", c.x, c.y)).collect::<Vec<_>>().join(" "), radius, vnets.len(), before, after, if kept { "" } else { ", undone" });
-                if self.cfg.verbose {
-                    eprintln!("[{:.1}s] {}", self.elapsed(), ev);
-                }
-                if kept {
-                    self.events.push(ev);
-                } else {
-                    self.w = snap.0;
-                    self.ties = snap.1;
-                    self.history = snap.2;
-                    self.junctions = snap.3;
-                    self.pair_diag = dsnap;
+                if !self.adopt_best_trial(&failing, |r, &net| r.clear_area_trial(net, radius, before)) {
+                    break;
                 }
             }
         }
+    }
+
+    /// Run `trial` for every job, each on its own copy of the board, in parallel (a chunk of copies per round of
+    /// threads, so memory stays bounded), and keep the copy that leaves the board least incomplete if that is
+    /// better than now (ties: the earlier job). The trials' event lines are printed in job order. Returns
+    /// whether a trial was kept.
+    fn adopt_best_trial<T: Sync, F: Fn(&mut Router, &T) -> Option<String> + Sync>(&mut self, jobs: &[T], trial: F) -> bool {
+        use rayon::prelude::*;
+        let before = self.total_deficit();
+        let chunk = rayon::current_num_threads().max(1);
+        let mut best: Option<(usize, String, Router)> = None;
+        for part in jobs.chunks(chunk) {
+            if self.elapsed() > self.cfg.seconds * 1.5 || self.hurried() {
+                break;
+            }
+            let _t = Instant::now();
+            let copies: Vec<Router> = part
+                .iter()
+                .map(|_| {
+                    let mut r = self.clone();
+                    r.cfg.verbose = false;
+                    r
+                })
+                .collect();
+            self.prof_add("end game: board copies", _t);
+            let done: Vec<(Option<String>, usize, Router)> = copies
+                .into_par_iter()
+                .zip(part.par_iter())
+                .map(|(mut r, job)| {
+                    let ev = trial(&mut r, job);
+                    let d = r.total_deficit();
+                    (ev, d, r)
+                })
+                .collect();
+            for (ev, d, r) in done {
+                let Some(ev) = ev else { continue };
+                let better = d < before && best.as_ref().map_or(true, |b| d < b.0);
+                if self.cfg.verbose {
+                    eprintln!("[{:.1}s] {}{}", self.elapsed(), ev, if better { "" } else if d < before { ", not the best of its wave" } else { ", undone" });
+                }
+                if better {
+                    best = Some((d, ev, r));
+                }
+            }
+        }
+        let Some((_, ev, r)) = best else { return false };
+        let (verbose, stop, t0) = (self.cfg.verbose, self.stop.clone(), self.t0);
+        *self = r;
+        self.cfg.verbose = verbose;
+        self.stop = stop;
+        self.t0 = t0;
+        self.events.push(ev);
+        true
+    }
+
+    /// One clear-area trial for `net` on this copy of the board: the event line if there was copper to move.
+    fn clear_area_trial(&mut self, net: u32, radius: f64, before: usize) -> Option<String> {
+        if self.deficit(net) == 0 {
+            return None;
+        }
+        // pads of the groups that are not connected (all but the largest; every group for planes)
+        let comps = self.components(net);
+        let open: Vec<P2> = comps
+            .iter()
+            .skip(if self.is_plane(net) { 0 } else { 1 })
+            .filter(|c| !self.is_plane(net) || !self.plane_ok(net, c))
+            .flatten()
+            .filter(|&&o| self.w.objs[o as usize].s.kind == Kind::Pad)
+            .map(|&o| self.w.objs[o as usize].s.center)
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let near = |q: P2| open.iter().any(|c| c.dist(q) < radius);
+        let mut victims: Vec<u32> = Vec::new();
+        for (i, pc) in self.w.pieces.iter().enumerate() {
+            if pc.alive && pc.net != net && pc.poly.windows(2).any(|sg| open.iter().any(|&c| seg_point_dist(sg[0], sg[1], c) < radius)) {
+                victims.push(i as u32);
+            }
+        }
+        for (oi, o) in self.w.objs.iter().enumerate() {
+            if o.alive && o.s.kind == Kind::Via && o.s.net != net && near(o.s.center) {
+                victims.extend(self.w.obj_pieces[oi].iter().cloned().filter(|&p| self.w.pieces[p as usize].alive));
+            }
+        }
+        victims.sort();
+        victims.dedup();
+        if victims.is_empty() {
+            return None;
+        }
+        let mut vnets: Vec<u32> = victims.iter().map(|&p| self.w.pieces[p as usize].net).collect();
+        vnets.sort();
+        vnets.dedup();
+        for p in victims {
+            self.rip_piece(p);
+        }
+        self.route_net(net);
+        for v in &vnets {
+            self.reroute(*v);
+        }
+        for v in &vnets {
+            if self.deficit(*v) > 0 {
+                let more = self.repair_net(*v);
+                self.route_net(*v);
+                for m in more {
+                    self.reroute(m);
+                }
+            }
+        }
+        Some(format!("{} was sealed in near {}: cleared {:.1} mm round its open pads ({} nets moved), deficit {} -> {}", self.w.b.nets[net as usize].name, open.iter().take(2).map(|c| format!("({:.2},{:.2})", c.x, c.y)).collect::<Vec<_>>().join(" "), radius, vnets.len(), before, self.total_deficit()))
     }
 
     /// On the finished board, rebuild poorly coupled pairs as ribbons; a rebuild is kept only if the

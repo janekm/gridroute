@@ -16,6 +16,10 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;
 
+// the search allocates many small, short-lived vectors: mimalloc serves them far faster than the system allocator
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn arg(args: &[String], k: &str) -> Option<String> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned())
 }
@@ -139,9 +143,27 @@ fn main() {
         single_attempt: args.iter().any(|a| a == "--single-attempt"),
     };
     let mut r = router::Router::new(w, cfg);
+    let t_world = t0.elapsed().as_secs_f64();
     r.route_all();
     let secs = t0.elapsed().as_secs_f64();
+    let t_check = Instant::now();
     let viol = r.w.check_all();
+    r.prof_add("final exact check", t_check);
+    // where the time went: the phases of the kept attempt (the parallel attempts overlap in wall time), and the
+    // searches by kind (summed over every attempt's thread)
+    {
+        let st = &r.stats;
+        let mut ph: Vec<(&str, f64, usize)> = r.prof.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+        ph.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        eprintln!("time: {:.1}s total, {:.1}s to build the board; by phase:", secs, t_world);
+        for (k, t, n) in &ph {
+            eprintln!("  {:>7.1}s  {:5}x  {}", t, n, k);
+        }
+        eprintln!(
+            "  searches: {} ({} failed), {:.1}s: hard {:.1}s, soft (what to rip) {:.1}s ({} failed, {:.1}s; {} known failures skipped); failed searches {:.1}s ({} of {} expansions)",
+            st.searches, st.search_fail, st.search_s, st.search_s - st.soft_s, st.soft_s, st.soft_fail, st.soft_fail_s, st.soft_skipped, st.fail_s, st.fail_exp, st.expansions
+        );
+    }
     let incomplete = r.incomplete_nets();
     let routable: Vec<u32> = (0..r.w.b.nets.len() as u32).filter(|&n| r.net_pads[n as usize].len() >= 2 || (r.is_plane(n) && !r.net_pads[n as usize].is_empty())).collect();
     let ntracks = r.w.pieces.iter().filter(|p| p.alive).count();
@@ -270,6 +292,7 @@ fn main() {
             "routable_nets": routable.len(), "complete_nets": routable.len() - incomplete.iter().filter(|n| routable.contains(n)).count(),
             "deficit": r.total_deficit(), "tracks": ntracks, "vias": nvias, "length_mm": length,
             "internal_violations": viol.len(), "internal_violations_by_kind": by_kind,
+            "phase_seconds": r.prof.iter().map(|(k, v)| (k.to_string(), json!({"seconds": v.0, "calls": v.1}))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "neck_stubs": r.w.b.necks.iter().map(|n| json!({"pad": n.pad, "net": r.w.b.nets[n.net as usize].name, "width": n.width, "length": n.from.dist(n.to)})).collect::<Vec<_>>(), "neck_failed": r.w.b.neck_failed, "missing": missing,
             "pairs": pair_json,
             "events": r.events,
