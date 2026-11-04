@@ -141,14 +141,15 @@ impl Router {
         }
         // a zone's pieces join the pads and pieces of its net they touch (the fill's own connections)
         let mut ties = Vec::new();
+        // and a neck-down stub its pad
         for (zi, z) in w.objs.iter().enumerate() {
-            if !z.s.name.starts_with("zone:") || z.s.net == NONE {
+            if !crate::world::fixed_copper(&z.s.name) || z.s.net == NONE {
                 continue;
             }
             for &oi in &net_pads[z.s.net as usize] {
                 let o = &w.objs[oi as usize];
-                let once = !o.s.name.starts_with("zone:") || oi as usize > zi;
-                if once && o.s.layers & z.s.layers != 0 && crate::world::core_dist(&z.s, &o.s) - o.s.r < 0.03 {
+                let once = !crate::world::fixed_copper(&o.s.name) || oi as usize > zi;
+                if once && o.s.layers & z.s.layers != 0 && crate::world::core_dist(&z.s, &o.s) - o.s.r - z.s.r < 0.03 {
                     ties.push((zi as u32, oi));
                 }
             }
@@ -245,6 +246,11 @@ impl Router {
         let mut out: Vec<Vec<u32>> = groups.into_iter().map(|g| g.1).filter(|g| g.iter().any(|&o| self.w.objs[o as usize].s.kind == Kind::Pad) || plane && g.iter().any(|&o| self.w.objs[o as usize].s.kind == Kind::Via)).collect();
         out.sort_by_key(|g| std::cmp::Reverse(g.len()));
         out
+    }
+
+    /// Whether pad `o` has a neck-down stub (tied to it).
+    pub fn has_neck(&self, o: u32) -> bool {
+        self.ties.iter().any(|&(x, y)| (x == o && self.w.objs[y as usize].s.name.starts_with("neck:")) || (y == o && self.w.objs[x as usize].s.name.starts_with("neck:")))
     }
 
     pub fn plane_ok(&self, net: u32, comp: &[u32]) -> bool {
@@ -743,6 +749,45 @@ impl Router {
                 }
             }
         }
+        // a pad a neck-down rule covers drops at the neck width, if the drop is one straight segment from it
+        // (a track that touches the part's courtyard)
+        let neck = comp.iter().filter_map(|&o| self.w.b.neck_width.get(&self.w.objs[o as usize].s.name).cloned()).fold(f64::INFINITY, f64::min);
+        if neck.is_finite() {
+            let mut q = self.query(net, comp.to_vec(), targets.clone(), true);
+            q.plane_goal = true;
+            q.max_len = 2.0;
+            let mut layers = 0u32;
+            for &o in comp {
+                layers |= self.w.objs[o as usize].s.layers;
+            }
+            q.allowed &= layers;
+            for x in q.width.iter_mut() {
+                *x = x.min(neck);
+            }
+            let w = q.width.clone();
+            for _attempt in 0..4 {
+                let path = match self.search(&q) {
+                    Some(p) => p,
+                    None => break,
+                };
+                match self.commit(net, &path, &w) {
+                    Ok(ps) => {
+                        let straight = ps.iter().all(|&p| {
+                            let pc = &self.w.pieces[p as usize];
+                            pc.poly.len() == 2 && (comp.contains(&pc.a.obj) || comp.contains(&pc.b.obj))
+                        });
+                        if straight {
+                            return true;
+                        }
+                        for p in ps {
+                            self.rip_piece(p);
+                        }
+                        self.learn(&mut q);
+                    }
+                    Err(_) => self.learn(&mut q),
+                }
+            }
+        }
         // no pour of the net within reach (a partial plane): wire it to a part of the net that is on it
         if !self.w.b.plane_regions.is_empty() {
             let reach: Vec<u32> = self.components(net).iter().filter(|c| c.as_slice() != comp && self.plane_ok(net, c)).flatten().cloned().collect();
@@ -1099,7 +1144,7 @@ impl Router {
     fn escape_rows(&self) -> Vec<Vec<(u32, P2, P2)>> {
         let mut parts: HashMap<String, Vec<u32>> = HashMap::default();
         for (i, o) in self.w.objs.iter().enumerate() {
-            if o.alive && o.s.kind == Kind::Pad && o.s.net != NONE && !o.s.name.starts_with("junction:") && !o.s.name.starts_with("zone:") {
+            if o.alive && o.s.kind == Kind::Pad && o.s.net != NONE && !o.s.name.starts_with("junction:") && !crate::world::fixed_copper(&o.s.name) {
                 parts.entry(o.s.name.split('.').next().unwrap_or("").to_string()).or_default().push(i as u32);
             }
         }
@@ -1202,7 +1247,8 @@ impl Router {
                 let s = &self.w.objs[o as usize].s;
                 let net = s.net;
                 let paired = self.w.b.partner.get(net as usize).map_or(false, |&x| x != NONE);
-                if self.is_plane(net) || paired || self.net_pads[net as usize].len() < 2 {
+                // a pin with a neck-down stub routes on from the stub's end
+                if self.is_plane(net) || paired || self.net_pads[net as usize].len() < 2 || self.has_neck(o) {
                     return 0;
                 }
 
@@ -1585,7 +1631,7 @@ impl Router {
     pub fn fanout_order(&self) -> Vec<u32> {
         let mut parts: HashMap<String, Vec<u32>> = HashMap::default();
         for (i, o) in self.w.objs.iter().enumerate() {
-            if o.alive && o.s.kind == Kind::Pad && o.s.net != NONE && !o.s.name.starts_with("junction:") && !o.s.name.starts_with("zone:") {
+            if o.alive && o.s.kind == Kind::Pad && o.s.net != NONE && !o.s.name.starts_with("junction:") && !crate::world::fixed_copper(&o.s.name) {
                 parts.entry(o.s.name.split('.').next().unwrap_or("").to_string()).or_default().push(i as u32);
             }
         }

@@ -160,7 +160,8 @@ impl Router {
         // movable pieces: every live wire of a net that is not a pair member
         let movable_piece = |p: usize| {
             let pc = &w.pieces[p];
-            pc.alive && !pc.frozen && !pair(pc.net) && pc.poly.len() >= 2
+            // (a drop at a neck-down width stays the straight segment it is)
+            pc.alive && !pc.frozen && !pair(pc.net) && pc.poly.len() >= 2 && pc.width >= w.b.nets[pc.net as usize].wmin[pc.layer as usize] - 1e-9
         };
         // movable vias: signal and plane vias whose wires all move
         let mut via_node: crate::fx::FxMap<u32, u32> = Default::default();
@@ -197,7 +198,7 @@ impl Router {
                 _ => {
                     let nodes: Vec<u32> = s.pts.iter().map(|&p| m.node(p, 0)).collect();
                     let rd = if s.kind == Kind::Via { s.drill / 2.0 } else { 0.0 };
-                    let own_pad = s.kind == Kind::Pad && !s.name.starts_with("zone:") && !s.name.starts_with("junction:");
+                    let own_pad = s.kind == Kind::Pad && !crate::world::fixed_copper(&s.name) && !s.name.starts_with("junction:");
                     m.element(nodes, El { layers: s.layers & sig, attr, r: s.r, rd, own_pad, pad: if s.kind == Kind::Pad && s.pts.len() >= 2 { o as u32 } else { NONE }, ends: [NONE; 2] }, false);
                     if s.drill > 0.0 {
                         let c = m.node(s.center, 0);
@@ -218,7 +219,7 @@ impl Router {
         for &(o, n) in &m.vias.clone() {
             let s = &w.objs[o as usize].s;
             let c = w.b.nets[s.net as usize].class;
-            let attr = Attr { kind: Kind::Via, net: s.net, class: c as u32, clear: w.b.classes[c].clear };
+            let attr = Attr { kind: Kind::Via, net: s.net, class: c as u32, clear: s.clear };
             m.element(vec![n], El { layers: (s.layers & sig) | VIARULE, attr, r: s.r, rd: s.drill / 2.0, own_pad: false, pad: NONE, ends: [NONE; 2] }, true);
             m.element(vec![n], El { layers: DRILL, attr, r: s.drill / 2.0, rd: 0.0, own_pad: false, pad: NONE, ends: [NONE; 2] }, true);
         }
@@ -228,7 +229,7 @@ impl Router {
             if !pc.alive || pc.poly.len() < 2 {
                 continue;
             }
-            let attr = w.net_attr(pc.net);
+            let attr = w.net_attr(pc.net, pc.layer as usize);
             let el = El { layers: 1 << pc.layer, attr, r: pc.width / 2.0, rd: 0.0, own_pad: false, pad: NONE, ends: [pc.a.obj, pc.b.obj] };
             if !movable_piece(p) {
                 let nodes: Vec<u32> = pc.poly.iter().map(|&q| m.node(q, 0)).collect();

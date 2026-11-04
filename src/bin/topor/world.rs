@@ -317,7 +317,7 @@ impl World {
             // through copper joins its plane in any region of the net; an SMD pad only in one on its layer
             // (an outer-layer pour that is the net's plane, as for a module's ground)
             let smd_layer = (0..b.signal.len()).find(|&l| s.layers == 1 << l).map(|l| b.signal[l]);
-            let plane = s.net != NONE && b.nets[s.net as usize].plane.is_some() && s.kind == Kind::Pad && !s.name.starts_with("zone:") && if s.through { pad_in_plane(&b, &s) } else { smd_layer.map_or(false, |l| b.in_plane_on(s.net, s.center, 0.0, Some(l))) };
+            let plane = s.net != NONE && b.nets[s.net as usize].plane.is_some() && s.kind == Kind::Pad && !fixed_copper(&s.name) && if s.through { pad_in_plane(&b, &s) } else { smd_layer.map_or(false, |l| b.in_plane_on(s.net, s.center, 0.0, Some(l))) };
             objs.push(Obj { s, alive: true, plane, lv: Vec::new() });
         }
         let spec_obj: Vec<u32> = map.iter().map(|&k| first + k as u32).collect();
@@ -412,7 +412,7 @@ impl World {
         for c in &w.b.classes {
             mc = mc.max(c.clear);
         }
-        for &c in &w.b.class_pair {
+        for &c in w.b.class_pair.iter().chain(&w.b.track_clear) {
             mc = mc.max(c);
         }
         for o in &w.objs {
@@ -420,7 +420,7 @@ impl World {
         }
         w.max_clear = mc + MARGIN;
         w.max_hw = w.b.nets.iter().flat_map(|n| n.wpref.iter().cloned()).fold(0.1, f64::max) / 2.0;
-        w.max_wire_clear = w.b.classes.iter().map(|c| c.clear).chain(w.b.class_pair.iter().cloned()).chain(w.b.pair_gap.iter().cloned()).fold(0.0, f64::max) + MARGIN;
+        w.max_wire_clear = w.b.classes.iter().map(|c| c.clear).chain(w.b.class_pair.iter().cloned()).chain(w.b.pair_gap.iter().cloned()).chain(w.b.track_clear.iter().cloned()).fold(0.0, f64::max) + MARGIN;
         for l in 0..nsig {
             w.mark_blocked(l);
         }
@@ -719,9 +719,10 @@ impl World {
         let class = if s.net != NONE { self.b.nets[s.net as usize].class as u32 } else { NONE };
         Attr { kind: s.kind, net: s.net, class, clear: s.clear }
     }
-    pub fn net_attr(&self, net: u32) -> Attr {
+    /// A wire of `net` on signal layer `l`.
+    pub fn net_attr(&self, net: u32, l: usize) -> Attr {
         let c = self.b.nets[net as usize].class;
-        Attr { kind: Kind::Pad, net, class: c as u32, clear: self.b.classes[c].clear }
+        Attr { kind: Kind::Pad, net, class: c as u32, clear: self.b.track_clear(net, l) }
     }
     pub fn vert_attr(&self, l: usize, v: u32) -> (Attr, f64) {
         let o = self.layers[l].vobj[v as usize];
@@ -729,6 +730,11 @@ impl World {
             return (Attr { kind: Kind::Keepout, net: NONE, class: NONE, clear: -1.0 }, 0.0);
         }
         (self.obj_attr(o), self.objs[o as usize].s.r)
+    }
+    /// A net tie's copper belongs to no net for KiCad's hole clearance: a via of a net it joins still keeps
+    /// its drill that far off (`d`: distance from the via's centre to the copper, `rd`: drill radius).
+    fn tie_hole(&self, o: u32, d: f64, rd: f64) -> bool {
+        self.objs[o as usize].s.name == "net_tie" && d - rd < self.b.hole_clear + MARGIN
     }
     /// Required gap between two items, or None when they may touch (same net, or free vertex).
     pub fn clr(&self, x: &Attr, y: &Attr) -> Option<f64> {
@@ -797,7 +803,7 @@ impl World {
     #[inline]
     fn cross_wire(&self, c: u32) -> (Attr, f64) {
         let p = &self.pieces[self.crosses[c as usize].piece as usize];
-        (self.net_attr(p.net), p.width)
+        (self.net_attr(p.net, p.layer as usize), p.width)
     }
 
     /// Feasible interval (distance from edge.a) for a new wire inserted at `ins` on edge e, if it fits.
@@ -806,7 +812,7 @@ impl World {
         let len = self.edge_len(l, e);
         let list = &self.layers[l].cross[e as usize];
         let n = list.len() + 1;
-        let me = (self.net_attr(net), width);
+        let me = (self.net_attr(net, l), width);
         let wire = |k: usize| -> (Attr, f64) {
             if k < ins {
                 self.cross_wire(list[k])
@@ -980,7 +986,7 @@ impl World {
     pub fn portals(&self, p: u32) -> Vec<(Disc, Disc)> {
         let pc = &self.pieces[p as usize];
         let l = pc.layer as usize;
-        let me = (self.net_attr(pc.net), pc.width);
+        let me = (self.net_attr(pc.net, pc.layer as usize), pc.width);
         let mut out = Vec::with_capacity(pc.cx.len());
         for &c in &pc.cx {
             let cr = &self.crosses[c as usize];
@@ -1030,7 +1036,7 @@ impl World {
             return None;
         }
         let pv = self.vpos(l, v);
-        let me = self.net_attr(net);
+        let me = self.net_attr(net, l);
         let reach = self.max_clear + width;
         let mut items = Vec::new();
         self.layers[l].grid.query(pv - p2(reach, reach), pv + p2(reach, reach), &mut items);
@@ -1213,7 +1219,7 @@ impl World {
         let l = pc.layer as usize;
         let n = pc.cx.len();
         let tris = self.piece_tris(p);
-        let me = self.net_attr(pc.net);
+        let me = self.net_attr(pc.net, pc.layer as usize);
         let mut out = Vec::new();
         let mut id = 0xC000_0000u32;
         for k in 0..tris.len() {
@@ -1283,7 +1289,7 @@ impl World {
                     if wall_side == 0.0 {
                         continue;
                     }
-                    let need = match self.clr(&me, &self.net_attr(sp.net)) {
+                    let need = match self.clr(&me, &self.net_attr(sp.net, sp.layer as usize)) {
                         Some(g) => g + (pc.width + sp.width) / 2.0 + 0.002,
                         None => continue,
                     };
@@ -1327,7 +1333,7 @@ impl World {
         if viol.is_empty() || pc.poly.len() < 2 {
             return vec![];
         }
-        let me = self.net_attr(pc.net);
+        let me = self.net_attr(pc.net, pc.layer as usize);
         let mut out = Vec::new();
         for v in viol.iter().take(12) {
             // closest segment of p to the violation
@@ -1366,7 +1372,7 @@ impl World {
             } else if v.pieces.len() == 2 {
                 let other = if v.pieces[0] == p { v.pieces[1] } else { v.pieces[0] };
                 let q = &self.pieces[other as usize];
-                let g = match self.clr(&me, &self.net_attr(q.net)) {
+                let g = match self.clr(&me, &self.net_attr(q.net, q.layer as usize)) {
                     Some(g) => g,
                     None => continue,
                 };
@@ -1467,7 +1473,7 @@ impl World {
         if runs.is_empty() {
             return false;
         }
-        let me = self.net_attr(pc.net);
+        let me = self.net_attr(pc.net, pc.layer as usize);
         let width = pc.width;
         let start = self.term_point(l, pc.a);
         let end = self.term_point(l, pc.b);
@@ -1490,7 +1496,7 @@ impl World {
                 if qa > qb {
                     qs.reverse();
                 }
-                let g = self.clr(&me, &self.net_attr(q.net));
+                let g = self.clr(&me, &self.net_attr(q.net, q.layer as usize));
                 if qs.len() < 2 || g.is_none() {
                     bad = true;
                     break;
@@ -2297,7 +2303,8 @@ impl World {
         let c = &self.b.classes[self.b.nets[net as usize].class];
         let nsig = self.nsig();
         let oid = self.objs.len() as u32;
-        let spec = ObjSpec { kind, net, layers, pts: vec![pos], r, clear: c.clear, center: pos, drill, name, through: kind == Kind::Via };
+        let clear = if kind == Kind::Via { self.b.via_clear(net) } else { c.clear };
+        let spec = ObjSpec { kind, net, layers, pts: vec![pos], r, clear, center: pos, drill, name, through: kind == Kind::Via };
         let plane = kind == Kind::Via && self.b.nets[net as usize].plane.is_some() && self.b.in_plane(net, pos, r);
         self.objs.push(Obj { s: spec, alive: true, plane, lv: vec![NONE; nsig] });
         self.obj_pieces.push(Vec::new());
@@ -2335,7 +2342,7 @@ impl World {
     /// Whether a disc of radius r for `net` at pos on layer l clears other copper (routing margin) and
     /// sits in routable space.
     pub fn point_fits(&self, net: u32, pos: P2, r: f64, l: usize) -> bool {
-        let me = self.net_attr(net);
+        let me = self.net_attr(net, l);
         let reach = r + self.max_clear + 0.5;
         let mut items = Vec::new();
         self.layers[l].grid.query(pos - p2(reach, reach), pos + p2(reach, reach), &mut items);
@@ -2373,7 +2380,7 @@ impl World {
                         continue;
                     }
                     let d = seg_point_dist(q.poly[k], q.poly[k + 1], pos) - q.width / 2.0;
-                    let need = self.clr(&me, &self.net_attr(q.net)).unwrap_or(0.0);
+                    let need = self.clr(&me, &self.net_attr(q.net, q.layer as usize)).unwrap_or(0.0);
                     if d - r < need {
                         return false;
                     }
@@ -2432,7 +2439,7 @@ impl World {
     /// Visit other nets' pieces a straight stretch a-b of `net` comes too close to; `f` returns false to
     /// stop. Only grid cells near the stretch are looked at (its box can be large and mostly empty).
     fn stretch_scan<F: FnMut(u32) -> bool>(&self, l: usize, a: P2, b: P2, net: u32, width: f64, extra: f64, mut f: F) {
-        let me = self.net_attr(net);
+        let me = self.net_attr(net, l);
         let reach = width / 2.0 + self.max_wire_clear + self.max_hw + extra.max(0.0) + 0.01;
         let g = &self.layers[l].grid;
         let lo = p2(a.x.min(b.x) - reach, a.y.min(b.y) - reach);
@@ -2480,7 +2487,7 @@ impl World {
                     }
                     if q.net != last_net {
                         last_net = q.net;
-                        last_g = self.clr(&me, &self.net_attr(q.net));
+                        last_g = self.clr(&me, &self.net_attr(q.net, q.layer as usize));
                     }
                     if let Some(gap) = last_g {
                         if seg_seg_dist(a, b, s0, s1) < gap + (width + q.width) / 2.0 + extra && !f(it.id) {
@@ -2495,7 +2502,6 @@ impl World {
     /// What blocks a via of `net` at pos: None when fixed copper does, else the pieces to rip (wires
     /// too close, and the pieces holding other nets' vias in the way).
     pub fn via_block(&self, net: u32, pos: P2) -> Option<Vec<u32>> {
-        let c = &self.b.classes[self.b.nets[net as usize].class];
         let (r, rd) = { let (d, dr) = self.b.via_size(net); (d / 2.0, dr / 2.0) };
         if self.in_escape(net, pos, r) {
             return None;
@@ -2503,7 +2509,7 @@ impl World {
         if self.b.via_kept_out(pos, r) {
             return None;
         }
-        let me = Attr { kind: Kind::Via, net, class: self.b.nets[net as usize].class as u32, clear: c.clear };
+        let me = Attr { kind: Kind::Via, net, class: self.b.nets[net as usize].class as u32, clear: self.b.via_clear(net) };
         let reach = r + self.max_clear + self.max_hw + 0.01;
         let mut items = Vec::new();
         let mut out: Vec<u32> = Vec::new();
@@ -2521,7 +2527,7 @@ impl World {
                         let inside_keep = o.s.kind == Kind::Keepout && point_in_poly(&o.s.pts, pos);
                         let blocked = match self.clr(&me, &self.obj_attr(it.id)) {
                             Some(g) => d - r < g || (o.s.kind != Kind::Outline && o.s.kind != Kind::Keepout && d - rd < self.b.hole_clear + MARGIN),
-                            None => (o.s.kind == Kind::Pad && d < r + EPS_OWN * 4.0) || (o.s.kind == Kind::Via && d < r + o.s.r),
+                            None => (o.s.kind == Kind::Pad && d < r + EPS_OWN * 4.0) || (o.s.kind == Kind::Via && d < r + o.s.r) || self.tie_hole(it.id, d, rd),
                         };
                         if hole || inside_keep || blocked {
                             if o.s.kind == Kind::Via && o.s.net != net {
@@ -2552,7 +2558,7 @@ impl World {
                         let need = if q.net == net {
                             0.0
                         } else {
-                            match self.clr(&me, &self.net_attr(q.net)) {
+                            match self.clr(&me, &self.net_attr(q.net, q.layer as usize)) {
                                 Some(g) => g,
                                 None => continue,
                             }
@@ -2598,7 +2604,7 @@ impl World {
             return;
         }
         let l = pc.layer as usize;
-        let me = self.net_attr(pc.net);
+        let me = self.net_attr(pc.net, pc.layer as usize);
         let hw = pc.width / 2.0;
         let reach = hw + self.max_clear + 0.5;
         let mut items = Vec::new();
@@ -2638,7 +2644,7 @@ impl World {
                         if !q.alive || q.net == pc.net {
                             continue;
                         }
-                        let need = match self.clr(&me, &self.net_attr(q.net)) {
+                        let need = match self.clr(&me, &self.net_attr(q.net, q.layer as usize)) {
                             Some(g) => g - MARGIN,
                             None => continue,
                         };
@@ -2658,9 +2664,8 @@ impl World {
 
     /// Clearance of a via (copper on every signal layer, drill to holes) at pos for net.
     pub fn check_via_at(&self, net: u32, pos: P2, skip_obj: u32, out: &mut Vec<Viol>, early: bool) {
-        let c = &self.b.classes[self.b.nets[net as usize].class];
         let (r, rd) = { let (d, dr) = self.b.via_size(net); (d / 2.0, dr / 2.0) };
-        let me = Attr { kind: Kind::Via, net, class: self.b.nets[net as usize].class as u32, clear: c.clear };
+        let me = Attr { kind: Kind::Via, net, class: self.b.nets[net as usize].class as u32, clear: self.b.via_clear(net) };
         if self.b.via_kept_out(pos, r) {
             out.push(Viol { what: "via-rule-area".into(), layer: -1, at: pos, dist: -1.0, need: 0.0, pieces: vec![], objs: vec![] });
             if early {
@@ -2694,6 +2699,12 @@ impl World {
                                 if early {
                                     return;
                                 }
+                            }
+                        }
+                        if self.clr(&me, &oa).is_none() && self.tie_hole(it.id, d, rd) {
+                            out.push(Viol { what: "hole-net-tie".into(), layer: l as i32, at: pos, dist: d - rd, need: self.b.hole_clear, pieces: vec![], objs: vec![it.id] });
+                            if early {
+                                return;
                             }
                         }
                         if let Some(g) = self.clr(&me, &oa) {
@@ -2733,7 +2744,7 @@ impl World {
                         if q.net == net {
                             continue;
                         }
-                        let need = match self.clr(&me, &self.net_attr(q.net)) {
+                        let need = match self.clr(&me, &self.net_attr(q.net, q.layer as usize)) {
                             Some(g) => g - MARGIN,
                             None => continue,
                         };
@@ -2862,9 +2873,8 @@ impl World {
 
     fn check_via_margin(&self, net: u32, pos: P2, allow: u32, out: &mut Vec<Viol>) {
         // same as check_via_at but demanding the routing margin
-        let c = &self.b.classes[self.b.nets[net as usize].class];
         let (r, rd) = { let (d, dr) = self.b.via_size(net); (d / 2.0, dr / 2.0) };
-        let me = Attr { kind: Kind::Via, net, class: self.b.nets[net as usize].class as u32, clear: c.clear };
+        let me = Attr { kind: Kind::Via, net, class: self.b.nets[net as usize].class as u32, clear: self.b.via_clear(net) };
         if self.b.via_kept_out(pos, r) {
             out.push(Viol { what: "via-rule-area".into(), layer: -1, at: pos, dist: 0., need: 0., pieces: vec![], objs: vec![] });
             return;
@@ -2900,6 +2910,10 @@ impl World {
                                 }
                             }
                             None => {
+                                if self.tie_hole(it.id, d, rd) {
+                                    out.push(Viol { what: "hole-net-tie".into(), layer: l as i32, at: pos, dist: d - rd, need: self.b.hole_clear, pieces: vec![], objs: vec![it.id] });
+                                    return;
+                                }
                                 // own-net pad: no via inside small pads; keep the vertex off its hull
                                 if d < r + EPS_OWN * 4.0 && o.s.kind == Kind::Pad {
                                     out.push(Viol { what: "via-own-pad".into(), layer: l as i32, at: pos, dist: d, need: 0., pieces: vec![], objs: vec![it.id] });
@@ -2923,7 +2937,7 @@ impl World {
                         }
                         let d = seg_point_dist(q.poly[k2], q.poly[k2 + 1], pos) - q.width / 2.0;
                         let need = if q.net == net { 0.0 } else {
-                            match self.clr(&me, &self.net_attr(q.net)) {
+                            match self.clr(&me, &self.net_attr(q.net, q.layer as usize)) {
                                 Some(g) => g,
                                 None => continue,
                             }
@@ -2946,6 +2960,16 @@ impl World {
         for (oi, o) in self.objs.iter().enumerate() {
             if o.alive && o.s.kind == Kind::Via {
                 self.check_via_at(o.s.net, o.s.center, oi as u32, &mut out, false);
+            }
+        }
+        // a wire under its net's least width is a neck-down: one straight segment from a pad the rule covers
+        for (p, pc) in self.pieces.iter().enumerate() {
+            if !pc.alive || pc.width >= self.b.nets[pc.net as usize].wmin[pc.layer as usize] - 1e-9 {
+                continue;
+            }
+            let at_neck = |o: u32| self.b.neck_width.get(&self.objs[o as usize].s.name).map_or(false, |&e| pc.width >= e - 1e-9);
+            if pc.poly.len() != 2 || !(at_neck(pc.a.obj) || at_neck(pc.b.obj)) {
+                out.push(Viol { what: "neck-width".into(), layer: pc.layer as i32, at: pc.poly.first().cloned().unwrap_or(p2(0., 0.)), dist: pc.width, need: self.b.nets[pc.net as usize].wmin[pc.layer as usize], pieces: vec![p as u32], objs: vec![] });
             }
         }
         // each pair reported twice for track-track; dedupe roughly
@@ -3101,7 +3125,7 @@ fn merge_overlaps(specs: Vec<ObjSpec>, nsig: usize) -> (Vec<ObjSpec>, Vec<usize>
             }
         }
         // zone pieces stay apart: an island's pieces and the pads it reaches are tied, not hulled
-        if d == 0.0 && (a.name.starts_with("zone:") || b.name.starts_with("zone:")) {
+        if d == 0.0 && (fixed_copper(&a.name) || fixed_copper(&b.name)) {
             if a.net != b.net {
                 warnings.push(format!("zone copper overlaps another net: {} and {}", a.name, b.name));
             }
@@ -3184,6 +3208,12 @@ fn merge_overlaps(specs: Vec<ObjSpec>, nsig: usize) -> (Vec<ObjSpec>, Vec<usize>
         });
     }
     (out, map, warnings)
+}
+
+/// Copper of a net laid before routing besides its pads: a zone's fill pieces and neck-down stubs. Tied to the pads
+/// it touches, never hulled with them.
+pub fn fixed_copper(name: &str) -> bool {
+    name.starts_with("zone:") || name.starts_with("neck:")
 }
 
 /// World::clr on the board's rules alone.

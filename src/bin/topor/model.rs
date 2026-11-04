@@ -65,8 +65,28 @@ pub struct PlaneRegion {
     pub holes: Vec<Vec<P2>>,
 }
 
+/// A neck-down stub: a straight track at a narrower width than the net's class allows elsewhere, from a pad
+/// out to where the class width fits (a custom rule letting tracks that touch a fine-pitch part narrow).
+#[derive(Clone, Debug)]
+pub struct Neck {
+    pub net: u32,
+    /// Signal layer index.
+    pub layer: usize,
+    pub pad: String,
+    /// Export geometry: from inside the pad to the stub's end.
+    pub from: P2,
+    pub to: P2,
+    pub width: f64,
+}
+
 #[derive(Clone)]
 pub struct Board {
+    /// Neck-down stubs; each is also fixed copper of its net (objects named "neck:<pad>").
+    pub necks: Vec<Neck>,
+    /// Pads that needed a neck-down stub but had no room for one (why).
+    pub neck_failed: Vec<String>,
+    /// Neck-down width per pad a neck rule covers: a plane net's drop from it may be one straight segment at it.
+    pub neck_width: HashMap<String, f64>,
     /// Plane regions; a plane net without any is a full plane (any via of the net joins it).
     pub plane_regions: Vec<PlaneRegion>,
     /// Areas of plane layers kept free of pour (cutouts).
@@ -90,6 +110,10 @@ pub struct Board {
     pub hole_to_hole: f64,
     /// Extra clearance between different nets of the same class (custom rules).
     pub class_pair: Vec<f64>,
+    /// Least gap between a track and other copper per signal layer (a custom rule such as a fab's inner-layer
+    /// spacing), for tracks of every class not exempt (`track_clear_exempt`, per class).
+    pub track_clear: Vec<f64>,
+    pub track_clear_exempt: Vec<bool>,
     pub routable_nets: usize,
     /// Differential pair partner per net (NONE if unpaired) and the pair's edge-to-edge gap.
     pub partner: Vec<u32>,
@@ -201,6 +225,9 @@ impl Board {
         let bsig = signal.iter().position(|&l| l == layers.len() - 1);
         let all_sig = (1u32 << signal.len()) - 1;
         let mut objs = Vec::new();
+        // pads a neck-down rule covers: (object index, neck width (0: the class width), long axis if the pad is
+        // elongated, clearance of the stub (0: the class clearance))
+        let mut escapes: Vec<(usize, f64, Option<P2>, f64)> = Vec::new();
         for p in m["pads"].as_array().ok_or("pads")? {
             let net = match p["net"].as_str() {
                 Some(n) if !n.is_empty() => net_of(n, &mut nets),
@@ -255,9 +282,24 @@ impl Board {
             }
             let core = dedup_hull(&core);
             let kind = if npth { Kind::Hole } else { Kind::Pad };
-            // KiCad keeps copper off a non-plated hole by the board-edge clearance as well
-            let clear = if npth { hole_clear.max(edge_clear).max(local) } else { local };
+            // KiCad keeps copper off a non-plated hole by the board-edge clearance as well; a plated hole keeps
+            // other copper the hole clearance off its drill, which beyond a thin annular ring is the larger gap
+            let clear = if npth {
+                hole_clear.max(edge_clear).max(local)
+            } else if drill > 0.0 {
+                // the thinnest ring, axis by axis (a slot in an oval pad runs along it)
+                let (dw, dh) = (f(&p["drill_w"]).max(f(&p["drill"])), f(&p["drill_h"]).max(f(&p["drill"])));
+                let ring = ((w - dw).min(h - dh) / 2.0).max(0.0);
+                local.max(hole_clear - ring)
+            } else {
+                local
+            };
             let name = format!("{}.{}", p["original_ref"].as_str().unwrap_or("?"), p["original_pin"].as_str().unwrap_or("?"));
+            let (e, ec) = (f(&p["escape_width"]), f(&p["escape_clear"]));
+            if (e > 0.0 || ec > 0.0) && lay != "all" && !npth && net != NONE {
+                let axis = if (w - h).abs() < 0.05 * w.max(h) { None } else if w > h { Some(p2(c, -s)) } else { Some(p2(s, c)) };
+                escapes.push((objs.len(), e, axis, ec));
+            }
             objs.push(ObjSpec {
                 kind,
                 net: if npth { NONE } else { net },
@@ -394,6 +436,18 @@ impl Board {
                 holes: r["holes"].as_array().into_iter().flatten().map(|h| ppoly(h)).collect(),
             });
         }
+        let mut track_clear = vec![0.0; signal.len()];
+        if let Some(tc) = cold["track_clearance"].as_object() {
+            for (ln, v) in tc {
+                if let Some(si) = signal.iter().position(|&li| &layers[li] == ln) {
+                    track_clear[si] = f(v);
+                }
+            }
+        }
+        let exempt: Vec<String> = cold["track_clearance_except"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        let track_clear_exempt: Vec<bool> = classes.iter().map(|c| exempt.contains(&c.name)).collect();
+        let neck_width: HashMap<String, f64> = escapes.iter().filter(|x| x.1 > 0.0).map(|&(i, e, _, _)| (objs[i].name.clone(), e)).collect();
+        let (necks, neck_failed) = place_necks(&mut objs, &escapes, &nets, &classes, &track_clear, &track_clear_exempt, &outline, &outline_holes, edge_clear);
         let mut fill_keepouts = Vec::new();
         for k in cold["fill_keepouts"].as_array().into_iter().flatten() {
             if let Some(l) = layers.iter().position(|x| Some(x.as_str()) == k["layer"].as_str()) {
@@ -412,6 +466,9 @@ impl Board {
             }
         }
         Ok(Board {
+            necks,
+            neck_failed,
+            neck_width,
             plane_regions,
             fill_keepouts,
             via_keepouts,
@@ -430,6 +487,8 @@ impl Board {
             hole_clear,
             hole_to_hole,
             class_pair,
+            track_clear,
+            track_clear_exempt,
             routable_nets,
             partner: Vec::new(),
             pair_gap: Vec::new(),
@@ -549,6 +608,150 @@ impl Board {
         let ni = &self.nets[net as usize];
         ni.via_size.unwrap_or((self.classes[ni.class].via_d, self.classes[ni.class].via_drill))
     }
+    /// A via's gap to other copper: its class clearance, or the hole clearance off its drill where the
+    /// annular ring is thinner than the difference.
+    pub fn via_clear(&self, net: u32) -> f64 {
+        let (d, drill) = self.via_size(net);
+        self.classes[self.nets[net as usize].class].clear.max(self.hole_clear - (d - drill) / 2.0)
+    }
+    /// A track's gap to other copper on signal layer `l`.
+    pub fn track_clear(&self, net: u32, l: usize) -> f64 {
+        let c = self.nets[net as usize].class;
+        let t = if self.track_clear_exempt[c] { 0.0 } else { self.track_clear.get(l).cloned().unwrap_or(0.0) };
+        self.classes[c].clear.max(t)
+    }
+}
+
+/// Neck-down stubs for the pads that need one (plane nets' pads drop to vias instead): a pad narrower than its
+/// net's class width (or one where that width meets other copper) gets a straight stub at its neck width, outward
+/// along the pad (from the part's centre for a square pad), to the first point where a disc of the class width
+/// clears the other nets' copper and the class-width starts of the stubs laid before it (so neighbouring stubs
+/// stagger), with the stub itself clear.
+/// The stub stops 10 µm short of its pad (touching copper, tied to the pad, not hulled with it) and is pushed as
+/// fixed copper of the net, named "neck:<pad>"; KiCad gets it as a track from the pad's centre.
+#[allow(clippy::too_many_arguments)]
+fn place_necks(objs: &mut Vec<ObjSpec>, escapes: &[(usize, f64, Option<P2>, f64)], nets: &[NetInfo], classes: &[Class], track_clear: &[f64], exempt: &[bool], outline: &[P2], holes: &[Vec<P2>], edge_clear: f64) -> (Vec<Neck>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut failed = Vec::new();
+    let mut centre: HashMap<String, (P2, usize)> = HashMap::new();
+    for o in objs.iter().filter(|o| o.kind == Kind::Pad) {
+        let e = centre.entry(o.name.split('.').next().unwrap_or("").to_string()).or_insert((p2(0., 0.), 0));
+        e.0 = e.0 + o.center;
+        e.1 += 1;
+    }
+    // stub ends laid so far: (end, class half-width, clearance, net)
+    let mut ends: Vec<(P2, f64, f64, u32)> = Vec::new();
+    for &(pi, e, axis, ec) in escapes {
+        let pad = objs[pi].clone();
+        let net = pad.net;
+        let ni = &nets[net as usize];
+        // a plane net's pads drop to vias: a straight drop at the neck width needs no stub
+        if ni.plane.is_some() {
+            continue;
+        }
+        let Some(l) = (0..32).find(|&l| pad.layers == 1 << l) else { continue };
+        let wide = ni.wmin[l].max(ni.wpref[l]);
+        let c = ni.class;
+        let my_clear = classes[c].clear.max(if exempt[c] { 0.0 } else { track_clear.get(l).cloned().unwrap_or(0.0) });
+        // the stub: narrower than the class, or at the class width with a smaller clearance
+        let e = if e > 0.0 { e } else { wide };
+        let stub_clear = if ec > 0.0 { ec.min(my_clear) } else { my_clear };
+        if e >= wide && stub_clear >= my_clear {
+            continue;
+        }
+        // (a pad's own clearance is KiCad's, its class and custom rules resolved; a stub's is its own)
+        let need = |o: &ObjSpec, mine: f64| -> f64 {
+            match o.kind {
+                Kind::Outline => edge_clear,
+                Kind::Hole | Kind::Keepout => o.clear,
+                _ => mine.max(o.clear),
+            }
+        };
+        // everything within 4 mm (by bounding box: a long keepout's centre may lie far away)
+        let near = |o: &ObjSpec| {
+            let (lo, hi) = o.pts.iter().fold((p2(1e9, 1e9), p2(-1e9, -1e9)), |(lo, hi), q| (p2(lo.x.min(q.x), lo.y.min(q.y)), p2(hi.x.max(q.x), hi.y.max(q.y))));
+            let dx = (lo.x - pad.center.x).max(pad.center.x - hi.x).max(0.0);
+            let dy = (lo.y - pad.center.y).max(pad.center.y - hi.y).max(0.0);
+            dx.hypot(dy) - o.r < 4.0
+        };
+        let others: Vec<&ObjSpec> = objs.iter().filter(|o| o.layers & (1 << l) != 0 && (o.net != net || o.kind == Kind::Hole) && near(o)).collect();
+        // gap of a capsule a-b of radius r keeping `mine` to everything else (negative: overlap)
+        let gap = |a: P2, b: P2, r: f64, mine: f64| -> f64 {
+            let mut g = f64::INFINITY;
+            for o in &others {
+                let d = if o.kind == Kind::Keepout {
+                    if point_in_poly(&o.pts, a) || point_in_poly(&o.pts, b) {
+                        -1.0
+                    } else {
+                        (0..o.pts.len()).map(|k| crate::geom::seg_seg_dist(a, b, o.pts[k], o.pts[(k + 1) % o.pts.len()])).fold(f64::INFINITY, f64::min)
+                    }
+                } else {
+                    crate::geom::seg_hull_dist(&o.pts, a, b) - o.r
+                };
+                g = g.min(d - r - need(o, mine));
+            }
+            for &(q, rq, cq, n) in &ends {
+                if n != net {
+                    g = g.min(crate::geom::seg_point_dist(a, b, q) - r - rq - cq.max(mine));
+                }
+            }
+            for ring in std::iter::once(outline).chain(holes.iter().map(|h| h.as_slice())) {
+                if ring.len() >= 3 {
+                    let d = (0..ring.len()).map(|k| crate::geom::seg_seg_dist(a, b, ring[k], ring[(k + 1) % ring.len()])).fold(f64::INFINITY, f64::min);
+                    g = g.min(d - r - edge_clear);
+                }
+            }
+            g
+        };
+        let part = pad.name.split('.').next().unwrap_or("").to_string();
+        let mid = centre.get(&part).map(|&(s, n)| s * (1.0 / n as f64)).unwrap_or(pad.center);
+        let out_dir = pad.center - mid;
+        let dir = match axis {
+            Some(a) => if a.dot(out_dir) >= 0.0 { a } else { a * -1.0 },
+            None if out_dir.norm() > 1e-6 => out_dir.unit(),
+            None => continue,
+        };
+        // a pad as wide as the class width, with room for it, needs none
+        let across = pad.pts.iter().map(|&q| (q - pad.center).dot(dir.perp()).abs()).fold(0.0, f64::max) + pad.r;
+        if 2.0 * across >= wide && gap(pad.center, pad.center, wide / 2.0, my_clear) >= 0.0 {
+            continue;
+        }
+        // where the pad's copper ends along the stub
+        let core = pad.pts.iter().map(|&q| (q - pad.center).dot(dir)).fold(0.0, f64::max);
+        let reach = core + pad.r;
+        // a stub as narrow as the pad runs in from its centre, over its copper, and is modelled from just past
+        // the pad (touching copper); one wider than the pad would stand out along its sides, so it starts, in the
+        // model and on the board, just past the pad's core, inside its rounded end, and ends round there
+        let wider = e > 2.0 * across + 1e-9;
+        let start = if wider { pad.center + dir * (core + 0.01) } else { pad.center + dir * (reach + e / 2.0 + 0.01) };
+        // (KiCad joins a track to a pad its end lies in: on a square-cornered pad that end stays just inside)
+        let from = if wider { pad.center + dir * (core + 0.01).min(reach - 0.005) } else { pad.center };
+        let mut found = None;
+        let mut why = "no room for the class width within 2.5 mm";
+        let mut t = (start - pad.center).dot(dir) + 0.01;
+        while t < reach + 2.5 {
+            let j = pad.center + dir * t;
+            if gap(start, j, e / 2.0, stub_clear) < 0.0 {
+                why = "the stub runs into other copper first";
+                break;
+            }
+            if gap(j, j, wide / 2.0, my_clear) >= 0.005 {
+                found = Some(j);
+                break;
+            }
+            t += 0.01;
+        }
+        let Some(j) = found else {
+            failed.push(format!("{} ({})", pad.name, why));
+            continue;
+        };
+        let name = format!("neck:{}", pad.name);
+        objs.push(ObjSpec { kind: Kind::Pad, net, layers: pad.layers, pts: vec![start, j], r: e / 2.0, clear: stub_clear, center: j, drill: 0.0, name, through: false });
+        // (a wire from a stub with its own clearance starts in the courtyard, where that clearance holds too)
+        ends.push((j, wide / 2.0, stub_clear, net));
+        out.push(Neck { net, layer: l, pad: pad.name.clone(), from, to: j, width: e });
+    }
+    (out, failed)
 }
 
 /// The part of convex polygon `poly` on the side of the line through `o` that normal `n` points away from.

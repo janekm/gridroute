@@ -34,7 +34,7 @@ fn layout_json(r: &router::Router) -> serde_json::Value {
             let t = if end { pc.b } else { pc.a };
             let s = &w.objs[t.obj as usize].s;
             // a merged group's outline spans the gaps between its pads: only a single pad is clipped
-            if t.vtx != cdt::NONE || s.kind != Kind::Pad || s.pts.len() < 3 || s.name.contains('+') || s.name.starts_with("zone:") {
+            if t.vtx != cdt::NONE || s.kind != Kind::Pad || s.pts.len() < 3 || s.name.contains('+') || world::fixed_copper(&s.name) {
                 continue;
             }
             let (lo, hi) = s.pts.iter().fold((P2 { x: 1e9, y: 1e9 }, P2 { x: -1e9, y: -1e9 }), |(lo, hi), q| (P2 { x: lo.x.min(q.x), y: lo.y.min(q.y) }, P2 { x: hi.x.max(q.x), y: hi.y.max(q.y) }));
@@ -76,6 +76,10 @@ fn layout_json(r: &router::Router) -> serde_json::Value {
             vias.push(json!({"net": w.b.nets[o.s.net as usize].name, "x": (o.s.center.x * 1e6).round() / 1e6, "y": (o.s.center.y * 1e6).round() / 1e6, "d": o.s.r * 2.0, "drill": o.s.drill}));
         }
     }
+    // neck-down stubs: from the pad's centre (where KiCad joins them) to their end
+    for nk in &w.b.necks {
+        tracks.push(json!({"net": w.b.nets[nk.net as usize].name, "layer": w.b.sig_name(nk.layer), "width": nk.width, "pts": [[nk.from.x, nk.from.y], [nk.to.x, nk.to.y]]}));
+    }
     json!({"outline": w.b.size, "parts": {}, "tracks": tracks, "vias": vias, "zones": [], "keepouts": [], "keepouts_rule": [], "texts": [], "rects": [], "labels": []})
 }
 
@@ -109,6 +113,9 @@ fn main() {
     eprintln!("world built in {:.2}s", t0.elapsed().as_secs_f64());
     if !w.b.rf_nets.is_empty() {
         eprintln!("RF frontend nets kept on one layer (no vias): {}", w.b.rf_nets.iter().map(|x| x.1.as_str()).collect::<Vec<_>>().join("; "));
+    }
+    if !w.b.necks.is_empty() || !w.b.neck_failed.is_empty() {
+        eprintln!("neck-down stubs: {} laid{}", w.b.necks.len(), if w.b.neck_failed.is_empty() { String::new() } else { format!("; no room at {}", w.b.neck_failed.join(", ")) });
     }
     for x in w.warnings.iter().take(10) {
         eprintln!("warning: {}", x);
@@ -154,6 +161,13 @@ fn main() {
     );
     if r.w.thread_drops > 0 {
         eprintln!("  {} wire(s) re-routed after a triangulation change could not re-thread them", r.w.thread_drops);
+    }
+    let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for v in &viol {
+        *by_kind.entry(v.what.clone()).or_insert(0) += 1;
+    }
+    if !by_kind.is_empty() {
+        eprintln!("  violations by kind: {}", by_kind.iter().map(|(k, n)| format!("{} {}", k, n)).collect::<Vec<_>>().join(", "));
     }
     if std::env::var("TOPOR_VIOLDBG").is_ok() {
         let mut groups: std::collections::BTreeMap<String, (usize, P2)> = std::collections::BTreeMap::new();
@@ -255,7 +269,8 @@ fn main() {
             "case": r.w.b.name, "algorithm": "topor-engine", "cold": true, "routing_seconds": secs,
             "routable_nets": routable.len(), "complete_nets": routable.len() - incomplete.iter().filter(|n| routable.contains(n)).count(),
             "deficit": r.total_deficit(), "tracks": ntracks, "vias": nvias, "length_mm": length,
-            "internal_violations": viol.len(), "missing": missing,
+            "internal_violations": viol.len(), "internal_violations_by_kind": by_kind,
+            "neck_stubs": r.w.b.necks.iter().map(|n| json!({"pad": n.pad, "net": r.w.b.nets[n.net as usize].name, "width": n.width, "length": n.from.dist(n.to)})).collect::<Vec<_>>(), "neck_failed": r.w.b.neck_failed, "missing": missing,
             "pairs": pair_json,
             "events": r.events,
             "rf_nets_single_layer": r.w.b.rf_nets.iter().map(|x| x.1.clone()).collect::<Vec<_>>(),

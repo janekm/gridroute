@@ -123,7 +123,8 @@ static inline bool contact(Model m, device const float2 *p, uint i, float2 xi, u
 }
 
 // moving neighbours share a Jacobi average; fixed obstacles then apply in full from where that leaves the node,
-// so no number of pushing neighbours can carry a node through a boundary
+// so no number of pushing neighbours can carry a node through a boundary, one after another, so a run of short
+// boundary segments (a densified curve) pushes once, not once per segment
 kernel void relax_project(device const float2 *p [[buffer(0)]],
                           device float2 *out [[buffer(1)]],
                           device const uint *kind [[buffer(2)]],
@@ -157,16 +158,14 @@ kernel void relax_project(device const float2 *p [[buffer(0)]],
         }
     }
     float2 y = n > 0 ? x + acc / float(n) : x;
-    float2 fix = float2(0.0f);
     for (uint k = ne_off[i]; k < ne_off[i + 1]; k++) {
         uint e = ne[k];
         for (uint c = c_off[e]; c < c_off[e + 1]; c++) {
             uint f = c_el[c];
             if (!is_fixed(m, f)) continue;
-            if (contact(m, p, i, y, e, f, c_need[c], corr, pen)) { fix += corr; worst = max(worst, pen); }
+            if (contact(m, p, i, y, e, f, c_need[c], corr, pen)) { y += corr; worst = max(worst, pen); }
         }
     }
-    y += fix;
     float4 lz = leash[i];
     if (lz.z >= 0.0f) {
         float2 o = y - lz.xy;

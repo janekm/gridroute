@@ -407,7 +407,7 @@ impl<'a> Search<'a> {
         let v = tr.v[shared];
         let pv = w.vpos(l, v);
         let vobj = w.layers[l].vobj[v as usize];
-        let me = w.net_attr(self.q.net);
+        let me = w.net_attr(self.q.net, l);
         // wires around the shared vertex: chords between edges k_in and k_out, ordered from the vertex
         let in_lo = cy.start[k_in];
         let in_hi = cy.start[k_in + 1];
@@ -427,7 +427,7 @@ impl<'a> Search<'a> {
             };
             if let Some(pi) = pos_in {
                 let pc = &w.pieces[p as usize];
-                around.push((pi, w.net_attr(pc.net), pc.width));
+                around.push((pi, w.net_attr(pc.net, pc.layer as usize), pc.width));
                 around_pieces.push(p);
             }
         }
@@ -495,7 +495,7 @@ impl<'a> Search<'a> {
                     if k + 1 >= q.poly.len() {
                         continue;
                     }
-                    (seg_near(q.poly[k], q.poly[k + 1]) - q.width / 2.0, w.net_attr(q.net), Some(vec![it.id]))
+                    (seg_near(q.poly[k], q.poly[k + 1]) - q.width / 2.0, w.net_attr(q.net, q.layer as usize), Some(vec![it.id]))
                 }
                 _ => {
                     if it.id == vobj {
