@@ -113,6 +113,9 @@ pub struct Router {
     /// whether pairs may be crossed, the budget): other nets' copper is passable to them, so the same search
     /// fails again until one of those changes, and is not run again.
     pub soft_dead: std::collections::HashSet<(u32, u64)>,
+    /// Pair stations that fixed copper already joins are merged into one (see pair_stations); off for the
+    /// attempts that route the pairs split at every station, as before, to compare.
+    pub merge_stations: bool,
     /// Wall time and calls per phase of the run (the attempt that is kept), for the time report.
     pub prof: std::collections::BTreeMap<&'static str, (f64, usize)>,
 }
@@ -201,7 +204,7 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), prof: Default::default() }
+        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), merge_stations: true, prof: Default::default() }
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -1774,6 +1777,11 @@ impl Router {
     /// A pair's stations, in path order: (p pad, n pad) couples where both members meet one part
     /// (connector, protection IC, chip, series resistors). The members run through every station.
     pub fn pair_stations(&self, p: u32, n: u32) -> Vec<(u32, u32)> {
+        self.pair_stations_with(p, n, self.merge_stations)
+    }
+
+    /// pair_stations, with stations that fixed copper joins merged or not.
+    fn pair_stations_with(&self, p: u32, n: u32, merge: bool) -> Vec<(u32, u32)> {
         let c = |o: u32| self.w.objs[o as usize].s.center;
         let mut cand: Vec<(f64, u32, u32, P2)> = Vec::new();
         let mut cen = p2(0.0, 0.0);
@@ -1806,6 +1814,51 @@ impl Router {
             }
             st.push((a, b, m));
         }
+        // stations the members' fixed copper (hand-drawn tracks and vias, zones) already joins, both members, are one:
+        // the pair needs no ribbon between them, only from the copper's tip that faces the other stations
+        let (gp, gn) = (self.fixed_groups(p), self.fixed_groups(n));
+        let key = |x: &(u32, u32, P2)| (gp.get(&x.0).cloned(), gn.get(&x.1).cloned());
+        let mut keys: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+        for x in &st {
+            if !keys.contains(&key(x)) {
+                keys.push(key(x));
+            }
+        }
+        if merge && keys.len() < st.len() {
+            let mut merged: Vec<(u32, u32, P2)> = Vec::new();
+            for k in &keys {
+                let mine: Vec<&(u32, u32, P2)> = st.iter().filter(|x| key(x) == *k).collect();
+                let others: Vec<P2> = st.iter().filter(|x| key(x) != *k).map(|x| x.2).collect();
+                // the copper's own end before a part's pads it starts from: its via pair (where it leaves the
+                // layer), else its pieces
+                let rank = |x: &(u32, u32, P2)| {
+                    let kinds: Vec<u8> = [x.0, x.1]
+                        .iter()
+                        .map(|&o| {
+                            let s = &self.w.objs[o as usize].s;
+                            if s.name.starts_with("via.") || s.kind == Kind::Via {
+                                0
+                            } else if crate::world::fixed_copper(&s.name) {
+                                1
+                            } else {
+                                2
+                            }
+                        })
+                        .collect();
+                    kinds[0].max(kinds[1])
+                };
+                let best_rank = mine.iter().map(|x| rank(x)).min().unwrap_or(2);
+                let pool: Vec<&(u32, u32, P2)> = mine.iter().cloned().filter(|x| rank(x) == best_rank).collect();
+                let pick = if others.is_empty() {
+                    pool[0]
+                } else {
+                    let c = others.iter().fold(p2(0., 0.), |a, &b| a + b) * (1.0 / others.len() as f64);
+                    pool.iter().min_by(|a, b| a.2.dist(c).partial_cmp(&b.2.dist(c)).unwrap()).unwrap()
+                };
+                merged.push(*pick);
+            }
+            st = merged;
+        }
         if st.len() < 2 {
             return Vec::new();
         }
@@ -1829,6 +1882,26 @@ impl Router {
         }
         order.push(i1);
         order.into_iter().map(|i| (st[i].0, st[i].1)).collect()
+    }
+
+    /// The groups a net's pads and fixed copper form through their ties alone (not routed wires): which of them
+    /// hand-drawn copper or zones already join. Object -> group.
+    fn fixed_groups(&self, net: u32) -> HashMap<u32, usize> {
+        let objs = &self.net_pads[net as usize];
+        let mut index: HashMap<u32, usize> = HashMap::default();
+        for (i, &o) in objs.iter().enumerate() {
+            index.entry(o).or_insert(i);
+        }
+        let mut par: Vec<usize> = (0..objs.len()).collect();
+        for &(x, y) in &self.ties {
+            if let (Some(&i), Some(&j)) = (index.get(&x), index.get(&y)) {
+                let (a, b) = (find(&mut par, i), find(&mut par, j));
+                if a != b {
+                    par[b] = a;
+                }
+            }
+        }
+        objs.iter().enumerate().map(|(i, &o)| (o, find(&mut par, i))).collect()
     }
 
     /// Route one net point to point (a pad or junction to another), optionally coupled to a partner.
@@ -2851,7 +2924,33 @@ impl Router {
                 self.pair_len[p as usize] = self.w.objs[pa as usize].s.center.dist(self.w.objs[pb as usize].s.center);
             }
         }
-        { let _t = Instant::now(); self.route_pairs(); self.prof_add("pairs", _t); }
+        // where fixed copper joins stations of a pair, the pairs are routed both with those stations merged and
+        // split as before, at once; the routing attempts then run on both, the merged ones first, and the board
+        // keeps whichever comes out more complete (coupling never costs a connection)
+        let mut split_pairs: Option<Router> = None;
+        {
+            let _t = Instant::now();
+            let differs = !self.cfg.fast && !self.cfg.single_attempt && std::env::var("TOPOR_NOSPLITPAIRS").is_err() && (0..nn).any(|p| {
+                let n = self.w.b.partner.get(p as usize).cloned().unwrap_or(NONE);
+                n != NONE && p < n && self.pair_stations_with(p, n, true) != self.pair_stations_with(p, n, false)
+            });
+            if differs {
+                let mut other = self.clone();
+                other.merge_stations = false;
+                other.cfg.verbose = false;
+                split_pairs = std::thread::scope(|sc| {
+                    let h = sc.spawn(move || {
+                        other.route_pairs();
+                        other
+                    });
+                    self.route_pairs();
+                    Some(h.join().expect("pairs split at every station"))
+                });
+            } else {
+                self.route_pairs();
+            }
+            self.prof_add("pairs", _t);
+        }
         if self.cfg.verbose {
             eprintln!("[{:.1}s] pairs done", self.elapsed());
         }
@@ -2872,13 +2971,18 @@ impl Router {
             self.route_rest(fan, long, esc);
         } else if std::env::var("TOPOR_FANOUT").is_ok() {
             self.route_rest(true, false, false);
-        } else if self.cfg.single_attempt || variants.len() == 1 {
+        } else if (self.cfg.single_attempt || variants.len() == 1) && split_pairs.is_none() {
             self.route_rest(false, false, false);
         } else {
-            let stops: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = variants.iter().map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
-            let mut others: Vec<Router> = (1..variants.len())
+            // the orders on these pairs, then (if they were routed so too) on the pairs split at every station
+            let mut atts: Vec<(bool, (bool, bool, bool))> = variants.iter().map(|&v| (false, v)).collect();
+            if split_pairs.is_some() {
+                atts.extend(variants.iter().map(|&v| (true, v)));
+            }
+            let stops: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = atts.iter().map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
+            let mut others: Vec<Router> = (1..atts.len())
                 .map(|k| {
-                    let mut o = self.clone();
+                    let mut o = if atts[k].0 { split_pairs.as_ref().unwrap().clone() } else { self.clone() };
                     o.cfg.verbose = false;
                     o.stop = Some(stops[k].clone());
                     o
@@ -2894,7 +2998,7 @@ impl Router {
             let hurry = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let finished = std::sync::Arc::new(std::sync::Mutex::new((0usize, None::<Instant>)));
             let grace_frac: f64 = std::env::var("TOPOR_GRACE").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
-            let n_attempts = variants.len();
+            let n_attempts = atts.len();
             let finish = |f: &std::sync::Mutex<(usize, Option<Instant>)>| {
                 let mut g = f.lock().unwrap();
                 g.0 += 1;
@@ -2909,7 +3013,7 @@ impl Router {
                     .drain(..)
                     .enumerate()
                     .map(|(i, mut o)| {
-                        let (fan, long, esc) = variants[i + 1];
+                        let (fan, long, esc) = atts[i + 1].1;
                         let stops = &stops;
                         let finished = &finished;
                         sc.spawn(move || {
@@ -2948,12 +3052,19 @@ impl Router {
             });
             let hurried = hurry.load(std::sync::atomic::Ordering::Relaxed);
             self.hurry = None;
-            let name = |k: usize| match variants[k] {
-                (true, _, true) => "fine-pitch parts given a planned fan-out first",
-                (false, false, _) => "plain order",
-                (true, false, _) => "fine-pitch parts fanned out first",
-                (false, true, _) => "long nets first",
-                (true, true, _) => "fan-out first, then long nets first",
+            let name = |k: usize| {
+                let order = match atts[k].1 {
+                    (true, _, true) => "fine-pitch parts given a planned fan-out first",
+                    (false, false, _) => "plain order",
+                    (true, false, _) => "fine-pitch parts fanned out first",
+                    (false, true, _) => "long nets first",
+                    (true, true, _) => "fan-out first, then long nets first",
+                };
+                if atts[k].0 {
+                    format!("{} (pairs split at every station)", order)
+                } else {
+                    order.to_string()
+                }
             };
             let first = self.total_deficit();
             let mut best: Option<(usize, usize)> = None;
