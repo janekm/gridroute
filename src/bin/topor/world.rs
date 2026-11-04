@@ -2298,7 +2298,7 @@ impl World {
         // out of step with the polyline after an earlier change) is taken out: its net is routed again
         for p in touched {
             if let Some(why) = self.thread_fault(l, p) {
-                if std::env::var("TOPOR_VALIDATE").is_ok() {
+                if std::env::var("TOPOR_VALIDATE").is_ok() || std::env::var("TOPOR_THREADDBG").is_ok() {
                     eprintln!("re-threading left piece {} of {} inconsistent ({}): removed", p, self.b.nets[self.pieces[p as usize].net as usize].name, why);
                 }
                 self.remove_piece(p);

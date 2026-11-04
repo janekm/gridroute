@@ -794,7 +794,19 @@ impl Router {
         }
         self.prof_add("spring wb: re-search short wires", t_pending);
         let t_join = std::time::Instant::now();
-        // 5. join up what is open
+        // 5. join up what is open: the nets above, and any other the relaxation left apart without a wire of its
+        // own to rethread (a wire dropped where the triangles changed under it as its neighbours moved): a next try
+        // holds it and the nets beside it
+        let mut apart = Vec::new();
+        for net in self.incomplete_nets() {
+            if !was_open.contains(&net) && !open.contains(&net) {
+                if dbg {
+                    eprintln!("  spring: {} came apart without a wire to rethread", self.w.b.nets[net as usize].name);
+                }
+                open.push(net);
+                apart.push(net);
+            }
+        }
         for &net in open.iter().filter(|n| !was_open.contains(n)) {
             for _ in 0..3 {
                 if self.route_net(net) == 0 {
@@ -824,9 +836,16 @@ impl Router {
             if self.cfg.verbose {
                 eprintln!("  spring: dropped (deficit {} -> {}, violations {} -> {}, wires {:.1} -> {:.1} mm, {} nets routed again)", before_def, def, before_viol, viol, before_len, len, rerouted);
             }
+            // (the nets beside one that came apart, on its layers within 1 mm of its copper as it was)
+            let mut hold_next = open.clone();
+            for n in nets_beside(&snap.0, &apart, 1.0) {
+                if !hold_next.contains(&n) {
+                    hold_next.push(n);
+                }
+            }
             restore(self, snap);
             // left incomplete or unclean by the nets that had to be joined up again: the next try holds them
-            return if (def > before_def || viol > before_viol) && !open.is_empty() { Err(open) } else { Ok(false) };
+            return if (def > before_def || viol > before_viol) && !hold_next.is_empty() { Err(hold_next) } else { Ok(false) };
         }
         self.events.push(format!("spring relaxation: {} vias moved, wires {:.1} -> {:.1} mm ({} nets routed again where the relaxed wires did not fit)", moved, before_len, len, rerouted));
         if self.cfg.verbose {
@@ -1014,3 +1033,23 @@ impl Router {
     }
 }
 
+/// Nets with copper within `d` of the wires of `nets` on the same layer (vias: on any layer), in board w.
+fn nets_beside(w: &crate::world::World, nets: &[u32], d: f64) -> Vec<u32> {
+    let mut out = Vec::new();
+    if nets.is_empty() {
+        return out;
+    }
+    let mine: Vec<(usize, P2, P2, f64)> = w.pieces.iter().filter(|p| p.alive && nets.contains(&p.net)).flat_map(|p| p.poly.windows(2).map(move |s| (p.layer as usize, s[0], s[1], p.width))).collect();
+    let near = |l: Option<usize>, a: P2, b: P2, r: f64| mine.iter().any(|&(ml, c, e, mw)| l.map_or(true, |l| l == ml) && seg_seg_dist(a, b, c, e) < d + (r + mw) / 2.0);
+    for p in w.pieces.iter().filter(|p| p.alive && !nets.contains(&p.net)) {
+        if !out.contains(&p.net) && p.poly.windows(2).any(|s| near(Some(p.layer as usize), s[0], s[1], p.width)) {
+            out.push(p.net);
+        }
+    }
+    for o in w.objs.iter().filter(|o| o.alive && o.s.kind == crate::model::Kind::Via && !nets.contains(&o.s.net)) {
+        if !out.contains(&o.s.net) && near(None, o.s.center, o.s.center, 2.0 * o.s.r) {
+            out.push(o.s.net);
+        }
+    }
+    out
+}

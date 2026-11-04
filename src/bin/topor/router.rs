@@ -130,6 +130,9 @@ pub struct Router {
     /// their nets: rip-up moves them at a small premium, pair stations treat them like fixed copper.
     pub suggested: std::collections::HashSet<u32>,
     pub suggested_nets: std::collections::HashSet<u32>,
+    /// Pair members whose pads the suggested copper joins already (a pair drawn by hand, as found by the import):
+    /// the model keeps their suggested copper as drawn (see main).
+    pub drawn_pairs: std::collections::HashSet<u32>,
     /// Per net: the coupled length (mm) of the differential pair it belongs to, as last measured; crossing it
     /// costs in proportion, so rip-up does not break good coupling for a short cut.
     pub pair_coupled: Vec<f64>,
@@ -233,7 +236,7 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default() }
+        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), drawn_pairs: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default() }
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -1059,10 +1062,10 @@ impl Router {
                             }
                         }
                     }
-                    // differential pairs are rebuilt only as pairs: do not rip them for a single net
-                    if self.protect_pairs {
-                        culprits.retain(|&pp| self.w.b.partner.get(self.w.pieces[pp as usize].net as usize).map_or(true, |&x| x == NONE));
-                    }
+                    // nothing this net may not cross at any price (a pair while pairs are protected, or for a plane
+                    // net, whose drop can go elsewhere): the search was kept off it, and the exact check is not
+                    // a way round that
+                    culprits.retain(|&pp| q.cross_cost.get(self.w.pieces[pp as usize].net as usize).map_or(true, |c| c.is_finite()));
 
                     if culprits.is_empty() {
                         self.learn(&mut q);
@@ -1821,13 +1824,35 @@ impl Router {
     /// pair_stations, with stations that fixed copper joins merged or not.
     fn pair_stations_with(&self, p: u32, n: u32, merge: bool) -> Vec<(u32, u32)> {
         let c = |o: u32| self.w.objs[o as usize].s.center;
+        // (merging: the vias of the members' suggested copper count too, as a fixed via pair would: the pair then
+        // starts where the hand-drawn escapes leave the layer)
+        let ends = |x: u32| -> Vec<u32> {
+            let mut v = self.net_pads[x as usize].clone();
+            if merge {
+                let mut vias: Vec<u32> = self
+                    .suggested
+                    .iter()
+                    .map(|&q| &self.w.pieces[q as usize])
+                    .filter(|pc| pc.alive && pc.net == x)
+                    .flat_map(|pc| [pc.a.obj, pc.b.obj])
+                    .filter(|&o| self.w.objs[o as usize].alive && self.w.objs[o as usize].s.kind == Kind::Via)
+                    .collect();
+                vias.sort();
+                vias.dedup();
+                v.extend(vias);
+            }
+            v
+        };
+        let (ends_p, ends_n) = (ends(p), ends(n));
         let mut cand: Vec<(f64, u32, u32, P2)> = Vec::new();
         let mut cen = p2(0.0, 0.0);
         let mut k = 0.0;
         for &a in &self.net_pads[p as usize] {
             cen = cen + c(a);
             k += 1.0;
-            for &b in &self.net_pads[n as usize] {
+        }
+        for &a in &ends_p {
+            for &b in &ends_n {
                 if c(a).dist(c(b)) < 3.0 {
                     cand.push((c(a).dist(c(b)), a, b, c(a).lerp(c(b), 0.5)));
                 }
@@ -1962,6 +1987,11 @@ impl Router {
         objs.iter().enumerate().map(|(i, &o)| (o, find(&mut par, i))).collect()
     }
 
+    /// Whether objects a and b of a net are joined by its copper (wires, and ties through fixed copper).
+    fn joined(&self, net: u32, a: u32, b: u32) -> bool {
+        self.components(net).iter().any(|c| c.contains(&a) && c.contains(&b))
+    }
+
     /// Route one net point to point (a pad or junction to another), optionally coupled to a partner.
     fn connect(&mut self, net: u32, a: u32, b: u32, couple: u32) -> bool {
         self.connect_within(net, a, b, couple, f64::INFINITY)
@@ -2006,6 +2036,14 @@ impl Router {
         let labels: Vec<String> = st.iter().map(|&x| self.station_label(x)).collect();
         let mut segs: Vec<(String, String, String)> = Vec::new();
         for k in 0..st.len() - 1 {
+            // both members joined station to station already by hand copper given as suggestions: a ribbon or
+            // member wires there would only double it (where fixed copper joins them, the segment is routed as
+            // before)
+            let sug = self.suggested_nets.contains(&p) || self.suggested_nets.contains(&n);
+            if sug && self.joined(p, st[k].0, st[k + 1].0) && self.joined(n, st[k].1, st[k + 1].1) {
+                segs.push((labels[k].clone(), labels[k + 1].clone(), "joined already (suggested copper)".into()));
+                continue;
+            }
             match self.route_segment(r, p, n, st[k], st[k + 1]) {
                 Ok(()) => {
                     if dbg {
@@ -2981,11 +3019,24 @@ impl Router {
     pub fn update_pair_coupling(&mut self) {
         let mut v = vec![0.0; self.w.b.nets.len()];
         for (a, b, lp, ln, cf) in self.pair_report() {
-            let len = if lp.is_finite() && ln.is_finite() { lp.min(ln) } else { 0.0 };
-            for name in [a, b] {
-                if let Some(&i) = self.w.b.net_index.get(&name) {
-                    v[i as usize] = cf * len;
-                }
+            let (Some(&p), Some(&n)) = (self.w.b.net_index.get(&a), self.w.b.net_index.get(&b)) else { continue };
+            let fixed = || self.w.objs.iter().any(|o| o.alive && (o.s.net == p || o.s.net == n) && crate::world::fixed_copper(&o.s.name));
+            let c = if lp.is_finite() && ln.is_finite() {
+                cf * lp.min(ln)
+            } else if !fixed() {
+                0.0
+            } else {
+                // no chain of the router's own wires between the pair's ends (hand copper kept as drawn in
+                // between): the coupled length of n's own wires beside p's copper, fixed copper too, which is
+                // what a rip can take away
+                let steps: Vec<(Vec<P2>, usize, f64)> = self.w.pieces.iter().filter(|x| x.alive && x.net == n).map(|q| (q.poly.clone(), q.layer as usize, q.width)).collect();
+                let len: f64 = steps.iter().map(|s| s.0.windows(2).map(|t| t[0].dist(t[1])).sum::<f64>()).sum();
+                self.coupled_fraction(p, &steps, true) * len
+            };
+            v[p as usize] = c;
+            v[n as usize] = c;
+            if std::env::var("TOPOR_COUPLEDBG").is_ok() {
+                eprintln!("pair coupling {}: lp {:.2} ln {:.2} cf {:.2} -> {:.2} mm", a, lp, ln, cf, c);
             }
         }
         self.pair_coupled = v;
@@ -3038,11 +3089,16 @@ impl Router {
         let path_p = self.report_path(p, pa, pb);
         let path_n = self.report_path(n, na, nb);
         let len = |x: &Option<Vec<(Vec<P2>, usize, f64)>>| x.as_ref().map_or(f64::NAN, |v| v.iter().map(|s| s.0.windows(2).map(|t| t[0].dist(t[1])).sum::<f64>()).sum());
+        if std::env::var("TOPOR_MEASUREDBG").is_ok() {
+            let steps: Vec<String> = path_n.iter().flatten().map(|s| format!("L{} w{:.2} {:.1}mm {}pts", s.1, s.2, s.0.windows(2).map(|t| t[0].dist(t[1])).sum::<f64>(), s.0.len())).collect();
+            eprintln!("measure {}: routed {:?}; full ends {}/{} {}/{}; n path: {}", self.w.b.nets[p as usize].name, self.pair_measure_routed(p, n), self.w.objs[pa as usize].s.name, self.w.objs[na as usize].s.name, self.w.objs[pb as usize].s.name, self.w.objs[nb as usize].s.name, steps.join(", "));
+        }
         Some((len(&path_p), len(&path_n), path_n.as_ref().map_or(0.0, |st| self.coupled_fraction(p, st, true))))
     }
 
-    /// The part of the path `steps` (polyline, layer, width) of p's partner within the coupling distance of p's
-    /// copper on the same layer (its wires, and with `fixed` its fixed copper ties), sampled every 50 um.
+    /// The part of the path `steps` (polyline, layer, width) of p's partner that runs beside p's copper on the same
+    /// layer (its wires, and with `fixed` its fixed copper ties) at the coupled pitch (the two half widths and the
+    /// pair gap, within 0.05 mm) and parallel (within 15 degrees), sampled every 50 um.
     fn coupled_fraction(&self, p: u32, steps: &[(Vec<P2>, usize, f64)], fixed: bool) -> f64 {
         // p's copper by layer, indexed once
         let mut pcu: Vec<Vec<(P2, P2, f64)>> = vec![Vec::new(); self.w.nsig()];
@@ -3058,14 +3114,24 @@ impl Router {
         }
         let gap = self.w.b.pair_gap[p as usize];
         let (mut tot, mut cpl) = (0.0, 0.0);
+        let sin_max = 15f64.to_radians().sin();
         for (poly, l, w) in steps {
             for sgm in poly.windows(2) {
                 let len = sgm[0].dist(sgm[1]);
+                if len < 1e-9 {
+                    continue;
+                }
+                let u = (sgm[1] - sgm[0]) * (1.0 / len);
                 let k = (len / 0.05).ceil().max(1.0) as usize;
                 for i in 0..k {
                     let m = sgm[0].lerp(sgm[1], (i as f64 + 0.5) / k as f64);
                     tot += len / k as f64;
-                    if pcu[*l].iter().any(|&(a, b, qw)| seg_point_dist(a, b, m) < (qw + w) / 2.0 + gap + 0.03) {
+                    let beside = pcu[*l].iter().any(|&(a, b, qw)| {
+                        let lv = a.dist(b);
+                        let parallel = lv < 1e-9 || ((b - a) * (1.0 / lv)).cross(u).abs() <= sin_max;
+                        parallel && (seg_point_dist(a, b, m) - ((qw + w) / 2.0 + gap)).abs() <= 0.05
+                    });
+                    if beside {
                         cpl += len / k as f64;
                     }
                 }
@@ -3175,6 +3241,12 @@ impl Router {
     pub fn route_all(&mut self) {
         let nn = self.w.b.nets.len() as u32;
         if self.cfg.only.as_deref() == Some("pairs") {
+            // (TOPOR_LEGACYPAIRS: the pairs as routed before, to compare)
+            if std::env::var("TOPOR_LEGACYPAIRS").is_ok() {
+                self.merge_stations = false;
+                self.legacy_pairs = true;
+                self.w.b.ribbon_touch = false;
+            }
             self.route_pairs();
             return;
         }
@@ -3293,7 +3365,9 @@ impl Router {
             }
             self.hurry = Some(hurry.clone());
             let mut at0 = 0.0;
-            let done: Vec<(usize, Router, f64)> = std::thread::scope(|sc| {
+            // (whether an attempt was called off is read when it finishes: a later call-off of the attempts after a
+            // complete one does not undo one that has finished already)
+            let done: Vec<(usize, Router, f64, bool)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = others
                     .drain(..)
                     .enumerate()
@@ -3303,13 +3377,14 @@ impl Router {
                         let finished = &finished;
                         sc.spawn(move || {
                             o.route_rest(fan, long, esc);
-                            let complete = !o.stopped() && o.total_deficit() == 0;
+                            let off = o.stopped();
+                            let complete = !off && o.total_deficit() == 0;
                             if complete {
                                 call_off_after(i + 1, stops);
                             }
                             finish(finished, i + 1, complete);
                             let at = o.elapsed();
-                            (o, at)
+                            (o, at, off)
                         })
                     })
                     .collect();
@@ -3342,7 +3417,7 @@ impl Router {
                 }
                 finish(&finished, 0, complete);
                 at0 = self.elapsed();
-                hs.into_iter().enumerate().map(|(i, h)| { let (o, at) = h.join().expect("routing attempt"); (i + 1, o, at) }).collect()
+                hs.into_iter().enumerate().map(|(i, h)| { let (o, at, off) = h.join().expect("routing attempt"); (i + 1, o, at, off) }).collect()
             });
             let hurried = hurry.load(std::sync::atomic::Ordering::Relaxed);
             self.hurry = None;
@@ -3360,20 +3435,21 @@ impl Router {
                     order.to_string()
                 }
             };
-            // the most complete board wins; between equally complete ones, the one with the most coupled length
-            let coupled_len = |r: &Router| -> f64 { r.pair_report().iter().map(|x| if x.2.is_finite() && x.3.is_finite() { x.4 * x.2.min(x.3) } else { 0.0 }).sum() };
+            // the most complete board wins; between equally complete ones, the one with the most coupled length less
+            // the pairs' skews (a member's detour costs what it is longer than its partner)
+            let coupled_len = |r: &Router| -> f64 { r.pair_report().iter().map(|x| if x.2.is_finite() && x.3.is_finite() { x.4 * x.2.min(x.3) - (x.2 - x.3).abs() } else { 0.0 }).sum() };
             let first = self.total_deficit();
             let first_c = coupled_len(self);
             let mut best: Option<(usize, usize, f64)> = None;
-            let mut summary = vec![format!("{}: deficit {}, {:.0} mm coupled (done at {:.1}s)", name(0), first, first_c, at0)];
-            for (k, o, at) in &done {
-                if o.stopped() {
+            let mut summary = vec![format!("{}: deficit {}, {:.0} mm coupled less skew (done at {:.1}s)", name(0), first, first_c, at0)];
+            for (k, o, at, off) in &done {
+                if *off {
                     summary.push(format!("{}: called off (at {:.1}s)", name(*k), at));
                     continue;
                 }
                 let d = o.total_deficit();
                 let c = coupled_len(o);
-                summary.push(format!("{}: deficit {}, {:.0} mm coupled (done at {:.1}s)", name(*k), d, c, at));
+                summary.push(format!("{}: deficit {}, {:.0} mm coupled less skew (done at {:.1}s)", name(*k), d, c, at));
                 let (bd, bc) = best.map_or((first, first_c), |b| (b.1, b.2));
                 if d < bd || (d == bd && c > bc + 1e-6) {
                     best = Some((*k, d, c));
@@ -3950,10 +4026,11 @@ impl Router {
                 break;
             }
         }
-        // signal vias whose wires all sit on one layer: rip them and reconnect the net without them
+        // signal vias whose wires all sit on one layer: rip them and reconnect the net without them (not a pair
+        // member's: it would come back as a lone wire, its coupling lost)
         for o in 0..self.w.objs.len() as u32 {
             let ob = &self.w.objs[o as usize];
-            if !ob.alive || ob.s.kind != Kind::Via || ob.plane {
+            if !ob.alive || ob.s.kind != Kind::Via || ob.plane || self.w.b.partner.get(ob.s.net as usize).map_or(false, |&q| q != NONE) {
                 continue;
             }
             let live: Vec<u32> = self.w.obj_pieces[o as usize].iter().cloned().filter(|&p| self.w.pieces[p as usize].alive).collect();
@@ -4228,6 +4305,16 @@ impl Router {
                 }
             }
         }
+        // a via drawn on copper kept as drawn (fixed: zone pieces of its net) joins it, as the fill joins a pad
+        // (else the net comes apart there: the wire drawn up to the via is a dead end, and the router goes round)
+        for &(net, _, o) in &vias {
+            for z in 0..self.w.objs.len() as u32 {
+                let (zs, vs) = (&self.w.objs[z as usize].s, &self.w.objs[o as usize].s);
+                if zs.net == net && self.w.objs[z as usize].alive && crate::world::fixed_copper(&zs.name) && zs.layers & vs.layers != 0 && crate::world::core_dist(zs, vs) - zs.r - vs.r < 0.03 && !self.ties.contains(&(z, o)) {
+                    self.ties.push((z, o));
+                }
+            }
+        }
         // segments by (net, layer, width), their end points joined at 1 um
         let key = |p: P2| ((p.x * 1000.0).round() as i64, (p.y * 1000.0).round() as i64);
         let mut segs: Vec<(u32, usize, f64, P2, P2)> = Vec::new();
@@ -4245,6 +4332,51 @@ impl Router {
                 if pts[k].dist(pts[k + 1]) > 1e-6 {
                     segs.push((net, l, w, pts[k], pts[k + 1]));
                     seg_track.push(ti);
+                }
+            }
+        }
+        // a track that ends on another track of its net and layer, inside its copper but off its points (a T drawn
+        // by overlap, as an ESD tap off a line running past it), joins it there: the other track is split at the
+        // foot of that end, and the end moved onto it (else the tap stays apart, and the router draws the line again
+        // through the part)
+        {
+            let mut ends: HashMap<(u32, usize, (i64, i64)), usize> = HashMap::default();
+            for &(net, l, _, a, b) in &segs {
+                *ends.entry((net, l, key(a))).or_insert(0) += 1;
+                *ends.entry((net, l, key(b))).or_insert(0) += 1;
+            }
+            let at_via = |net: u32, p: P2| vias.iter().any(|&(n, q, _)| n == net && q.dist(p) < 0.02);
+            let at_pad = |me: &Router, net: u32, l: usize, p: P2| {
+                me.net_pads[net as usize].iter().any(|&o| {
+                    let s = &me.w.objs[o as usize].s;
+                    s.layers & (1 << l) != 0 && point_hull_dist(&s.pts, p) - s.r <= 1e-3
+                })
+            };
+            for i in 0..segs.len() {
+                for side in 0..2 {
+                    let (net, l, w, a, b) = segs[i];
+                    let e = if side == 0 { a } else { b };
+                    if ends.get(&(net, l, key(e))).cloned().unwrap_or(0) != 1 || at_via(net, e) || at_pad(self, net, l, e) {
+                        continue;
+                    }
+                    let foot = (0..segs.len()).filter(|&j| j != i && segs[j].0 == net && segs[j].1 == l).find_map(|j| {
+                        let (_, _, wj, c, d) = segs[j];
+                        let t = seg_param(c, d, e);
+                        let q = c.lerp(d, t);
+                        (q.dist(e) < (w + wj) / 2.0 && q.dist(c) > 1e-3 && q.dist(d) > 1e-3).then_some((j, q))
+                    });
+                    let Some((j, q)) = foot else { continue };
+                    let (_, _, wj, c, d) = segs[j];
+                    segs[j] = (net, l, wj, c, q);
+                    segs.push((net, l, wj, q, d));
+                    seg_track.push(seg_track[j]);
+                    if side == 0 {
+                        segs[i].3 = q;
+                    } else {
+                        segs[i].4 = q;
+                    }
+                    ends.remove(&(net, l, key(e)));
+                    *ends.entry((net, l, key(q))).or_insert(0) += 3;
                 }
             }
         }
@@ -4400,6 +4532,14 @@ impl Router {
             }
         }
         self.junctions.retain(|&j| self.w.objs[j as usize].alive);
+        // pairs drawn whole: both members complete as suggested
+        for &net in &self.suggested_nets {
+            let pn = self.w.b.partner.get(net as usize).cloned().unwrap_or(NONE);
+            if pn != NONE && self.deficit(net) == 0 && self.deficit(pn) == 0 {
+                self.drawn_pairs.insert(net);
+                self.drawn_pairs.insert(pn);
+            }
+        }
         bad_tracks.sort();
         bad_tracks.dedup();
         Suggested { vias_kept: vok, vias_left_out: vbad, tracks_kept: tok, tracks_left_out: tbad, notes, bad_vias, bad_tracks }

@@ -223,6 +223,7 @@ fn main() {
     // at a joint, and fixing them walks the whole drawing of a power net; they are left out for the router as
     // before. A pair member's copper kept as drawn takes the partner's beside it along, so the pair stays together.)
     let mut kept_fixed = (Vec::new(), Vec::new());
+    let mut drawn_pairs: Vec<String> = Vec::new();
     if !m["suggested_copper"].is_null() {
         let b0 = board_of(&m);
         let partner = |net: &str| -> Option<String> {
@@ -243,6 +244,35 @@ fn main() {
             let (t, v) = fix_suggestions(&mut m, &bt, &bv);
             kept_fixed.0.extend(t);
             kept_fixed.1.extend(v);
+        }
+        // a pair the suggested copper completes (both members' pads joined as drawn) stays as drawn too: as the
+        // router's own copper it is pulled taut, pushed aside and ripped like any wire, and a pair drawn whole is
+        // better kept than drawn again; the router takes the pairs drawn in part (TOPOR_ROUTE_DRAWN_PAIRS: all)
+        // (TOPOR_SUGGEST_FIXED: all of it as drawn, as fixed copper given as such, to compare)
+        if std::env::var("TOPOR_SUGGEST_FIXED").is_ok() {
+            let all = |m: &serde_json::Value, k: &str| -> Vec<usize> { (0..m["suggested_copper"][k].as_array().map_or(0, |a| a.len())).collect() };
+            let (bt, bv) = (all(&m, "tracks"), all(&m, "vias"));
+            let (t, v) = fix_suggestions(&mut m, &bt, &bv);
+            kept_fixed.0.extend(t);
+            kept_fixed.1.extend(v);
+        } else if std::env::var("TOPOR_ROUTE_DRAWN_PAIRS").is_err() {
+            let w = world::World::new(board_of(&m)).expect("world");
+            let cfg = router::Cfg { only: None, via_cost: 4.0, max_exp: 20000, seconds: 60.0, rip_rounds: 0, verbose: false, single_attempt: true, fast: true };
+            let mut r = router::Router::new(w, cfg);
+            let _ = r.import_suggestions(&m["suggested_copper"]);
+            let names: Vec<String> = r.drawn_pairs.iter().map(|&n| r.w.b.nets[n as usize].name.clone()).collect();
+            let sel = |m: &serde_json::Value, k: &str| -> Vec<usize> {
+                m["suggested_copper"][k].as_array().into_iter().flatten().enumerate().filter(|(_, x)| names.iter().any(|n| Some(n.as_str()) == x["net"].as_str())).map(|(i, _)| i).collect()
+            };
+            let (bt, bv) = (sel(&m, "tracks"), sel(&m, "vias"));
+            if !bt.is_empty() || !bv.is_empty() {
+                let (t, v) = fix_suggestions(&mut m, &bt, &bv);
+                kept_fixed.0.extend(t);
+                kept_fixed.1.extend(v);
+                let mut ps: Vec<String> = r.drawn_pairs.iter().filter(|&&n| n < r.w.b.partner[n as usize]).map(|&n| r.w.b.nets[n as usize].name.clone()).collect();
+                ps.sort();
+                drawn_pairs = ps;
+            }
         }
     }
     let b = board_of(&m);
@@ -295,13 +325,16 @@ fn main() {
     if !m["suggested_copper"].is_null() {
         let sg = r.import_suggestions(&m["suggested_copper"]);
         eprintln!(
-            "suggested copper: {} vias and {} track chains taken as routed copper; {} tracks and {} vias kept as drawn (fixed: they break a rule as routed copper); left out {} vias, {} chains",
+            "suggested copper: {} vias and {} track chains taken as routed copper; {} tracks and {} vias kept as drawn (fixed: they break a rule as routed copper, or complete a pair); left out {} vias, {} chains",
             sg.vias_kept, sg.tracks_kept, kept_fixed.0.len(), kept_fixed.1.len(), sg.vias_left_out, sg.tracks_left_out
         );
+        if !drawn_pairs.is_empty() {
+            eprintln!("  pairs the suggested copper completes, kept as drawn: {}", drawn_pairs.join(", "));
+        }
         for n in sg.notes.iter().take(20) {
             eprintln!("  suggestion: {}", n);
         }
-        suggested = json!({"vias_kept": sg.vias_kept, "chains_kept": sg.tracks_kept, "tracks_fixed": kept_fixed.0.len(), "vias_fixed": kept_fixed.1.len(), "vias_left_out": sg.vias_left_out, "chains_left_out": sg.tracks_left_out, "notes": sg.notes});
+        suggested = json!({"vias_kept": sg.vias_kept, "chains_kept": sg.tracks_kept, "tracks_fixed": kept_fixed.0.len(), "vias_fixed": kept_fixed.1.len(), "vias_left_out": sg.vias_left_out, "chains_left_out": sg.tracks_left_out, "pairs_kept_as_drawn": drawn_pairs, "notes": sg.notes});
     }
     let t_world = t0.elapsed().as_secs_f64();
     r.route_all();
