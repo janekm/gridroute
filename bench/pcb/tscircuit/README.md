@@ -87,25 +87,25 @@ TSCIRCUIT_AUTOROUTER=... TOPOR_BENCH=... python3 bench/pcb/tscircuit/compare.py 
   tests ask for (`RELAXED_DRC_OPTIONS`). tscircuit's one result is checked against both.
 - **Holes:** they stay as tscircuit gives them, rectangular obstacles on both layers.
 - **Checking:** there is no KiCad board, so `check_layout.py` is the only judge.
-- **Versions:** topor 24faf65 (M3 Max) against tscircuit 0.0.1015 (Node 24). The tweet is from 3 October; 0.0.1015 is
-  the newest version this machine's npm minimum-age policy installs.
+- **Versions:** topor 24faf65 (M3 Max) against tscircuit 0.0.1038 (Node 24), the tscircuit of the table above. The
+  tweet is from 3 October.
 
 | Board | Engine | Time | Nets | Vias | Track mm | Clearance errors at 0.15 mm | at 0.1 mm | Shorts | Tracks under 0.15 mm wide |
 |---|---|---|---|---|---|---|---|---|---|
 | keyboard4 | topor | 0.5 s | 80/80 | 99 | 5838 | 0 | 0 | 0 | 0 |
 | | topor at 0.1 mm | 0.6 s | 80/80 | 111 | 5850 | – | 0 | 0 | 0 |
-| | tscircuit | 16.9 s | 80/80 | 191 | 6397 | 72 | 2 | 1 | 121 |
+| | tscircuit | 12.1 s | 80/80 | 191 | 6400 | 74 | 1 | 0 | 121 |
 | keyboard5 | topor | 0.5 s | 80/80 | 116 | 5608 | 0 | 0 | 0 | 0 |
 | | topor at 0.1 mm | 0.6 s | 80/80 | 115 | 5596 | – | 0 | 0 | 0 |
-| | tscircuit | 17.6 s | 80/80 | 206 | 6161 | 103 | 19 | 1 | 132 |
+| | tscircuit | 12.1 s | 80/80 | 206 | 6164 | 105 | 18 | 0 | 132 |
 
-- **tscircuit's time matches its claim:** 16.9 s here. It reports both boards solved.
-- **The short:** on both boards, tscircuit's `source_net_7` crosses `source_trace_174` on the top layer near
-  (260, 84) mm in model coordinates. No obstacle or connectivity net joins the two; the checker counts it as two
-  overlapping segments, which are keyboard4's two errors at 0.1 mm.
+- **tscircuit's time matches its claim:** 12.1 s on either board. It reports both boards solved.
+- **tscircuit's errors at 0.1 mm:** on each board, a track 0.025 mm from a via. keyboard5 also has 17 segments of one
+  track 0.024–0.048 mm from a 3 mm switch hole.
+- **An older tscircuit shorted two nets:** 0.0.1015 (29 October) crossed `source_net_7` over `source_trace_174` on the
+  top layer of both boards. 0.0.1038 keeps them apart.
 - **Neck-downs:** about a third of tscircuit's tracks are 0.1 mm wide, below the SRJ's own `minTraceWidth`.
-- **keyboard5's other 0.1 mm errors:** 17 segments of one track, 0.024–0.048 mm from a 3 mm switch hole.
-- **topor:** complete and clean at either clearance, in 0.5–0.6 s against tscircuit's 17 s, with about half the
+- **topor:** complete and clean at either clearance, in 0.5–0.6 s against tscircuit's 12 s, with about half the
   vias and 9% less track.
 
-![keyboard4: topor (top), tscircuit (bottom); the short ringed](results/keyboard4-topor-vs-tscircuit.png)
+![keyboard4: topor (top), tscircuit (bottom)](results/keyboard4-topor-vs-tscircuit.png)
