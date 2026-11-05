@@ -31,6 +31,9 @@ pub struct NetInfo {
     /// Signal rise time in ns (`cold_routing.rise_time`, by net or class); 0 for a net that is not high-speed.
     /// A high-speed net's tracks keep off gaps in their reference plane (gaps.rs).
     pub rise: f64,
+    /// Cost of a millimetre of wire per signal layer (1 by default; a length group's `layer_cost` raises it, e.g.
+    /// to keep its long runs off the crowded pad layer and leave room to tune them).
+    pub layer_cost: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +141,27 @@ pub struct Board {
     /// `gap_reflection` of an edge of the net's rise time on a `gap_z0` line.
     pub gap_reflection: f64,
     pub gap_z0: f64,
+    /// Length matching (`cold_routing.length_groups`): nets whose routed lengths must agree within a skew.
+    pub length_groups: Vec<LengthGroup>,
+    /// Meander geometry: edge-to-edge gap between a meander's legs (default the larger of three widths and
+    /// the clearance) and the largest bump height (`meander_gap`, `meander_max_amplitude`; mm).
+    pub meander_gap: Option<f64>,
+    pub meander_max_amp: f64,
+    /// Dogbone nets (`cold_routing.dogbone`: true for every net, or a list of nets): their vias go only right
+    /// beside their own pads, so a wire either stays on its pads' layer or drops at one end and comes back up
+    /// at the other, with no via between. Indexed by net (ribbon nets are not in it).
+    pub dogbone: Vec<bool>,
+}
+
+/// Nets routed to one length: each within `max_skew` of the longest (or of `target`, when that is longer).
+#[derive(Clone, Debug)]
+pub struct LengthGroup {
+    pub name: String,
+    pub nets: Vec<u32>,
+    pub max_skew: f64,
+    pub target: Option<f64>,
+    /// Names given that are not nets of the board.
+    pub unknown: Vec<String>,
 }
 
 fn f(v: &Value) -> f64 {
@@ -232,7 +256,7 @@ impl Board {
                 wmin.push(mn.min(p));
             }
             let id = nets.len() as u32;
-            nets.push(NetInfo { name: name.to_string(), class, plane: plane_of.get(name).cloned(), allowed, wpref, wmin, ribbon: None, via_size: None, rise: 0.0 });
+            nets.push(NetInfo { name: name.to_string(), class, plane: plane_of.get(name).cloned(), allowed, wpref, wmin, ribbon: None, via_size: None, rise: 0.0, layer_cost: vec![1.0; signal.len()] });
             net_index.insert(name.to_string(), id);
             id
         };
@@ -512,7 +536,48 @@ impl Board {
             }
             ref_planes.push(v);
         }
+        let mut length_groups = Vec::new();
+        for (gi, g) in cold["length_groups"].as_array().into_iter().flatten().enumerate() {
+            let (mut ids, mut unknown) = (Vec::new(), Vec::new());
+            for n in g["nets"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+                match net_index.get(n) {
+                    Some(&id) if !ids.contains(&id) => ids.push(id),
+                    Some(_) => {}
+                    None => unknown.push(n.to_string()),
+                }
+            }
+            // {layer: cost of a millimetre} for the group's nets (at least 1)
+            if let Some(lc) = g["layer_cost"].as_object() {
+                for &id in &ids {
+                    for (si, &li) in signal.iter().enumerate() {
+                        if let Some(v) = lc.get(layers[li].as_str()).and_then(|v| v.as_f64()) {
+                            let c = &mut nets[id as usize].layer_cost[si];
+                            *c = c.max(v.max(1.0));
+                        }
+                    }
+                }
+            }
+            length_groups.push(LengthGroup {
+                name: g["name"].as_str().map(String::from).unwrap_or_else(|| format!("group {}", gi + 1)),
+                nets: ids,
+                max_skew: g["max_skew"].as_f64().unwrap_or(0.1).max(0.0),
+                target: g["target"].as_f64(),
+                unknown,
+            });
+        }
+        let dogbone: Vec<bool> = match &cold["dogbone"] {
+            Value::Bool(b) => vec![*b; nets.len()],
+            Value::Array(a) => {
+                let names: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+                nets.iter().map(|ni| names.contains(&ni.name.as_str())).collect()
+            }
+            _ => vec![false; nets.len()],
+        };
         Ok(Board {
+            dogbone,
+            length_groups,
+            meander_gap: cold["meander_gap"].as_f64(),
+            meander_max_amp: cold["meander_max_amplitude"].as_f64().unwrap_or(1.0),
             ref_planes,
             plane_clear,
             plane_min_w,
@@ -607,6 +672,7 @@ impl Board {
                 ribbon: Some((i as u32, j as u32)),
                 via_size: Some((pitch + c.via_d, pitch + c.via_drill)),
                 rise: [a.rise, b.rise].into_iter().filter(|&x| x > 0.0).fold(0.0, |m: f64, x| if m == 0.0 { x } else { m.min(x) }),
+                layer_cost: a.layer_cost.iter().zip(&b.layer_cost).map(|(x, y)| x.max(*y)).collect(),
             };
             let id = self.nets.len() as u32;
             self.net_index.insert(r.name.clone(), id);

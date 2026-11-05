@@ -86,6 +86,8 @@ pub struct Router {
     pub w: World,
     pub cfg: Cfg,
     pub net_pads: Vec<Vec<u32>>,
+    /// Per dogbone net: where its vias may go (right beside its pads, clear of the fixed copper).
+    pub dogbone_spots: Vec<Option<std::sync::Arc<Vec<P2>>>>,
     pub history: Vec<f64>,
     pub log: Vec<String>,
     pub t0: Instant,
@@ -239,7 +241,8 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), drawn_pairs: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default(), gap_rule: true }
+        let dogbone_spots = (0..n).map(|net| if w.b.dogbone.get(net).copied().unwrap_or(false) { Some(std::sync::Arc::new(dogbone_spots(&w, net as u32, &net_pads[net]))) } else { None }).collect();
+        Router { w, cfg, net_pads, dogbone_spots, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), drawn_pairs: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default(), gap_rule: true }
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -398,7 +401,7 @@ impl Router {
             soft: false,
             cross_cost,
             max_exp: (self.cfg.max_exp as f64 * self.budget_scale) as usize,
-            layer_cost: vec![1.0; nl],
+            layer_cost: if ni.layer_cost.len() == nl { ni.layer_cost.clone() } else { vec![1.0; nl] },
             max_len: f64::INFINITY,
             ignore: vec![],
             taboo: HashMap::default(),
@@ -409,6 +412,8 @@ impl Router {
             couple_factor: 0.3,
             ribbon: vec![],
             gap_rule: self.gap_rule,
+            via_spots: self.dogbone_spots.get(net as usize).cloned().flatten(),
+            via_spot_layers: self.net_pads.get(net as usize).map_or(0, |ps| ps.iter().fold(0, |m, &o| m | self.w.objs[o as usize].s.layers)),
         }
     }
 
@@ -2057,7 +2062,11 @@ impl Router {
                 segs.push((labels[k].clone(), labels[k + 1].clone(), "joined already (suggested copper)".into()));
                 continue;
             }
-            match self.route_segment(r, p, n, st[k], st[k + 1]) {
+            // a dogbone pair: no ribbon (its via pair would sit wherever the ribbon changes layer); each member
+            // drops at its own pads' dogbones, the second alongside the first
+            let dogbone = self.w.b.dogbone.get(p as usize).copied().unwrap_or(false) && self.w.b.dogbone.get(n as usize).copied().unwrap_or(false);
+            let res = if dogbone { Err("dogbone vias".to_string()) } else { self.route_segment(r, p, n, st[k], st[k + 1]) };
+            match res {
                 Ok(()) => {
                     if dbg {
                         eprintln!("ribbon {} segment {}: ok", self.w.b.nets[p as usize].name, k);
@@ -4706,4 +4715,31 @@ impl Router {
 /// Total length of the live wires.
 pub fn wire_len(w: &World) -> f64 {
     w.pieces.iter().filter(|p| p.alive).map(|p| p.poly.windows(2).map(|s| s[0].dist(s[1])).sum::<f64>()).sum()
+}
+
+/// Where a dogbone net's vias may go: on rings just outside each of its pads (the via's copper clear of the pad
+/// and out to about a pitch beyond it), wherever a via fits among the fixed copper. In a BGA these are the gaps
+/// between the balls round each of the net's own balls; at a part's edge also the room outside it.
+fn dogbone_spots(w: &World, net: u32, pads: &[u32]) -> Vec<P2> {
+    let rv = w.b.via_size(net).0 / 2.0;
+    let mut out: Vec<P2> = Vec::new();
+    for &o in pads {
+        let s = &w.objs[o as usize].s;
+        if s.layers == (1 << w.nsig()) - 1 {
+            continue; // a through pad is its own via
+        }
+        let ext = s.pts.iter().map(|q| q.dist(s.center)).fold(0.0, f64::max) + s.r;
+        let r0 = ext + rv + 0.02;
+        for k in 0..10 {
+            let r = r0 + 0.04 * k as f64;
+            for a in 0..24 {
+                let an = a as f64 * std::f64::consts::TAU / 24.0;
+                let x = s.center + p2(an.cos(), an.sin()) * r;
+                if w.via_fits(net, x) && !out.iter().any(|y| y.dist(x) < 0.02) {
+                    out.push(x);
+                }
+            }
+        }
+    }
+    out
 }

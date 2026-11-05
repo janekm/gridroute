@@ -166,7 +166,8 @@ impl Router {
         // movable vias: signal and plane vias whose wires all move
         let mut via_node: crate::fx::FxMap<u32, u32> = Default::default();
         for (o, ob) in w.objs.iter().enumerate() {
-            if !ob.alive || ob.s.kind != Kind::Via || pair(ob.s.net) || self.ties.iter().any(|t| t.0 == o as u32 || t.1 == o as u32) {
+            // (a dogbone net's via stays beside its pad)
+            if !ob.alive || ob.s.kind != Kind::Via || pair(ob.s.net) || self.ties.iter().any(|t| t.0 == o as u32 || t.1 == o as u32) || w.b.dogbone.get(ob.s.net as usize).copied().unwrap_or(false) {
                 continue;
             }
             let live: Vec<u32> = w.obj_pieces[o].iter().cloned().filter(|&p| w.pieces[p as usize].alive).collect();
@@ -889,7 +890,7 @@ impl Router {
         if !ob.alive || ob.s.kind != Kind::Via || ob.plane || self.ties.iter().any(|t| t.0 == o || t.1 == o) {
             return None;
         }
-        if self.w.b.partner.get(ob.s.net as usize).map_or(false, |&q| q != NONE) {
+        if self.w.b.partner.get(ob.s.net as usize).map_or(false, |&q| q != NONE) || self.w.b.dogbone.get(ob.s.net as usize).copied().unwrap_or(false) {
             return None;
         }
         let c = ob.s.center;

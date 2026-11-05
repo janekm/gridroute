@@ -96,6 +96,11 @@ pub struct Query {
     pub ribbon: Vec<f64>,
     /// Charge slots in high-speed nets' reference planes (gaps.rs), where the board has such nets.
     pub gap_rule: bool,
+    /// Dogbone nets (`cold_routing.dogbone`): the only places a via may go, right beside the net's own pads,
+    /// and the layers of those pads (bit per signal layer): each of its vias joins a pad layer to one other
+    /// layer, so there is one at each end and no hop between inner layers.
+    pub via_spots: Option<std::sync::Arc<Vec<P2>>>,
+    pub via_spot_layers: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1055,9 +1060,16 @@ impl<'a> Search<'a> {
             return;
         }
         let near_term = n.g < 1.2 || self.h_raw(l, n.pos) < 1.2;
-        let mut pts = self.via_candidates(l, t, n.pos, near_term);
+        let mut pts = match &q.via_spots {
+            // a dogbone net: only its spots beside its pads that lie in this face
+            Some(spots) => {
+                let tr = w.layers[l].cdt.tri_ip(t);
+                spots.iter().cloned().filter(|&x| { let ix = to_ip(x); orient(tr[0], tr[1], ix) > 0 && orient(tr[1], tr[2], ix) > 0 && orient(tr[2], tr[0], ix) > 0 }).collect()
+            }
+            None => self.via_candidates(l, t, n.pos, near_term),
+        };
         let mut paired_vias: Vec<P2> = Vec::new();
-        if q.couple != NONE {
+        if q.couple != NONE && q.via_spots.is_none() {
             let c = &w.b.classes[w.b.nets[q.net as usize].class];
             let pitch = c.via_d + w.b.pair_gap[q.net as usize].max(c.clear) + 0.01;
             let tr2 = w.layers[l].cdt.tri_ip(t);
@@ -1162,6 +1174,10 @@ impl<'a> Search<'a> {
             }
             for l2 in 0..w.nsig() {
                 if other_layers & (1 << l2) == 0 {
+                    continue;
+                }
+                // a dogbone via joins its pads' layer to one other layer
+                if q.via_spots.is_some() && q.via_spot_layers & ((1 << l) | (1 << l2)) == 0 {
                     continue;
                 }
                 let lay2 = &w.layers[l2];

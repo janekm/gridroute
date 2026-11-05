@@ -9,6 +9,7 @@ mod router;
 mod search;
 mod spring;
 mod svg;
+mod tune;
 mod world;
 
 use crate::geom::P2;
@@ -406,6 +407,46 @@ fn main() {
     }
     let t_world = t0.elapsed().as_secs_f64();
     r.route_all();
+    // length matching: serpentines on the finished copper (boards with length groups only)
+    let mut length_json = json!(null);
+    if !r.w.b.length_groups.is_empty() && std::env::var("TOPOR_NO_TUNE").is_err() {
+        let t_tune = Instant::now();
+        let groups = r.match_lengths();
+        r.prof_add("length matching", t_tune);
+        let name = |n: u32| r.w.b.nets[n as usize].name.clone();
+        let mm = |x: Option<f64>| x.map(|v| json!((v * 1e4).round() / 1e4)).unwrap_or(json!(null));
+        for g in &groups {
+            eprintln!(
+                "length group {}: skew {:.3} -> {:.3} mm (max {:.3}), target {:.3} mm, {}{}",
+                g.name,
+                g.skew_before,
+                g.skew_after,
+                g.max_skew,
+                g.target,
+                if g.met { "met" } else { "NOT met" },
+                if g.unknown.is_empty() { String::new() } else { format!("; not nets of the board: {}", g.unknown.join(", ")) }
+            );
+            for n in g.nets.iter().filter(|n| n.bumps > 0 || n.note.is_some()) {
+                eprintln!(
+                    "  {}: {} -> {} mm, {} bumps{}",
+                    name(n.net),
+                    n.before.map_or("-".into(), |v| format!("{:.3}", v)),
+                    n.after.map_or("-".into(), |v| format!("{:.3}", v)),
+                    n.bumps,
+                    n.note.as_ref().map_or(String::new(), |s| format!(" ({})", s))
+                );
+            }
+        }
+        length_json = json!(groups
+            .iter()
+            .map(|g| json!({
+                "name": g.name, "max_skew_mm": g.max_skew, "target_mm": (g.target * 1e4).round() / 1e4,
+                "skew_before_mm": (g.skew_before * 1e4).round() / 1e4, "skew_after_mm": (g.skew_after * 1e4).round() / 1e4,
+                "met": g.met, "not_nets": g.unknown,
+                "nets": g.nets.iter().map(|n| json!({"net": name(n.net), "before_mm": mm(n.before), "after_mm": mm(n.after), "bumps": n.bumps, "note": n.note})).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>());
+    }
     let secs = t0.elapsed().as_secs_f64();
     let t_check = Instant::now();
     let viol = r.w.check_all();
@@ -614,6 +655,7 @@ fn main() {
             "phase_seconds": r.prof.iter().map(|(k, v)| (k.to_string(), json!({"seconds": v.0, "calls": v.1}))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "neck_stubs": r.w.b.necks.iter().map(|n| json!({"pad": n.pad, "net": r.w.b.nets[n.net as usize].name, "width": n.width, "length": n.from.dist(n.to)})).collect::<Vec<_>>(), "neck_failed": r.w.b.neck_failed, "missing": missing,
             "pairs": pair_json,
+            "length_groups": length_json,
             "plane_gaps": plane_gaps,
             "events": r.events,
             "rf_nets_single_layer": r.w.b.rf_nets.iter().map(|x| x.1.clone()).collect::<Vec<_>>(),
