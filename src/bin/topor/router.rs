@@ -144,6 +144,9 @@ pub struct Router {
     pub legacy_pairs: bool,
     /// Wall time and calls per phase of the run (the attempt that is kept), for the time report.
     pub prof: std::collections::BTreeMap<&'static str, (f64, usize)>,
+    /// High-speed nets keep off gaps in their reference planes (gaps.rs); off for the attempts that route
+    /// the board without the rule, to compare (see route_all).
+    pub gap_rule: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -236,7 +239,7 @@ impl Router {
             }
         }
         let n = w.b.nets.len();
-        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), drawn_pairs: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default() }
+        Router { w, cfg, net_pads, history: vec![0.0; n], log: Vec::new(), t0: Instant::now(), stats: Stats::default(), dumps: 0, last_viol: None, last_exp: 0, ties, junctions: Vec::new(), split_wide: true, protect_pairs: false, pair_len: Vec::new(), relax_pairs: false, pair_diag: HashMap::default(), events: Vec::new(), round: -1, budget_scale: 1.0, stop: None, tri_hist: std::sync::Arc::new(HashMap::default()), hurry: None, soft_dead: Default::default(), suggested: Default::default(), suggested_nets: Default::default(), drawn_pairs: Default::default(), pair_coupled: Vec::new(), merge_stations: true, legacy_pairs: false, prof: Default::default(), gap_rule: true }
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -405,7 +408,17 @@ impl Router {
             couple: NONE,
             couple_factor: 0.3,
             ribbon: vec![],
+            gap_rule: self.gap_rule,
         }
+    }
+
+    /// High-speed wires (as routed) crossing a slot in a reference plane past their net's limit.
+    pub fn gap_violations(&self) -> usize {
+        if !crate::gaps::active(&self.w) {
+            return 0;
+        }
+        let tracks: Vec<(u32, usize, f64, Vec<P2>)> = self.w.pieces.iter().filter(|p| p.alive && p.poly.len() >= 2 && self.w.b.high_speed(p.net)).map(|p| (p.net, p.layer as usize, p.width, p.poly.clone())).collect();
+        crate::gaps::Gaps::new(&self.w).report(&tracks).iter().filter(|c| c.violation()).count()
     }
 
     pub fn search(&mut self, q: &Query) -> Option<PathOut> {
@@ -3269,32 +3282,49 @@ impl Router {
         // member stubs that may end the lane earlier, rip-up charged for lost coupling) and as before, at once;
         // the routing attempts then run on both, the new ones first, and the board keeps whichever comes out more
         // complete: the coupling never costs a connection (TOPOR_NOSPLITPAIRS: the new ones alone)
+        // likewise, on a board with high-speed nets, the board is also routed without the plane gap rule: the rule
+        // never costs a connection either (TOPOR_GAP_ONLY: with the rule alone)
         let mut split_pairs: Option<Router> = None;
+        let mut no_gap: Option<Router> = None;
+        let mut split_no_gap: Option<Router> = None;
         {
             let _t = Instant::now();
             let pairs = !self.cfg.fast && !self.cfg.single_attempt && std::env::var("TOPOR_NOSPLITPAIRS").is_err() && (0..nn).any(|p| {
                 let n = self.w.b.partner.get(p as usize).cloned().unwrap_or(NONE);
                 n != NONE && p < n && self.pair_stations_with(p, n, false).len() >= 2
             });
-            if pairs {
-                let mut other = self.clone();
-                other.merge_stations = false;
-                other.legacy_pairs = true;
-                other.w.b.ribbon_touch = false;
-                other.cfg.verbose = false;
-                split_pairs = std::thread::scope(|sc| {
-                    let h = sc.spawn(move || {
-                        other.route_pairs();
-                        other
-                    });
-                    self.route_pairs();
-                    Some(h.join().expect("pairs routed as before"))
-                });
+            let gap_alt = !self.cfg.fast && !self.cfg.single_attempt && self.gap_rule && crate::gaps::active(&self.w) && std::env::var("TOPOR_GAP_ONLY").is_err();
+            let mut other = if pairs {
+                let mut o = self.clone();
+                o.merge_stations = false;
+                o.legacy_pairs = true;
+                o.w.b.ribbon_touch = false;
+                o.cfg.verbose = false;
+                Some(o)
             } else {
+                None
+            };
+            let off = |r: &Router| {
+                let mut o = r.clone();
+                o.gap_rule = false;
+                o.cfg.verbose = false;
+                o
+            };
+            let mut ng = if gap_alt { Some(off(self)) } else { None };
+            let mut sng = if gap_alt { other.as_ref().map(off) } else { None };
+            std::thread::scope(|sc| {
+                let spawn = |r: Option<Router>| r.map(|mut o| sc.spawn(move || {
+                    o.route_pairs();
+                    o
+                }));
+                let (h1, h2, h3) = (spawn(other.take()), spawn(ng.take()), spawn(sng.take()));
                 self.route_pairs();
-            }
+                split_pairs = h1.map(|h| h.join().expect("pairs routed as before"));
+                no_gap = h2.map(|h| h.join().expect("pairs routed without the gap rule"));
+                split_no_gap = h3.map(|h| h.join().expect("pairs routed as before, without the gap rule"));
+            });
             self.update_pair_coupling();
-            if let Some(o) = split_pairs.as_mut() {
+            for o in split_pairs.iter_mut().chain(no_gap.iter_mut()).chain(split_no_gap.iter_mut()) {
                 o.update_pair_coupling();
             }
             self.prof_add("pairs", _t);
@@ -3319,18 +3349,26 @@ impl Router {
             self.route_rest(fan, long, esc);
         } else if std::env::var("TOPOR_FANOUT").is_ok() {
             self.route_rest(true, false, false);
-        } else if (self.cfg.single_attempt || variants.len() == 1) && split_pairs.is_none() {
+        } else if (self.cfg.single_attempt || variants.len() == 1) && split_pairs.is_none() && no_gap.is_none() {
             self.route_rest(false, false, false);
         } else {
-            // the orders on these pairs, then (if they were routed so too) on the pairs routed as before
-            let mut atts: Vec<(bool, (bool, bool, bool))> = variants.iter().map(|&v| (false, v)).collect();
-            if split_pairs.is_some() {
-                atts.extend(variants.iter().map(|&v| (true, v)));
+            // the orders on these pairs, then (if they were routed so too) on the pairs routed as before, and on both
+            // routed without the gap rule (0: these, 1: as before, 2 and 3: the same without the gap rule)
+            let mut atts: Vec<(u8, (bool, bool, bool))> = variants.iter().map(|&v| (0, v)).collect();
+            for (k, r) in [(1u8, &split_pairs), (2, &no_gap), (3, &split_no_gap)] {
+                if r.is_some() {
+                    atts.extend(variants.iter().map(|&v| (k, v)));
+                }
             }
             let stops: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> = atts.iter().map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
             let mut others: Vec<Router> = (1..atts.len())
                 .map(|k| {
-                    let mut o = if atts[k].0 { split_pairs.as_ref().unwrap().clone() } else { self.clone() };
+                    let mut o = match atts[k].0 {
+                        1 => split_pairs.as_ref().unwrap().clone(),
+                        2 => no_gap.as_ref().unwrap().clone(),
+                        3 => split_no_gap.as_ref().unwrap().clone(),
+                        _ => self.clone(),
+                    };
                     o.cfg.verbose = false;
                     o.stop = Some(stops[k].clone());
                     o
@@ -3338,7 +3376,8 @@ impl Router {
                 .collect();
             // a complete board calls off the later attempts on the same pairs (the other pairs still finish, to
             // compare their coupling)
-            let group_end = |k: usize| if k < variants.len() { variants.len() } else { atts.len() };
+            let nv = variants.len();
+            let group_end = |k: usize| (k / nv + 1) * nv;
             let call_off_after = |k: usize, stops: &[std::sync::Arc<std::sync::atomic::AtomicBool>]| {
                 for s in &stops[k + 1..group_end(k)] {
                     s.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3429,19 +3468,24 @@ impl Router {
                     (false, true, _) => "long nets first",
                     (true, true, _) => "fan-out first, then long nets first",
                 };
-                if atts[k].0 {
-                    format!("{} (pairs as before)", order)
-                } else {
-                    order.to_string()
+                match atts[k].0 {
+                    1 => format!("{} (pairs as before)", order),
+                    2 => format!("{} (gap rule off)", order),
+                    3 => format!("{} (pairs as before, gap rule off)", order),
+                    _ => order.to_string(),
                 }
             };
-            // the most complete board wins; between equally complete ones, the one with the most coupled length less
-            // the pairs' skews (a member's detour costs what it is longer than its partner)
+            // the most complete board wins; between equally complete ones, the one with fewer high-speed wires over
+            // slots past their limit (boards with such nets), then the one with the most coupled length less the
+            // pairs' skews (a member's detour costs what it is longer than its partner)
             let coupled_len = |r: &Router| -> f64 { r.pair_report().iter().map(|x| if x.2.is_finite() && x.3.is_finite() { x.4 * x.2.min(x.3) - (x.2 - x.3).abs() } else { 0.0 }).sum() };
+            let gaps_on = crate::gaps::active(&self.w);
+            let gap_note = |g: usize| if gaps_on { format!(", {} past the gap limit", g) } else { String::new() };
             let first = self.total_deficit();
             let first_c = coupled_len(self);
-            let mut best: Option<(usize, usize, f64)> = None;
-            let mut summary = vec![format!("{}: deficit {}, {:.0} mm coupled less skew (done at {:.1}s)", name(0), first, first_c, at0)];
+            let first_g = self.gap_violations();
+            let mut best: Option<(usize, usize, usize, f64)> = None;
+            let mut summary = vec![format!("{}: deficit {}{}, {:.0} mm coupled less skew (done at {:.1}s)", name(0), first, gap_note(first_g), first_c, at0)];
             for (k, o, at, off) in &done {
                 if *off {
                     summary.push(format!("{}: called off (at {:.1}s)", name(*k), at));
@@ -3449,16 +3493,17 @@ impl Router {
                 }
                 let d = o.total_deficit();
                 let c = coupled_len(o);
-                summary.push(format!("{}: deficit {}, {:.0} mm coupled less skew (done at {:.1}s)", name(*k), d, c, at));
-                let (bd, bc) = best.map_or((first, first_c), |b| (b.1, b.2));
-                if d < bd || (d == bd && c > bc + 1e-6) {
-                    best = Some((*k, d, c));
+                let g = o.gap_violations();
+                summary.push(format!("{}: deficit {}{}, {:.0} mm coupled less skew (done at {:.1}s)", name(*k), d, gap_note(g), c, at));
+                let (bd, bg, bc) = best.map_or((first, first_g, first_c), |b| (b.1, b.2, b.3));
+                if d < bd || (d == bd && (g < bg || (g == bg && c > bc + 1e-6))) {
+                    best = Some((*k, d, g, c));
                 }
             }
             if self.cfg.verbose {
                 eprintln!("[{:.1}s] {}{}", self.elapsed(), summary.join("; "), if hurried { " (the slower ones wrapped up after their grace)" } else { "" });
             }
-            if let Some((k, d, _)) = best {
+            if let Some((k, d, _, _)) = best {
                 let mut o = done.into_iter().find(|x| x.0 == k).unwrap().1;
                 o.cfg.verbose = self.cfg.verbose;
                 o.stop = None;

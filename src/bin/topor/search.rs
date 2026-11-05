@@ -94,6 +94,8 @@ pub struct Query {
     pub couple_factor: f64,
     /// Width to reserve (per layer) away from the terminals, so a partner fits alongside; 0 = none.
     pub ribbon: Vec<f64>,
+    /// Charge slots in high-speed nets' reference planes (gaps.rs), where the board has such nets.
+    pub gap_rule: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -155,6 +157,11 @@ pub struct Search<'a> {
     spts: Vec<P2>,
     partner_vias: Vec<P2>,
     pub expansions: usize,
+    /// Plane gap rule (boards with high-speed nets): costs of slots crossed or closed; whether this net keeps
+    /// off them, and the nets whose copper is its own.
+    gaps: Option<crate::gaps::Gaps<'a>>,
+    gap_hs: bool,
+    gap_own: Vec<u32>,
 }
 
 fn nx(i: usize) -> usize {
@@ -233,6 +240,9 @@ impl<'a> Search<'a> {
             partner_vias,
             trace: std::env::var("TOPOR_SEARCHTRACE").is_ok(),
             expansions: 0,
+            gaps: if q.gap_rule && crate::gaps::active(w) { Some(crate::gaps::Gaps::new(w)) } else { None },
+            gap_hs: w.b.high_speed(q.net),
+            gap_own: crate::gaps::own_of(w, q.net),
         }
     }
 
@@ -987,7 +997,13 @@ impl<'a> Search<'a> {
                 let ntr = layer.cdt.tris[nt as usize];
                 let nk = ntr.e.iter().position(|&x| x == e2).unwrap();
                 let ngap = nc - g;
-                let pen = q.taboo.get(&(l as u8, nt)).cloned().unwrap_or(0.0) + q.history.get(&(l as u8, nt)).cloned().unwrap_or(0.0);
+                let mut pen = q.taboo.get(&(l as u8, nt)).cloned().unwrap_or(0.0) + q.history.get(&(l as u8, nt)).cloned().unwrap_or(0.0);
+                if self.gap_hs {
+                    if let Some(gs) = &self.gaps {
+                        pen += gs.edge_cost(q.net, &self.gap_own, l, layer.vobj[ed.a as usize], layer.vobj[ed.b as usize], pos, pos - n.pos);
+                        pen += gs.area_cost(q.net, l, n.pos, pos);
+                    }
+                }
                 let step = if g == coupled_gap { q.couple_factor } else { 1.0 };
                 let gg = n.g + n.pos.dist(pos) * q.layer_cost[l] * step + ccost + extra + pen;
                 let vic = self.add_victims(&vics);
@@ -1130,7 +1146,8 @@ impl<'a> Search<'a> {
                 }
             }
             let vcost = if paired_vias.iter().any(|&y| y.dist(x) < 1e-9) { q.via_cost * q.couple_factor } else { q.via_cost };
-            let base = n.g + n.pos.dist(x) * q.layer_cost[l] + vcost + vc;
+            let gvc = self.gaps.as_ref().map_or(0.0, |gs| gs.via_cost(q.net, x));
+            let base = n.g + n.pos.dist(x) * q.layer_cost[l] + vcost + vc + gvc;
             let vic = self.add_victims(&vics);
             let nvic = vics.len() as u16;
             if q.plane_goal {

@@ -28,6 +28,9 @@ pub struct NetInfo {
     pub ribbon: Option<(u32, u32)>,
     /// Via (diameter, drill) overriding the class (ribbon nets use one wide via for the via pair).
     pub via_size: Option<(f64, f64)>,
+    /// Signal rise time in ns (`cold_routing.rise_time`, by net or class); 0 for a net that is not high-speed.
+    /// A high-speed net's tracks keep off gaps in their reference plane (gaps.rs).
+    pub rise: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +127,17 @@ pub struct Board {
     pub ribbon_touch: bool,
     /// Ribbon net of each pair member (NONE if none).
     pub ribbon_of: Vec<u32>,
+    /// Reference planes (indices into `layers`) of each signal layer: the nearest plane layer on each side
+    /// with no signal layer between, else the nearest plane layer (`cold_routing.reference_planes` overrides).
+    pub ref_planes: Vec<Vec<usize>>,
+    /// Pour clearance per layer (`cold_routing.plane_clearance`; 0: the other copper's class clearance) and the
+    /// pour's least web width (`plane_min_width`; KiCad's zone minimum width, 0.25 mm by default).
+    pub plane_clear: Vec<f64>,
+    pub plane_min_w: Vec<f64>,
+    /// Gap rule: a slot crossing is allowed while its inductance (Johnson, 5 D ln(D/W) nH) reflects at most
+    /// `gap_reflection` of an edge of the net's rise time on a `gap_z0` line.
+    pub gap_reflection: f64,
+    pub gap_z0: f64,
 }
 
 fn f(v: &Value) -> f64 {
@@ -218,7 +232,7 @@ impl Board {
                 wmin.push(mn.min(p));
             }
             let id = nets.len() as u32;
-            nets.push(NetInfo { name: name.to_string(), class, plane: plane_of.get(name).cloned(), allowed, wpref, wmin, ribbon: None, via_size: None });
+            nets.push(NetInfo { name: name.to_string(), class, plane: plane_of.get(name).cloned(), allowed, wpref, wmin, ribbon: None, via_size: None, rise: 0.0 });
             net_index.insert(name.to_string(), id);
             id
         };
@@ -467,7 +481,43 @@ impl Board {
                 rf_nets.push((id, format!("{} on {} ({})", name, ln, r["why"].as_str().unwrap_or(""))));
             }
         }
+        // high-speed nets by rise time: a net's own entry wins over its class
+        if let Some(rt) = cold["rise_time"].as_object() {
+            for ni in nets.iter_mut() {
+                let v = rt.get(&ni.name).or_else(|| rt.get(&classes[ni.class].name)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                ni.rise = v.max(0.0);
+            }
+        }
+        // per-layer value: one number for every layer or {layer: value}
+        let per_layer = |v: &Value, d: f64| -> Vec<f64> {
+            layers.iter().map(|l| v.as_f64().or_else(|| v[l.as_str()].as_f64()).unwrap_or(d)).collect()
+        };
+        let plane_clear = per_layer(&cold["plane_clearance"], 0.0);
+        let plane_min_w = per_layer(&cold["plane_min_width"], 0.25);
+        let mut ref_planes: Vec<Vec<usize>> = Vec::new();
+        for &li in &signal {
+            let mut v: Vec<usize> = Vec::new();
+            if let Some(list) = cold["reference_planes"][layers[li].as_str()].as_array() {
+                v = list.iter().filter_map(|x| layers.iter().position(|l| Some(l.as_str()) == x.as_str())).filter(|i| plane_layers.contains(i)).collect();
+            } else {
+                // adjacent plane layers above and below (no signal layer between)
+                let up = (0..li).rev().take_while(|i| plane_layers.contains(i)).next();
+                let down = (li + 1..layers.len()).take_while(|i| plane_layers.contains(i)).next();
+                v.extend(up.into_iter().chain(down));
+                if v.is_empty() {
+                    if let Some(&p) = plane_layers.iter().min_by_key(|&&p| ((p as i64 - li as i64).abs(), p)) {
+                        v.push(p);
+                    }
+                }
+            }
+            ref_planes.push(v);
+        }
         Ok(Board {
+            ref_planes,
+            plane_clear,
+            plane_min_w,
+            gap_reflection: cold["gap_reflection"].as_f64().unwrap_or(0.05),
+            gap_z0: cold["gap_z0"].as_f64().unwrap_or(50.0),
             necks,
             neck_failed,
             neck_width,
@@ -556,6 +606,7 @@ impl Board {
                 wmin,
                 ribbon: Some((i as u32, j as u32)),
                 via_size: Some((pitch + c.via_d, pitch + c.via_drill)),
+                rise: [a.rise, b.rise].into_iter().filter(|&x| x > 0.0).fold(0.0, |m: f64, x| if m == 0.0 { x } else { m.min(x) }),
             };
             let id = self.nets.len() as u32;
             self.net_index.insert(r.name.clone(), id);
@@ -622,6 +673,37 @@ impl Board {
         let c = self.nets[net as usize].class;
         let t = if self.track_clear_exempt[c] { 0.0 } else { self.track_clear.get(l).cloned().unwrap_or(0.0) };
         self.classes[c].clear.max(t)
+    }
+    /// Whether a net keeps off gaps in its reference planes (it has a rise time).
+    pub fn high_speed(&self, net: u32) -> bool {
+        self.nets.get(net as usize).map_or(false, |n| n.rise > 0.0)
+    }
+    /// Longest slot (mm) a high-speed net's track on signal layer `l` may cross: Johnson's slot inductance
+    /// L = 5 D ln(D/W) nH (D, W in inches; W the track width) reflects L / (2 Z0 tr) of an edge, kept at most
+    /// `gap_reflection`. Infinite for a net that is not high-speed.
+    pub fn gap_limit(&self, net: u32, l: usize) -> f64 {
+        let ni = &self.nets[net as usize];
+        if ni.rise <= 0.0 {
+            return f64::INFINITY;
+        }
+        // a ribbon's members carry the signal: their own width
+        let w = match ni.ribbon {
+            Some((p, _)) => self.nets[p as usize].wpref[l],
+            None => ni.wpref[l],
+        }
+        .max(0.01);
+        // D ln(D/W) = L_max (nH) * 25.4 / 5, with L_max = 2 Z0 tr reflection (ohm ns = nH)
+        let k = 2.0 * self.gap_z0 * ni.rise * self.gap_reflection * 25.4 / 5.0;
+        let (mut lo, mut hi) = (w, 1000.0);
+        for _ in 0..60 {
+            let m = 0.5 * (lo + hi);
+            if m * (m / w).ln() > k {
+                hi = m;
+            } else {
+                lo = m;
+            }
+        }
+        lo
     }
 }
 

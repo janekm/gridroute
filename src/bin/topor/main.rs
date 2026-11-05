@@ -2,6 +2,7 @@
 mod cdt;
 mod funnel;
 mod fx;
+mod gaps;
 mod geom;
 mod model;
 mod router;
@@ -192,6 +193,73 @@ fn layout_json(r: &router::Router) -> serde_json::Value {
         tracks.push(json!({"net": w.b.nets[nk.net as usize].name, "layer": w.b.sig_name(nk.layer), "width": nk.width, "pts": [[nk.from.x, nk.from.y], [nk.to.x, nk.to.y]]}));
     }
     json!({"outline": w.b.size, "parts": {}, "tracks": tracks, "vias": vias, "zones": [], "keepouts": [], "keepouts_rule": [], "texts": [], "rects": [], "labels": []})
+}
+
+/// High-speed tracks over gaps in their reference planes, measured on the copper as exported (`layout`), with
+/// a summary on stderr. Null on a board without high-speed nets.
+fn plane_gap_report(r: &router::Router, layout: &serde_json::Value) -> serde_json::Value {
+    let w = &r.w;
+    if !gaps::active(w) {
+        return json!(null);
+    }
+    let g = gaps::Gaps::new(w);
+    let sig = |name: &str| (0..w.b.nsig()).find(|&l| w.b.sig_name(l) == name);
+    let mut tracks = Vec::new();
+    for t in layout["tracks"].as_array().into_iter().flatten() {
+        let (Some(&net), Some(l)) = (t["net"].as_str().and_then(|n| w.b.net_index.get(n)), t["layer"].as_str().and_then(sig)) else { continue };
+        if !w.b.high_speed(net) {
+            continue;
+        }
+        let pts: Vec<P2> = t["pts"].as_array().into_iter().flatten().map(|q| P2 { x: q[0].as_f64().unwrap_or(0.0), y: q[1].as_f64().unwrap_or(0.0) }).collect();
+        tracks.push((net, l, t["width"].as_f64().unwrap_or(0.0), pts));
+    }
+    let cr = g.report(&tracks);
+    let lname = |p: usize| w.b.layers[p].clone();
+    let num = |x: f64| if x.is_finite() { json!((x * 1000.0).round() / 1000.0) } else { json!(null) };
+    let mut hs: Vec<u32> = (0..w.b.nets.len() as u32).filter(|&n| w.b.high_speed(n) && w.b.nets[n as usize].ribbon.is_none()).collect();
+    hs.sort_by(|a, b| w.b.nets[*a as usize].name.cmp(&w.b.nets[*b as usize].name));
+    let mut nets_json = Vec::new();
+    for &n in &hs {
+        let mine: Vec<&gaps::Crossing> = cr.iter().filter(|c| c.net == n && c.spans()).collect();
+        let grazed: f64 = cr.iter().filter(|c| c.net == n && !c.spans()).fold(0.0, |s, c| s + c.over);
+        let ni = &w.b.nets[n as usize];
+        let limits: serde_json::Map<String, serde_json::Value> = (0..w.b.nsig()).filter(|&l| ni.allowed & (1 << l) != 0 && !w.b.ref_planes[l].is_empty()).map(|l| (w.b.sig_name(l).to_string(), num(w.b.gap_limit(n, l)))).collect();
+        nets_json.push(json!({
+            "net": ni.name, "rise_time_ns": ni.rise, "slot_limit_mm": limits, "crossings": mine.len(),
+            "over_gap_mm": num(mine.iter().fold(0.0, |s, c| s + c.over)), "violations": mine.iter().filter(|c| c.violation()).count(),
+            "over_void_edge_mm": num(grazed),
+        }));
+    }
+    let viol: Vec<&gaps::Crossing> = cr.iter().filter(|c| c.violation()).collect();
+    let spans: Vec<&gaps::Crossing> = cr.iter().filter(|c| c.spans()).collect();
+    let grazed: f64 = cr.iter().filter(|c| !c.spans()).fold(0.0, |s, c| s + c.over);
+    eprintln!("plane gaps: {} high-speed nets, {} crossings of a gap in their reference plane, {} past the rise-time limit ({:.2} mm over the edge of a via's or pad's clearance){}", hs.len(), spans.len(), viol.len(), grazed, if r.gap_rule { "" } else { "; the board routed without the gap rule completed better, so it was kept" });
+    for c in viol.iter().take(40) {
+        let slot = if c.slot.is_finite() { format!("{:.2} mm slot", c.slot) } else { "plane cut off".to_string() };
+        eprintln!("  gap: {} on {} over {} at ({:.2},{:.2}): {}, {:.2} mm over the void, limit {:.2} mm; {}", w.b.nets[c.net as usize].name, w.b.sig_name(c.layer), lname(c.plane), c.at.x, c.at.y, slot, c.over, c.limit, c.by.join(", "));
+    }
+    let mut planes = serde_json::Map::new();
+    let mut ps: Vec<usize> = w.b.ref_planes.iter().flatten().cloned().collect();
+    ps.sort();
+    ps.dedup();
+    for p in ps {
+        let nets: Vec<String> = w.b.nets.iter().filter(|n| n.plane == Some(p)).map(|n| n.name.clone()).chain(w.b.plane_regions.iter().filter(|x| x.layer == p).map(|x| w.b.nets[x.net as usize].name.clone())).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        planes.insert(lname(p), json!({"nets": nets, "clearance": if w.b.plane_clear[p] > 0.0 { json!(w.b.plane_clear[p]) } else { json!("class clearance") }, "min_width": w.b.plane_min_w[p]}));
+    }
+    json!({
+        "rule": format!("a high-speed track may cross a slot in its reference plane while the slot's inductance, 5 D ln(D/W) nH (Johnson; D the slot across the track, twice the void's reach on its shorter side, W the track width), reflects at most {:.0}% of an edge of the net's rise time on a {:.0} ohm line; a run along a void counts by its length", w.b.gap_reflection * 100.0, w.b.gap_z0),
+        "planes": planes,
+        "references": (0..w.b.nsig()).map(|l| (w.b.sig_name(l).to_string(), json!(w.b.ref_planes[l].iter().map(|&p| lname(p)).collect::<Vec<_>>()))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "rule_applied": r.gap_rule,
+        "violations": viol.len(),
+        "crossings_spanning_track": spans.len(),
+        "over_void_edge_mm": num(grazed),
+        "nets": nets_json,
+        "crossings": spans.iter().map(|c| json!({
+            "net": w.b.nets[c.net as usize].name, "layer": w.b.sig_name(c.layer), "plane": lname(c.plane), "at": [num(c.at.x), num(c.at.y)],
+            "over_mm": num(c.over), "slot_mm": num(c.slot), "cuts_plane_off": !c.slot.is_finite(), "limit_mm": num(c.limit), "violation": c.violation(), "made_by": c.by,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn main() {
@@ -509,12 +577,21 @@ fn main() {
             eprintln!("  log: {}", l);
         }
     }
+    let mut layout = layout_json(&r);
+    layout["tracks"].as_array_mut().unwrap().extend(kept_fixed.0.iter().cloned());
+    layout["vias"].as_array_mut().unwrap().extend(kept_fixed.1.iter().cloned());
+    let t_gap = Instant::now();
+    let plane_gaps = plane_gap_report(&r, &layout);
+    if !plane_gaps.is_null() {
+        eprintln!("  plane gap check {:.2}s", t_gap.elapsed().as_secs_f64());
+        if std::env::var("TOPOR_GAPDBG").is_ok() {
+            let c: Vec<usize> = gaps::CHARGED.iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed)).collect();
+            eprintln!("  gap costs charged in the search (all attempts): {} slots crossed, {} area voids, {} slots closed by a via", c[0], c[1], c[2]);
+        }
+    }
     if let Some(out) = arg(&args, "--out") {
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
-        let mut layout = layout_json(&r);
-        layout["tracks"].as_array_mut().unwrap().extend(kept_fixed.0.iter().cloned());
-        layout["vias"].as_array_mut().unwrap().extend(kept_fixed.1.iter().cloned());
         std::fs::write(out.join("layout.json"), serde_json::to_string(&layout).unwrap()).unwrap();
         // incomplete nets with their separate pad groups (where the gap is)
         let missing: Vec<serde_json::Value> = incomplete
@@ -537,6 +614,7 @@ fn main() {
             "phase_seconds": r.prof.iter().map(|(k, v)| (k.to_string(), json!({"seconds": v.0, "calls": v.1}))).collect::<serde_json::Map<String, serde_json::Value>>(),
             "neck_stubs": r.w.b.necks.iter().map(|n| json!({"pad": n.pad, "net": r.w.b.nets[n.net as usize].name, "width": n.width, "length": n.from.dist(n.to)})).collect::<Vec<_>>(), "neck_failed": r.w.b.neck_failed, "missing": missing,
             "pairs": pair_json,
+            "plane_gaps": plane_gaps,
             "events": r.events,
             "rf_nets_single_layer": r.w.b.rf_nets.iter().map(|x| x.1.clone()).collect::<Vec<_>>(),
             "stats": format!("{:?}", r.stats),
