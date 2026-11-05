@@ -2045,7 +2045,11 @@ impl World {
     {
         let blocked = cavity.iter().any(|&t| self.layers[l].tflag[t as usize] & T_BLOCK != 0);
         let flag = if blocked { T_BLOCK } else { 0 };
-        let incav = |w: &World, t: u32| cavity.contains(&t) && w.layers[l].tflag[t as usize] & T_BLOCK == 0;
+        // every cavity triangle a wire passes through is re-threaded, blocked or not: the change kills every
+        // crossing on the edges it removes, so a wire left out would keep crossings its edges no longer list. A wire
+        // can pass through a blocked triangle: a cavity that held one makes all its new triangles blocked (below),
+        // free space included, and the wires through it are threaded into them
+        let incav = |t: u32| cavity.contains(&t);
         // affected pieces
         let mut aff: Vec<u32> = Vec::new();
         let mut cav_verts: Vec<u32> = Vec::new();
@@ -2102,9 +2106,9 @@ impl World {
             }
             let mut j = 0;
             while j <= n {
-                if tris[j] != NONE && incav(self, tris[j]) {
+                if tris[j] != NONE && incav(tris[j]) {
                     let j0 = j;
-                    while j <= n && tris[j] != NONE && incav(self, tris[j]) {
+                    while j <= n && tris[j] != NONE && incav(tris[j]) {
                         j += 1;
                     }
                     let j1 = j - 1;
