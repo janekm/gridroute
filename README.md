@@ -108,6 +108,13 @@ What mattered was elsewhere. For example, `connect()` used to ask, pad by pad, w
 
 A corpus is a directory of `.npz` instances: `blk`, `vok` and `tgt` bit-packed, plus `shape`, `src`, `mcost`, `lay_ok`, `par` = (vcost, turn, hmul), `max_exp`, and the recorded `path`. Record one by wrapping `gridroute.astar` in a router run and saving its arguments.
 
+## Field solver
+
+`fieldsolve` (`src/bin/fieldsolve/`) is a 3-D FDTD field solver for the boards this flow produces. It reads KiCad
+Gerbers, runs on Metal or the CPU, and gives port impedance, S-parameters, decoupling-loop inductance and field
+snapshots for ParaView and Blender. It is cross-checked against closed-form cases and openEMS. See
+[docs/fieldsolve.md](docs/fieldsolve.md).
+
 ## License
 
 MIT; see [LICENSE](LICENSE).

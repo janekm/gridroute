@@ -1,0 +1,636 @@
+//! Voxel model: turns a layered layout (copper sheets, dielectric slabs, via barrels, board outline) and
+//! lumped elements into per-edge FDTD update coefficients on a [`Grid`].
+//!
+//! Conventions (as in openEMS PCB models): copper is a zero-thickness perfect conductor on the mesh plane
+//! of its layer; an in-plane E edge is metal when its midpoint lies in copper. A via barrel is a solid
+//! perfect-conductor column (z edges at nodes within its radius). Dielectric fills cells whose centre lies
+//! inside the board outline. Lumped elements (ports, resistors, capacitors) occupy a box of edges along one
+//! axis: `k` edges in series by `m` in parallel, each edge carrying `R m / k` and `C k / m`.
+
+use crate::geom::{BBox, P2, Prim, Shape};
+use crate::mesh::{range_in, snap, Grid};
+
+pub const C0: f64 = 299_792_458.0;
+pub const MU0: f64 = 1.256_637_062_12e-6;
+pub const EPS0: f64 = 8.854_187_812_8e-12;
+pub const ETA0: f64 = 376.730_313_668;
+
+/// Copper on one layer at height `z` (mm).
+#[derive(Clone, Debug)]
+pub struct Sheet {
+    pub name: String,
+    pub z: f64,
+    pub prims: Vec<Prim>,
+}
+
+/// A dielectric layer between `z0` and `z1` (mm).
+#[derive(Clone, Copy, Debug)]
+pub struct Slab {
+    pub z0: f64,
+    pub z1: f64,
+    pub eps: f64,
+    pub tand: f64,
+}
+
+/// A plated barrel (via or pin) between `z0` and `z1` (mm).
+#[derive(Clone, Copy, Debug)]
+pub struct Barrel {
+    pub c: P2,
+    pub r: f64,
+    pub z0: f64,
+    pub z1: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Layout {
+    pub sheets: Vec<Sheet>,
+    pub slabs: Vec<Slab>,
+    pub barrels: Vec<Barrel>,
+    /// Board outline loops (even-odd); empty means dielectric everywhere in x/y.
+    pub outline: Vec<Vec<P2>>,
+}
+
+impl Layout {
+    pub fn sheet(&self, name: &str) -> Option<&Sheet> {
+        self.sheets.iter().find(|s| s.name == name)
+    }
+}
+
+/// A lumped two-terminal element on the edges of a box. `lo`/`hi` are box corners in mm; along `axis` the
+/// box runs from terminal to terminal, across the other two axes it may be a line, a sheet or a volume.
+/// `plus_at_hi`: the + terminal is at the high coordinate end along `axis`.
+#[derive(Clone, Debug)]
+pub struct Lumped {
+    pub name: String,
+    pub axis: usize,
+    pub lo: [f64; 3],
+    pub hi: [f64; 3],
+    pub plus_at_hi: bool,
+    /// Resistance in ohms (0 = none: then it must have `c` or be a pure probe).
+    pub r: f64,
+    /// Parallel capacitance in farads.
+    pub c: f64,
+    /// A port: it is measured, and excited when chosen.
+    pub port: bool,
+}
+
+/// Runtime form of a port: where its source acts and how its voltage is measured.
+#[derive(Clone, Debug)]
+pub struct PortRt {
+    pub name: String,
+    pub r: f64,
+    /// (component, edge index, gain): `E += gain * Vs(t)` after each E update.
+    pub src: Vec<(u8, u32, f32)>,
+    /// (component, edge index, weight): `V = sum weight * E`.
+    pub probe: Vec<(u8, u32, f32)>,
+}
+
+/// CPML tables for one axis. Positions along the axis map to a slab index `s` (or `NONE`); `be/ce` are the
+/// recursive-convolution coefficients at node positions (E derivatives), `bh/ch` at half positions.
+#[derive(Clone, Debug, Default)]
+pub struct PmlAxis {
+    pub map: Vec<u32>,
+    pub slab: Vec<u32>,
+    pub be: Vec<f32>,
+    pub ce: Vec<f32>,
+    pub bh: Vec<f32>,
+    pub ch: Vec<f32>,
+}
+
+impl PmlAxis {
+    pub fn len(&self) -> usize {
+        self.slab.len()
+    }
+}
+
+pub const NONE: u32 = u32::MAX;
+
+/// A linear field functional: `sum weight * F[comp][idx]`, comp 0..3 = Ex..Ez, 3..6 = Hx..Hz. A probe is
+/// either all-E (a voltage) or all-H (a current loop).
+#[derive(Clone, Debug)]
+pub struct ProbeRt {
+    pub name: String,
+    pub h: bool,
+    pub terms: Vec<(u8, u32, f32)>,
+}
+
+impl Problem {
+    fn lines_mm(&self, a: usize) -> Vec<f64> {
+        self.grid.axis(a).iter().map(|v| v * 1e3).collect()
+    }
+    fn dual(&self, a: usize, i: usize) -> f64 {
+        let l = self.grid.axis(a);
+        let lo = if i > 0 { l[i] - l[i - 1] } else { 0.0 };
+        let hi = if i + 1 < l.len() { l[i + 1] - l[i] } else { 0.0 };
+        0.5 * (lo + hi)
+    }
+    /// Voltage probe: integral of E along `axis` from `from` to `to` (mm), on the mesh line nearest the
+    /// transverse position of `from`: V = phi(from) - phi(to).
+    pub fn add_vprobe(&mut self, name: &str, axis: usize, from: [f64; 3], to: f64) {
+        let mut at = [0usize; 3];
+        for b in 0..3 {
+            at[b] = snap(&self.lines_mm(b), from[b]);
+        }
+        let l = self.lines_mm(axis);
+        let (i0, i1) = (snap(&l, from[axis]), snap(&l, to));
+        let sign = if i1 >= i0 { 1.0 } else { -1.0 };
+        let mut terms = Vec::new();
+        for i in i0.min(i1)..i0.max(i1) {
+            let mut p = at;
+            p[axis] = i;
+            let id = self.grid.idx(p[0], p[1], p[2]);
+            terms.push((axis as u8, id as u32, (sign * (l[i + 1] - l[i]) * 1e-3) as f32));
+        }
+        self.probes.push(ProbeRt { name: name.into(), h: false, terms });
+    }
+    /// Current probe: the H loop around the E edges along `axis` (current in +axis) at the edge position
+    /// nearest `at[axis]`, enclosing the mesh nodes inside the transverse box `lo..hi` (mm).
+    pub fn add_iprobe(&mut self, name: &str, axis: usize, at: f64, lo: [f64; 3], hi: [f64; 3]) {
+        let (b, c) = ((axis + 1) % 3, (axis + 2) % 3);
+        let la = self.lines_mm(axis);
+        let mut ia = snap(&la, at);
+        if ia + 1 >= la.len() {
+            ia -= 1;
+        }
+        let rb = range_in(&self.lines_mm(b), lo[b], hi[b]);
+        let rc = range_in(&self.lines_mm(c), lo[c], hi[c]);
+        assert!(!rb.is_empty() && !rc.is_empty() && rb.start > 0 && rc.start > 0, "current probe {name} encloses no nodes");
+        let (b0, b1, c0, c1) = (rb.start, rb.end - 1, rc.start, rc.end - 1);
+        let idx = |pa: usize, pb: usize, pc: usize| -> u32 {
+            let mut p = [0usize; 3];
+            p[axis] = pa;
+            p[b] = pb;
+            p[c] = pc;
+            self.grid.idx(p[0], p[1], p[2]) as u32
+        };
+        let (hb, hc) = ((3 + b) as u8, (3 + c) as u8);
+        let mut terms = Vec::new();
+        // counter-clockwise seen from +axis: +b along c = c0-1/2, +c along b = b1+1/2, -b along c1+1/2, -c along b0-1/2
+        for pb in b0..=b1 {
+            let w = self.dual(b, pb) as f32;
+            terms.push((hb, idx(ia, pb, c0 - 1), w));
+            terms.push((hb, idx(ia, pb, c1), -w));
+        }
+        for pc in c0..=c1 {
+            let w = self.dual(c, pc) as f32;
+            terms.push((hc, idx(ia, b1, pc), w));
+            terms.push((hc, idx(ia, b0 - 1, pc), -w));
+        }
+        self.probes.push(ProbeRt { name: name.into(), h: true, terms });
+    }
+}
+
+/// Everything a backend needs to run.
+#[derive(Clone, Debug)]
+pub struct Problem {
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    pub dt: f64,
+    /// 1 / primary edge length per axis (len n-1, padded to n).
+    pub inv_d: [Vec<f32>; 3],
+    /// 1 / dual edge length per axis (len n).
+    pub inv_dd: [Vec<f32>; 3],
+    pub ca: [Vec<f32>; 3],
+    pub cb: [Vec<f32>; 3],
+    pub pml: [PmlAxis; 3],
+    pub ports: Vec<PortRt>,
+    /// Field probes recorded every step (E terms at n dt, H terms at (n - 1/2) dt).
+    pub probes: Vec<ProbeRt>,
+    pub grid: Grid,
+}
+
+impl Problem {
+    pub fn n(&self) -> usize {
+        self.nx * self.ny * self.nz
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildOpts {
+    /// CPML thickness in cells at x-, x+, y-, y+, z-, z+ (0 = PEC wall).
+    pub pml: [usize; 6],
+    /// Frequency at which `tand` is turned into a conductivity.
+    pub f_loss: f64,
+    /// Highest frequency of interest (sets the CPML alpha).
+    pub fmax: f64,
+    pub cfl: f64,
+}
+
+impl Default for BuildOpts {
+    fn default() -> Self {
+        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95 }
+    }
+}
+
+/// Per-layer metal flags of in-plane edges: `ex[(j)*(nx) + i]` for Ex(i,j), `ey` likewise for Ey(i,j).
+pub struct SheetMask {
+    pub k: usize,
+    pub ex: Vec<bool>,
+    pub ey: Vec<bool>,
+}
+
+fn paint(mask: &mut [bool], nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
+    // xs: sample x positions (len nx), ys: sample rows; mask[(j * nx) + i]
+    let bb = p.shape.bbox();
+    let ir = range_in(xs, bb.x0, bb.x1);
+    let jr = range_in(ys, bb.y0, bb.y1);
+    if ir.is_empty() || jr.is_empty() {
+        return;
+    }
+    match &p.shape {
+        Shape::Polygon(pts) => {
+            // scanline: crossings of each row with the polygon edges, even-odd spans
+            let mut xc: Vec<f64> = Vec::new();
+            for j in jr {
+                let y = ys[j];
+                xc.clear();
+                let n = pts.len();
+                for e in 0..n {
+                    let (a, b) = (pts[e], pts[(e + 1) % n]);
+                    if (a.y > y) != (b.y > y) {
+                        xc.push(a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y));
+                    }
+                }
+                xc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for s in xc.chunks_exact(2) {
+                    for i in range_in(xs, s[0], s[1]) {
+                        mask[j * nx + i] = p.dark;
+                    }
+                }
+            }
+        }
+        sh => {
+            for j in jr {
+                for i in ir.clone() {
+                    if sh.contains(P2::new(xs[i], ys[j])) {
+                        mask[j * nx + i] = p.dark;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rasterise copper sheets onto the grid's in-plane edges (coordinates in mm on the layout side).
+pub fn sheet_masks(g: &Grid, lay: &Layout) -> Vec<SheetMask> {
+    use rayon::prelude::*;
+    let (nx, ny) = (g.nx(), g.ny());
+    let xmm: Vec<f64> = g.x.iter().map(|v| v * 1e3).collect();
+    let ymm: Vec<f64> = g.y.iter().map(|v| v * 1e3).collect();
+    let zmm: Vec<f64> = g.z.iter().map(|v| v * 1e3).collect();
+    // midpoints: Ex samples at (x_{i+1/2}, y_j), Ey at (x_i, y_{j+1/2}); the last entry is a far sentinel
+    let mut xh: Vec<f64> = xmm.windows(2).map(|w| 0.5 * (w[0] + w[1])).collect();
+    xh.push(f64::INFINITY);
+    let mut yh: Vec<f64> = ymm.windows(2).map(|w| 0.5 * (w[0] + w[1])).collect();
+    yh.push(f64::INFINITY);
+    lay.sheets
+        .par_iter()
+        .map(|s| {
+            let k = snap(&zmm, s.z);
+            let mut ex = vec![false; nx * ny];
+            let mut ey = vec![false; nx * ny];
+            for p in &s.prims {
+                paint(&mut ex, nx, &xh, &ymm, p);
+                paint(&mut ey, nx, &xmm, &yh, p);
+            }
+            SheetMask { k, ex, ey }
+        })
+        .collect()
+}
+
+fn cpml_axis(lines: &[f64], nlo: usize, nhi: usize, dt: f64, fmax: f64) -> PmlAxis {
+    let n = lines.len();
+    let mut ax = PmlAxis { map: vec![NONE; n], ..Default::default() };
+    if nlo == 0 && nhi == 0 {
+        return ax;
+    }
+    let m = 3.0f64;
+    let alpha_max = 2.0 * std::f64::consts::PI * EPS0 * (fmax / 20.0).max(1e6);
+    // depth (0 at the inner PML interface, 1 at the outer wall) of a position on either side
+    let mut idx: Vec<usize> = Vec::new();
+    if nlo > 0 {
+        idx.extend(0..(nlo + 1).min(n));
+    }
+    if nhi > 0 {
+        let start = n.saturating_sub(nhi + 1);
+        for i in start..n {
+            if !idx.contains(&i) {
+                idx.push(i);
+            }
+        }
+    }
+    let depth = |x: f64| -> (f64, f64) {
+        // returns (rho, local cell size)
+        if nlo > 0 && x < lines[nlo] {
+            let w = lines[nlo] - lines[0];
+            ((lines[nlo] - x) / w, w / nlo as f64)
+        } else if nhi > 0 && x > lines[n - 1 - nhi] {
+            let w = lines[n - 1] - lines[n - 1 - nhi];
+            ((x - lines[n - 1 - nhi]) / w, w / nhi as f64)
+        } else {
+            (0.0, 1.0)
+        }
+    };
+    let coef = |x: f64| -> (f32, f32) {
+        let (rho, h) = depth(x);
+        if rho <= 0.0 {
+            return (1.0, 0.0);
+        }
+        let rho = rho.min(1.0);
+        let smax = 0.8 * (m + 1.0) / (ETA0 * h);
+        let sigma = smax * rho.powf(m);
+        let alpha = alpha_max * (1.0 - rho);
+        let b = (-(sigma + alpha) * dt / EPS0).exp();
+        let c = if sigma > 0.0 { sigma / (sigma + alpha) * (b - 1.0) } else { 0.0 };
+        (b as f32, c as f32)
+    };
+    for (s, &i) in idx.iter().enumerate() {
+        ax.map[i] = s as u32;
+        ax.slab.push(i as u32);
+        let (be, ce) = coef(lines[i]);
+        let xh = if i + 1 < n { 0.5 * (lines[i] + lines[i + 1]) } else { lines[i] };
+        let (bh, ch) = if i + 1 < n { coef(xh) } else { (1.0, 0.0) };
+        ax.be.push(be);
+        ax.ce.push(ce);
+        ax.bh.push(bh);
+        ax.ch.push(ch);
+    }
+    ax
+}
+
+/// Build the update coefficients and runtime ports.
+pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Problem {
+    let (nx, ny, nz) = (g.nx(), g.ny(), g.nz());
+    let n = g.n();
+    let dmin = [g.min_step(0), g.min_step(1), g.min_step(2)];
+    let dt = o.cfl / (C0 * (1.0 / (dmin[0] * dmin[0]) + 1.0 / (dmin[1] * dmin[1]) + 1.0 / (dmin[2] * dmin[2])).sqrt());
+
+    let d = |a: usize, i: usize| -> f64 {
+        let l = g.axis(a);
+        if i + 1 < l.len() {
+            l[i + 1] - l[i]
+        } else {
+            0.0
+        }
+    };
+    // dual length at node i: half of each adjacent cell
+    let dd = |a: usize, i: usize| -> f64 {
+        let l = g.axis(a);
+        let lo = if i > 0 { l[i] - l[i - 1] } else { 0.0 };
+        let hi = if i + 1 < l.len() { l[i + 1] - l[i] } else { 0.0 };
+        0.5 * (lo + hi)
+    };
+    let mut inv_d: [Vec<f32>; 3] = Default::default();
+    let mut inv_dd: [Vec<f32>; 3] = Default::default();
+    for a in 0..3 {
+        let len = g.axis(a).len();
+        inv_d[a] = (0..len).map(|i| if d(a, i) > 0.0 { (1.0 / d(a, i)) as f32 } else { 0.0 }).collect();
+        inv_dd[a] = (0..len).map(|i| if dd(a, i) > 0.0 { (1.0 / dd(a, i)) as f32 } else { 0.0 }).collect();
+    }
+
+    // cell materials: inside-outline mask per (i,j) cell, slab per k cell
+    let inside: Vec<bool> = {
+        let mut v = vec![true; nx * ny];
+        if !lay.outline.is_empty() {
+            let mut bb = BBox::empty();
+            lay.outline.iter().flatten().for_each(|&p| bb.add(p));
+            for j in 0..ny.saturating_sub(1) {
+                for i in 0..nx.saturating_sub(1) {
+                    let p = P2::new(0.5e3 * (g.x[i] + g.x[i + 1]), 0.5e3 * (g.y[j] + g.y[j + 1]));
+                    let mut c = false;
+                    if bb.contains(p) {
+                        for l in &lay.outline {
+                            if crate::geom::point_in_polygon(l, p) {
+                                c = !c;
+                            }
+                        }
+                    }
+                    v[j * nx + i] = c;
+                }
+            }
+        }
+        v
+    };
+    let slab_of_k: Vec<Option<Slab>> = (0..nz.saturating_sub(1))
+        .map(|k| {
+            let zc = 0.5e3 * (g.z[k] + g.z[k + 1]);
+            lay.slabs.iter().find(|s| zc >= s.z0.min(s.z1) && zc <= s.z0.max(s.z1)).copied()
+        })
+        .collect();
+    let w_loss = 2.0 * std::f64::consts::PI * o.f_loss;
+    // (eps_r, sigma) of cell (i,j,k); out-of-range cells are air
+    let cell = |i: isize, j: isize, k: isize| -> (f64, f64) {
+        if i < 0 || j < 0 || k < 0 || i >= nx as isize - 1 || j >= ny as isize - 1 || k >= nz as isize - 1 {
+            return (1.0, 0.0);
+        }
+        match slab_of_k[k as usize] {
+            Some(s) if inside[j as usize * nx + i as usize] => (s.eps, w_loss * EPS0 * s.eps * s.tand),
+            _ => (1.0, 0.0),
+        }
+    };
+    let cl = |a: usize, i: isize| -> f64 { if i < 0 { 0.0 } else { d(a, i as usize) } };
+
+    // per-edge effective eps and sigma: area-weighted mean of the four cells around the edge
+    let mut eps: [Vec<f32>; 3] = [vec![1.0; n], vec![1.0; n], vec![1.0; n]];
+    let mut sig: [Vec<f32>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let id = g.idx(i, j, k);
+                let (ii, jj, kk) = (i as isize, j as isize, k as isize);
+                for a in 0..3 {
+                    // the two transverse axes and the cell index along this edge
+                    let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+                    let pos = [ii, jj, kk];
+                    let mut ws = 0.0;
+                    let (mut e, mut s) = (0.0, 0.0);
+                    for db in [-1isize, 0] {
+                        for dc in [-1isize, 0] {
+                            let mut q = pos;
+                            q[b] += db;
+                            q[c] += dc;
+                            let w = cl(b, q[b]) * cl(c, q[c]);
+                            if w <= 0.0 {
+                                continue;
+                            }
+                            let (ce, cs) = cell(q[0], q[1], q[2]);
+                            ws += w;
+                            e += w * ce;
+                            s += w * cs;
+                        }
+                    }
+                    if ws > 0.0 {
+                        eps[a][id] = (e / ws) as f32;
+                        sig[a][id] = (s / ws) as f32;
+                    }
+                }
+            }
+        }
+    }
+
+    // lumped elements: extra conductivity / capacitance per edge, and source/probe lists for ports
+    let mut ports = Vec::new();
+    let mut shorts: Vec<(usize, usize)> = Vec::new();
+    let mut loaded: Vec<(usize, usize)> = Vec::new();
+    let xs = [&g.x, &g.y, &g.z];
+    for l in lumped {
+        let a = l.axis;
+        let mut rng: [std::ops::Range<usize>; 3] = Default::default();
+        for b in 0..3 {
+            let (lo, hi) = (l.lo[b] * 1e-3, l.hi[b] * 1e-3);
+            if b == a {
+                let (i0, i1) = (snap(xs[b], lo), snap(xs[b], hi));
+                assert!(i1 > i0, "lumped element {} has no length along its axis", l.name);
+                rng[b] = i0..i1; // edges i0..i1-1
+            } else {
+                let r = range_in(xs[b], lo - 1e-12, hi + 1e-12);
+                rng[b] = if r.is_empty() { let s = snap(xs[b], 0.5 * (lo + hi)); s..s + 1 } else { r };
+            }
+        }
+        let k_ser = rng[a].len() as f64;
+        let m_par = (rng[(a + 1) % 3].len() * rng[(a + 2) % 3].len()) as f64;
+        let sign: f64 = if l.plus_at_hi { -1.0 } else { 1.0 };
+        let mut rt = PortRt { name: l.name.clone(), r: l.r, src: vec![], probe: vec![] };
+        let mut edges = Vec::new();
+        for k in rng[2].clone() {
+            for j in rng[1].clone() {
+                for i in rng[0].clone() {
+                    let id = g.idx(i, j, k);
+                    let p = [i, j, k];
+                    let len = d(a, p[a]);
+                    let area = dd((a + 1) % 3, p[(a + 1) % 3]) * dd((a + 2) % 3, p[(a + 2) % 3]);
+                    edges.push((id, len, area));
+                }
+            }
+        }
+        if l.r == 0.0 && l.c == 0.0 && !l.port {
+            shorts.extend(edges.iter().map(|e| (a, e.0)));
+            continue;
+        }
+        loaded.extend(edges.iter().map(|e| (a, e.0)));
+        for &(id, len, area) in &edges {
+            if l.r > 0.0 {
+                let re = l.r * m_par / k_ser;
+                sig[a][id] += (len / (re * area)) as f32;
+            }
+            if l.c > 0.0 {
+                let ce = l.c * k_ser / m_par;
+                eps[a][id] += (ce * len / (area * EPS0)) as f32;
+            }
+        }
+        if l.port {
+            for &(id, len, area) in &edges {
+                let re = l.r * m_par / k_ser;
+                // gain multiplies cb later (cb is computed below); keep the raw term here
+                rt.src.push((a as u8, id as u32, (sign / (k_ser * re * area)) as f32));
+                rt.probe.push((a as u8, id as u32, (sign * len / m_par) as f32));
+            }
+            ports.push(rt);
+        }
+    }
+
+    // E update coefficients
+    let mut ca: [Vec<f32>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    let mut cb: [Vec<f32>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    for a in 0..3 {
+        for id in 0..n {
+            let e = eps[a][id] as f64 * EPS0;
+            let s = sig[a][id] as f64;
+            let q = s * dt / (2.0 * e);
+            ca[a][id] = ((1.0 - q) / (1.0 + q)) as f32;
+            cb[a][id] = ((dt / e) / (1.0 + q)) as f32;
+        }
+    }
+    // edges that do not exist or lie on the outer wall (tangential E = 0) and metal edges
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let id = g.idx(i, j, k);
+                let p = [i, j, k];
+                let nn = [nx, ny, nz];
+                for a in 0..3 {
+                    let mut dead = p[a] + 1 >= nn[a];
+                    for b in 0..3 {
+                        if b != a && (p[b] == 0 || p[b] + 1 >= nn[b]) {
+                            dead = true;
+                        }
+                    }
+                    if dead {
+                        ca[a][id] = 0.0;
+                        cb[a][id] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+    for m in sheet_masks(g, lay) {
+        for j in 0..ny {
+            for i in 0..nx {
+                let id = g.idx(i, j, m.k);
+                if m.ex[j * nx + i] {
+                    ca[0][id] = 0.0;
+                    cb[0][id] = 0.0;
+                }
+                if m.ey[j * nx + i] {
+                    ca[1][id] = 0.0;
+                    cb[1][id] = 0.0;
+                }
+            }
+        }
+    }
+    let xmm: Vec<f64> = g.x.iter().map(|v| v * 1e3).collect();
+    let ymm: Vec<f64> = g.y.iter().map(|v| v * 1e3).collect();
+    let zmm: Vec<f64> = g.z.iter().map(|v| v * 1e3).collect();
+    for b in &lay.barrels {
+        let (k0, k1) = (snap(&zmm, b.z0.min(b.z1)), snap(&zmm, b.z0.max(b.z1)));
+        let r = b.r.max(0.5 * (g.min_step(0).max(g.min_step(1))) * 1e3 * 0.0);
+        let mut ir = range_in(&xmm, b.c.x - r, b.c.x + r);
+        let mut jr = range_in(&ymm, b.c.y - r, b.c.y + r);
+        let mut cells: Vec<(usize, usize)> = Vec::new();
+        for j in jr.clone() {
+            for i in ir.clone() {
+                if (xmm[i] - b.c.x).powi(2) + (ymm[j] - b.c.y).powi(2) <= r * r {
+                    cells.push((i, j));
+                }
+            }
+        }
+        if cells.is_empty() {
+            // thinner than the mesh: the nearest node carries it
+            ir = snap(&xmm, b.c.x)..snap(&xmm, b.c.x) + 1;
+            jr = snap(&ymm, b.c.y)..snap(&ymm, b.c.y) + 1;
+            cells.push((ir.start, jr.start));
+        }
+        for (i, j) in cells {
+            for k in k0..k1 {
+                let id = g.idx(i, j, k);
+                ca[2][id] = 0.0;
+                cb[2][id] = 0.0;
+            }
+        }
+    }
+    // lumped elements win over copper they overlap (a port drawn across a pad gap that the mesh closed)
+    for &(a, id) in &loaded {
+        let e = eps[a][id] as f64 * EPS0;
+        let s = sig[a][id] as f64;
+        let q = s * dt / (2.0 * e);
+        ca[a][id] = ((1.0 - q) / (1.0 + q)) as f32;
+        cb[a][id] = ((dt / e) / (1.0 + q)) as f32;
+    }
+    for &(a, id) in &shorts {
+        ca[a][id] = 0.0;
+        cb[a][id] = 0.0;
+    }
+    for p in &mut ports {
+        for s in &mut p.src {
+            s.2 *= cb[s.0 as usize][s.1 as usize];
+        }
+    }
+
+    let pml = [
+        cpml_axis(&g.x, o.pml[0], o.pml[1], dt, o.fmax),
+        cpml_axis(&g.y, o.pml[2], o.pml[3], dt, o.fmax),
+        cpml_axis(&g.z, o.pml[4], o.pml[5], dt, o.fmax),
+    ];
+    Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone() }
+}
