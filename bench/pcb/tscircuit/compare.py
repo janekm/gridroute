@@ -5,7 +5,8 @@
 
 OUT/CASE/topor: bench/pcb/topor_engine.py (engine binary from $TOPOR; KiCad export, DRC and acceptance when the
 input has an unrouted.kicad_pcb). OUT/CASE/tscircuit: to_srj.py, route.mjs (package from $TSCIRCUIT_AUTOROUTER),
-from_srj.py, then the same KiCad export, DRC and acceptance. Both get check_layout.py (check.json), which also
+from_srj.py, then the same KiCad export, DRC and acceptance. A case made from one of tscircuit's own boards
+(srj_to_model.py: srj.json and srj-meta.json in the input) gives tscircuit its original SRJ instead of to_srj.py. Both get check_layout.py (check.json), which also
 covers a case without a KiCad board. Topor scripts are taken from $TOPOR_BENCH (a bench/pcb directory),
 default this one.
 """
@@ -64,7 +65,12 @@ def main():
         out.mkdir(parents=True)
         log = a.out / a.case / 'tscircuit.log'
         shutil.copytree(a.input, out / 'input')
-        run([sys.executable, HERE / 'to_srj.py', out / 'input', '--out', out], log)
+        if (a.input / 'srj.json').exists() and (a.input / 'srj-meta.json').exists():
+            # one of tscircuit's own boards (srj_to_model.py): tscircuit routes its original SRJ
+            shutil.copyfile(a.input / 'srj.json', out / 'srj.json')
+            shutil.copyfile(a.input / 'srj-meta.json', out / 'srj-meta.json')
+        else:
+            run([sys.executable, HERE / 'to_srj.py', out / 'input', '--out', out], log)
         run(['node', '--max-old-space-size=16000', HERE / 'route.mjs', out / 'srj.json', out / 'tscircuit-out.json',
              '--seconds', a.tscircuit_seconds, '--pipeline', a.pipeline] + (['--lift-pair-cap'] if a.lift_pair_cap else []), log)
         run([sys.executable, HERE / 'from_srj.py', out, out / 'tscircuit-out.json', '--out', out], log)

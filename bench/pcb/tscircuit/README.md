@@ -6,11 +6,12 @@ router behind tscircuit.com), and judges both engines' copper the same way.
 | Script | Does |
 |---|---|
 | `to_srj.py` | model.json → tscircuit SimpleRouteJson (`srj.json`) and a sidecar (`srj-meta.json`) |
+| `srj_to_model.py` | the reverse, for tscircuit's own boards: an SRJ → a topor case (model.json, the SRJ as `srj.json`, `srj-meta.json`) |
 | `route.mjs` | runs the autorouter on an SRJ, with a time limit, network disabled |
 | `from_srj.py` | tscircuit traces → gridroute `layout.json` (what `kicad_io.py export` reads) |
-| `check_layout.py` | router-independent connectivity and clearance check of any layout.json against its model |
-| `compare.py` | both engines on one case: topor via `topor_engine.py`, tscircuit via the three above; KiCad export, DRC and `accept.py` where the case has an `unrouted.kicad_pcb`; `check_layout.py` for both |
-| `render_layout.py` | layout.json over the model's pads as SVG |
+| `check_layout.py` | router-independent connectivity and clearance check of any layout.json against its model; overlapping copper (shorts) listed on its own |
+| `compare.py` | both engines on one case: topor via `topor_engine.py`, tscircuit via the three above (or the case's own `srj.json`); KiCad export, DRC and `accept.py` where the case has an `unrouted.kicad_pcb`; `check_layout.py` for both |
+| `render_layout.py` | layout.json over the model's pads as SVG, shorts ringed |
 
 ```sh
 npm install @tscircuit/capacity-autorouter          # anywhere; point TSCIRCUIT_AUTOROUTER at the package
@@ -64,3 +65,47 @@ input's baseline (`accept.py`). dut-pi has no KiCad board matching its model, so
   `route.mjs --lift-pair-cap` raises that one cap at runtime; it was not used for these results.
 
 ![1BP: topor (left), tscircuit (right)](results/1BP-topor-vs-tscircuit.png)
+
+## tscircuit's own board: the Pico keyboard (5 November 2026)
+
+tscircuit says its "original Pico keyboard" now routes in under 20 s. That board is `keyboard4.json` among the
+autorouter's fixtures: 2 layers, 311 × 99 mm, 61 hot-swap switches and a Raspberry Pi Pico on the top side. It has
+80 nets to route, with 183 pad-to-pad links. `keyboard5.json` is the same board with every pad on the bottom and
+three mounting holes.
+
+```sh
+SHA=f28666351b000f5e97e67f7cf86667fab2f309e8   # tscircuit-autorouter, last commit to touch both fixtures
+curl -sfLO https://raw.githubusercontent.com/tscircuit/tscircuit-autorouter/$SHA/fixtures/legacy/assets/keyboard4.json
+python3 bench/pcb/tscircuit/srj_to_model.py keyboard4.json CASES/keyboard4
+python3 bench/pcb/tscircuit/srj_to_model.py keyboard4.json CASES/keyboard4-c010 --clearance 0.1
+TSCIRCUIT_AUTOROUTER=... TOPOR_BENCH=... python3 bench/pcb/tscircuit/compare.py keyboard4 --input CASES/keyboard4 --out OUT
+```
+
+- **Inputs:** tscircuit routes the fixture as it is; `srj_to_model.py` gives topor the same board.
+- **Rules:** the SRJ sets only a minimum trace width (0.15 mm). Both engines get tscircuit's own via (0.3 mm, 0.15 mm
+  drill). topor routes 0.15 mm tracks at 0.15 mm clearance, and again at 0.1 mm, the clearance tscircuit's own DRC
+  tests ask for (`RELAXED_DRC_OPTIONS`). tscircuit's one result is checked against both.
+- **Holes:** they stay as tscircuit gives them, rectangular obstacles on both layers.
+- **Checking:** there is no KiCad board, so `check_layout.py` is the only judge.
+- **Versions:** topor 24faf65 (M3 Max) against tscircuit 0.0.1015 (Node 24). The tweet is from 3 October; 0.0.1015 is
+  the newest version this machine's npm minimum-age policy installs.
+
+| Board | Engine | Time | Nets | Vias | Track mm | Clearance errors at 0.15 mm | at 0.1 mm | Shorts | Tracks under 0.15 mm wide |
+|---|---|---|---|---|---|---|---|---|---|
+| keyboard4 | topor | 0.5 s | 80/80 | 99 | 5838 | 0 | 0 | 0 | 0 |
+| | topor at 0.1 mm | 0.6 s | 80/80 | 111 | 5850 | – | 0 | 0 | 0 |
+| | tscircuit | 16.9 s | 80/80 | 191 | 6397 | 72 | 2 | 1 | 121 |
+| keyboard5 | topor | 0.5 s | 80/80 | 116 | 5608 | 0 | 0 | 0 | 0 |
+| | topor at 0.1 mm | 0.6 s | 80/80 | 115 | 5596 | – | 0 | 0 | 0 |
+| | tscircuit | 17.6 s | 80/80 | 206 | 6161 | 103 | 19 | 1 | 132 |
+
+- **tscircuit's time matches its claim:** 16.9 s here. It reports both boards solved.
+- **The short:** on both boards, tscircuit's `source_net_7` crosses `source_trace_174` on the top layer near
+  (260, 84) mm in model coordinates. No obstacle or connectivity net joins the two; the checker counts it as two
+  overlapping segments, which are keyboard4's two errors at 0.1 mm.
+- **Neck-downs:** about a third of tscircuit's tracks are 0.1 mm wide, below the SRJ's own `minTraceWidth`.
+- **keyboard5's other 0.1 mm errors:** 17 segments of one track, 0.024–0.048 mm from a 3 mm switch hole.
+- **topor:** complete and clean at either clearance, in 0.5–0.6 s against tscircuit's 17 s, with about half the
+  vias and 9% less track.
+
+![keyboard4: topor (top), tscircuit (bottom); the short ringed](results/keyboard4-topor-vs-tscircuit.png)

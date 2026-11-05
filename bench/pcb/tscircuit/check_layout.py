@@ -13,7 +13,8 @@ Reports per net whether all its pads are joined, the open pad groups, different-
 (the larger of the two class clearances and pad local clearances; cold_routing.class_clearance between two nets
 of one class; hole clearance for drills), copper too close
 to the board edge, via drills too close to other drills, track width below the net's class width and signal
-copper laid on plane layers. Pad-to-pad gaps of the placed board are not counted (they are not routing).
+copper laid on plane layers. Overlaps (no gap at all: a short, or copper through an obstacle of no net) are also
+counted and listed on their own. Pad-to-pad gaps of the placed board are not counted (they are not routing).
 """
 import argparse
 import collections
@@ -69,6 +70,14 @@ def core_dist(a, b):
 
 def gap(a, b):
     return core_dist(a, b) - a.r - b.r
+
+
+def closest_on(s, o):
+    """About where s comes closest to o: the nearest of 21 samples along a segment core (else its points)."""
+    A = s.core
+    if len(A) == 2:
+        A = [(A[0][0] + (A[1][0] - A[0][0]) * k / 20, A[0][1] + (A[1][1] - A[0][1]) * k / 20) for k in range(21)]
+    return min(A, key=lambda p: core_dist(Shape([p], 0.0, None, 'point', 0.0, s.layer), o))
 
 
 def pad_shape(p, layer, clear):
@@ -245,7 +254,7 @@ def check(m, layout):
 
     # clearance (routed copper against everything of another net), edge, drills
     violations = collections.Counter()
-    examples = []
+    examples, overlaps = [], []
     for s in shapes[fixed:]:
         for o in by_layer[s.layer].near(s, 0.6):
             if o.net == s.net and s.net is not None:
@@ -264,6 +273,9 @@ def check(m, layout):
                 if len(examples) < 20:
                     examples.append(dict(kind=k, layer=s.layer, nets=[s.net, o.net], gap=round(g, 4), need=need,
                                          at=[round(c, 3) for c in s.core[0]], other=o.name or None))
+                if g < -TOL:  # touching: a short, or copper through an obstacle of no net
+                    overlaps.append(dict(kind=k, layer=s.layer, nets=[s.net, o.net], gap=round(g, 4),
+                                         at=[round(c, 3) for c in closest_on(s, o)], other=o.name or None))
     # drills: via to other-net copper (hole clearance from the drill edge) and to other drills (any net)
     holes = Grid()
     for p in m['pads']:
@@ -300,6 +312,7 @@ def check(m, layout):
     return dict(nets=nets_total, complete_nets=nets_complete, open_pad_groups=open_groups,
                 incomplete=sorted(incomplete, key=lambda x: x['net']),
                 clearance_violations=dict(violations), clearance_total=sum(violations.values()),
+                overlaps=len(overlaps), overlap_list=overlaps,
                 examples=examples, tracks=len(layout['tracks']), vias=len(layout['vias']),
                 track_length_mm=round(sum(track_len.values()), 1),
                 signal_track_on_plane_layers_mm=round(track_len[(False, True)], 1),
@@ -315,7 +328,7 @@ def main():
     r = check(json.loads(a.model.read_text()), json.loads(a.layout.read_text()))
     if a.out:
         a.out.write_text(json.dumps(r, indent=1))
-    print(json.dumps({k: v for k, v in r.items() if k not in ('incomplete', 'examples')}))
+    print(json.dumps({k: v for k, v in r.items() if k not in ('incomplete', 'examples', 'overlap_list')}))
 
 
 if __name__ == '__main__':

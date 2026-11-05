@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Draw a layout.json over its model's pads as SVG (tracks coloured by layer, vias as rings, open nets' pads ringed).
+"""Draw a layout.json over its model's pads as SVG (tracks coloured by layer, vias as rings; with a check.json, open
+nets' pads outlined and overlapping copper ringed in yellow).
 
-    render_layout.py MODEL.json LAYOUT.json OUT.svg [--check CHECK.json] [--title TEXT]
+    render_layout.py MODEL.json LAYOUT.json OUT.svg [--check CHECK.json] [--title TEXT] [--px 900]
 """
 import argparse
 import json
@@ -18,17 +19,21 @@ def main():
     p.add_argument('out', type=pathlib.Path)
     p.add_argument('--check', type=pathlib.Path)
     p.add_argument('--title', default='')
+    p.add_argument('--px', type=float, default=900, help='pixels along the longer side')
     a = p.parse_args()
     m = json.loads(a.model.read_text())
     lay = json.loads(a.layout.read_text())
-    open_nets = set()
+    open_nets, overlaps = set(), []
     if a.check and a.check.exists():
-        open_nets = {x['net'] for x in json.loads(a.check.read_text())['incomplete']}
+        chk = json.loads(a.check.read_text())
+        open_nets = {x['net'] for x in chk['incomplete']}
+        overlaps = chk.get('overlap_list', [])
     layers = m['layers']
     col = {l: COLOURS[i % len(COLOURS)] for i, l in enumerate(layers)}
     xs, ys = [q[0] for q in m['outline']], [q[1] for q in m['outline']]
-    x0, y0, x1, y1 = min(xs) - 1, min(ys) - 4, max(xs) + 1, max(ys) + 1
-    s = 900 / max(x1 - x0, y1 - y0)
+    fs = max(max(xs) - min(xs) + 2, max(ys) - min(ys) + 5) * 0.025  # title size, from the longer side
+    x0, y0, x1, y1 = min(xs) - 1, min(ys) - max(4, 2.8 * fs), max(xs) + 1, max(ys) + 1
+    s = a.px / max(x1 - x0, y1 - y0)
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x0} {y0} {x1 - x0} {y1 - y0}" '
            f'width="{(x1 - x0) * s:.0f}" height="{(y1 - y0) * s:.0f}" style="background:#111">',
            f'<polygon points="{" ".join(f"{x},{y}" for x, y in m["outline"])}" fill="#1b1b1b" stroke="#888" stroke-width="{1.5 / s}"/>']
@@ -49,7 +54,9 @@ def main():
     for v in lay['vias']:
         out.append(f'<circle cx="{v["x"]}" cy="{v["y"]}" r="{v["d"] / 2}" fill="#ddd"/>'
                    f'<circle cx="{v["x"]}" cy="{v["y"]}" r="{v["drill"] / 2}" fill="#111"/>')
-    fs = (y1 - y0) * 0.025
+    for o in overlaps:
+        out.append(f'<circle cx="{o["at"][0]}" cy="{o["at"][1]}" r="{18 / s}" fill="none" stroke="#ff0" '
+                   f'stroke-width="{3 / s}"/>')
     legend = '  '.join(f'<tspan fill="{col[l]}">{l}</tspan>' for l in layers)
     out.append(f'<text x="{x0 + 0.5}" y="{y0 + fs * 1.2}" font-size="{fs}" fill="#eee" font-family="sans-serif">{a.title}</text>')
     out.append(f'<text x="{x0 + 0.5}" y="{y0 + fs * 2.5}" font-size="{fs * 0.8}" font-family="sans-serif">{legend}</text>')

@@ -2,8 +2,9 @@
 """Turn tscircuit's routed traces (route.mjs output) into a gridroute layout.json for kicad_io.py export.
 
 Wires become tracks on their KiCad layer and net, vias through vias of the size tscircuit gave them (else the
-SimpleRouteJson minimum). Coordinates go back to y down. Also writes routing.json with what tscircuit reported
-and simple counts: connections with copper, length, vias, signal copper on plane layers.
+SimpleRouteJson minimum). Coordinates go back to y down, by the shift in the meta when it has one (a board taken
+from tscircuit by srj_to_model.py). Also writes routing.json with what tscircuit reported and simple counts:
+connections with copper, length, vias, signal copper on plane layers.
 """
 import argparse
 import json
@@ -12,6 +13,13 @@ import pathlib
 
 
 def convert(srj, meta, out):
+    shift = meta.get('shift')
+    if shift:
+        def xy_of(p):
+            return [p['x'] - shift['minX'], shift['maxY'] - p['y']]
+    else:
+        def xy_of(p):
+            return [p['x'], -p['y']]
     back = {v: k for k, v in meta['layer_names'].items()}
     conns = meta['connections']
     plane_layers = set(meta['plane_layers'])
@@ -47,7 +55,7 @@ def convert(srj, meta, out):
         for p in t['route']:
             kind = p.get('route_type')
             if kind == 'wire':
-                layer, w, xy = back[p['layer']], p['width'], [p['x'], -p['y']]
+                layer, w, xy = back[p['layer']], p['width'], xy_of(p)
                 if meta['planes'].get(net) == layer:
                     # a plane net's wire on its own plane: the pour carries it (a drop ends at its via)
                     close()
@@ -67,7 +75,8 @@ def convert(srj, meta, out):
             elif kind == 'via':
                 close()
                 layer_prev_xy = None
-                vias.append(dict(x=p['x'], y=-p['y'], net=net,
+                x, y = xy_of(p)
+                vias.append(dict(x=x, y=y, net=net,
                                  d=p.get('via_diameter') or srj.get('minViaPadDiameter') or srj['minViaDiameter'],
                                  drill=p.get('via_hole_diameter') or srj['minViaHoleDiameter']))
             else:
