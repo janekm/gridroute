@@ -28,6 +28,12 @@ pub struct NetInfo {
     pub ribbon: Option<(u32, u32)>,
     /// Via (diameter, drill) overriding the class (ribbon nets use one wide via for the via pair).
     pub via_size: Option<(f64, f64)>,
+    /// Signal rise time in ns (`cold_routing.rise_time`, by net or class); 0 for a net that is not high-speed.
+    /// A high-speed net's tracks keep off gaps in their reference plane (gaps.rs).
+    pub rise: f64,
+    /// Cost of a millimetre of wire per signal layer (1 by default; a length group's `layer_cost` raises it, e.g.
+    /// to keep its long runs off the crowded pad layer and leave room to tune them).
+    pub layer_cost: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,8 +71,28 @@ pub struct PlaneRegion {
     pub holes: Vec<Vec<P2>>,
 }
 
+/// A neck-down stub: a straight track at a narrower width than the net's class allows elsewhere, from a pad
+/// out to where the class width fits (a custom rule letting tracks that touch a fine-pitch part narrow).
+#[derive(Clone, Debug)]
+pub struct Neck {
+    pub net: u32,
+    /// Signal layer index.
+    pub layer: usize,
+    pub pad: String,
+    /// Export geometry: from inside the pad to the stub's end.
+    pub from: P2,
+    pub to: P2,
+    pub width: f64,
+}
+
 #[derive(Clone)]
 pub struct Board {
+    /// Neck-down stubs; each is also fixed copper of its net (objects named "neck:<pad>").
+    pub necks: Vec<Neck>,
+    /// Pads that needed a neck-down stub but had no room for one (why).
+    pub neck_failed: Vec<String>,
+    /// Neck-down width per pad a neck rule covers: a plane net's drop from it may be one straight segment at it.
+    pub neck_width: HashMap<String, f64>,
     /// Plane regions; a plane net without any is a full plane (any via of the net joins it).
     pub plane_regions: Vec<PlaneRegion>,
     /// Areas of plane layers kept free of pour (cutouts).
@@ -90,14 +116,52 @@ pub struct Board {
     pub hole_to_hole: f64,
     /// Extra clearance between different nets of the same class (custom rules).
     pub class_pair: Vec<f64>,
+    /// Least gap between a track and other copper per signal layer (a custom rule such as a fab's inner-layer
+    /// spacing), for tracks of every class not exempt (`track_clear_exempt`, per class).
+    pub track_clear: Vec<f64>,
+    pub track_clear_exempt: Vec<bool>,
     pub routable_nets: usize,
     /// Differential pair partner per net (NONE if unpaired) and the pair's edge-to-edge gap.
     pub partner: Vec<u32>,
     pub pair_gap: Vec<f64>,
     /// Net family: a pair's members and its ribbon share the first member's id (others: own id).
     pub family: Vec<u32>,
+    /// A ribbon may touch its own pair's copper (off for pair routing as it was, to compare).
+    pub ribbon_touch: bool,
     /// Ribbon net of each pair member (NONE if none).
     pub ribbon_of: Vec<u32>,
+    /// Reference planes (indices into `layers`) of each signal layer: the nearest plane layer on each side
+    /// with no signal layer between, else the nearest plane layer (`cold_routing.reference_planes` overrides).
+    pub ref_planes: Vec<Vec<usize>>,
+    /// Pour clearance per layer (`cold_routing.plane_clearance`; 0: the other copper's class clearance) and the
+    /// pour's least web width (`plane_min_width`; KiCad's zone minimum width, 0.25 mm by default).
+    pub plane_clear: Vec<f64>,
+    pub plane_min_w: Vec<f64>,
+    /// Gap rule: a slot crossing is allowed while its inductance (Johnson, 5 D ln(D/W) nH) reflects at most
+    /// `gap_reflection` of an edge of the net's rise time on a `gap_z0` line.
+    pub gap_reflection: f64,
+    pub gap_z0: f64,
+    /// Length matching (`cold_routing.length_groups`): nets whose routed lengths must agree within a skew.
+    pub length_groups: Vec<LengthGroup>,
+    /// Meander geometry: edge-to-edge gap between a meander's legs (default the larger of three widths and
+    /// the clearance) and the largest bump height (`meander_gap`, `meander_max_amplitude`; mm).
+    pub meander_gap: Option<f64>,
+    pub meander_max_amp: f64,
+    /// Dogbone nets (`cold_routing.dogbone`: true for every net, or a list of nets): their vias go only right
+    /// beside their own pads, so a wire either stays on its pads' layer or drops at one end and comes back up
+    /// at the other, with no via between. Indexed by net (ribbon nets are not in it).
+    pub dogbone: Vec<bool>,
+}
+
+/// Nets routed to one length: each within `max_skew` of the longest (or of `target`, when that is longer).
+#[derive(Clone, Debug)]
+pub struct LengthGroup {
+    pub name: String,
+    pub nets: Vec<u32>,
+    pub max_skew: f64,
+    pub target: Option<f64>,
+    /// Names given that are not nets of the board.
+    pub unknown: Vec<String>,
 }
 
 fn f(v: &Value) -> f64 {
@@ -192,7 +256,7 @@ impl Board {
                 wmin.push(mn.min(p));
             }
             let id = nets.len() as u32;
-            nets.push(NetInfo { name: name.to_string(), class, plane: plane_of.get(name).cloned(), allowed, wpref, wmin, ribbon: None, via_size: None });
+            nets.push(NetInfo { name: name.to_string(), class, plane: plane_of.get(name).cloned(), allowed, wpref, wmin, ribbon: None, via_size: None, rise: 0.0, layer_cost: vec![1.0; signal.len()] });
             net_index.insert(name.to_string(), id);
             id
         };
@@ -201,6 +265,9 @@ impl Board {
         let bsig = signal.iter().position(|&l| l == layers.len() - 1);
         let all_sig = (1u32 << signal.len()) - 1;
         let mut objs = Vec::new();
+        // pads a neck-down rule covers: (object index, neck width (0: the class width), long axis if the pad is
+        // elongated, clearance of the stub (0: the class clearance))
+        let mut escapes: Vec<(usize, f64, Option<P2>, f64)> = Vec::new();
         for p in m["pads"].as_array().ok_or("pads")? {
             let net = match p["net"].as_str() {
                 Some(n) if !n.is_empty() => net_of(n, &mut nets),
@@ -255,9 +322,24 @@ impl Board {
             }
             let core = dedup_hull(&core);
             let kind = if npth { Kind::Hole } else { Kind::Pad };
-            // KiCad keeps copper off a non-plated hole by the board-edge clearance as well
-            let clear = if npth { hole_clear.max(edge_clear).max(local) } else { local };
+            // KiCad keeps copper off a non-plated hole by the board-edge clearance as well; a plated hole keeps
+            // other copper the hole clearance off its drill, which beyond a thin annular ring is the larger gap
+            let clear = if npth {
+                hole_clear.max(edge_clear).max(local)
+            } else if drill > 0.0 {
+                // the thinnest ring, axis by axis (a slot in an oval pad runs along it)
+                let (dw, dh) = (f(&p["drill_w"]).max(f(&p["drill"])), f(&p["drill_h"]).max(f(&p["drill"])));
+                let ring = ((w - dw).min(h - dh) / 2.0).max(0.0);
+                local.max(hole_clear - ring)
+            } else {
+                local
+            };
             let name = format!("{}.{}", p["original_ref"].as_str().unwrap_or("?"), p["original_pin"].as_str().unwrap_or("?"));
+            let (e, ec) = (f(&p["escape_width"]), f(&p["escape_clear"]));
+            if (e > 0.0 || ec > 0.0) && lay != "all" && !npth && net != NONE {
+                let axis = if (w - h).abs() < 0.05 * w.max(h) { None } else if w > h { Some(p2(c, -s)) } else { Some(p2(s, c)) };
+                escapes.push((objs.len(), e, axis, ec));
+            }
             objs.push(ObjSpec {
                 kind,
                 net: if npth { NONE } else { net },
@@ -394,6 +476,18 @@ impl Board {
                 holes: r["holes"].as_array().into_iter().flatten().map(|h| ppoly(h)).collect(),
             });
         }
+        let mut track_clear = vec![0.0; signal.len()];
+        if let Some(tc) = cold["track_clearance"].as_object() {
+            for (ln, v) in tc {
+                if let Some(si) = signal.iter().position(|&li| &layers[li] == ln) {
+                    track_clear[si] = f(v);
+                }
+            }
+        }
+        let exempt: Vec<String> = cold["track_clearance_except"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        let track_clear_exempt: Vec<bool> = classes.iter().map(|c| exempt.contains(&c.name)).collect();
+        let neck_width: HashMap<String, f64> = escapes.iter().filter(|x| x.1 > 0.0).map(|&(i, e, _, _)| (objs[i].name.clone(), e)).collect();
+        let (necks, neck_failed) = place_necks(&mut objs, &escapes, &nets, &classes, &track_clear, &track_clear_exempt, &outline, &outline_holes, edge_clear);
         let mut fill_keepouts = Vec::new();
         for k in cold["fill_keepouts"].as_array().into_iter().flatten() {
             if let Some(l) = layers.iter().position(|x| Some(x.as_str()) == k["layer"].as_str()) {
@@ -411,7 +505,87 @@ impl Board {
                 rf_nets.push((id, format!("{} on {} ({})", name, ln, r["why"].as_str().unwrap_or(""))));
             }
         }
+        // high-speed nets by rise time: a net's own entry wins over its class
+        if let Some(rt) = cold["rise_time"].as_object() {
+            for ni in nets.iter_mut() {
+                let v = rt.get(&ni.name).or_else(|| rt.get(&classes[ni.class].name)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                ni.rise = v.max(0.0);
+            }
+        }
+        // per-layer value: one number for every layer or {layer: value}
+        let per_layer = |v: &Value, d: f64| -> Vec<f64> {
+            layers.iter().map(|l| v.as_f64().or_else(|| v[l.as_str()].as_f64()).unwrap_or(d)).collect()
+        };
+        let plane_clear = per_layer(&cold["plane_clearance"], 0.0);
+        let plane_min_w = per_layer(&cold["plane_min_width"], 0.25);
+        let mut ref_planes: Vec<Vec<usize>> = Vec::new();
+        for &li in &signal {
+            let mut v: Vec<usize> = Vec::new();
+            if let Some(list) = cold["reference_planes"][layers[li].as_str()].as_array() {
+                v = list.iter().filter_map(|x| layers.iter().position(|l| Some(l.as_str()) == x.as_str())).filter(|i| plane_layers.contains(i)).collect();
+            } else {
+                // adjacent plane layers above and below (no signal layer between)
+                let up = (0..li).rev().take_while(|i| plane_layers.contains(i)).next();
+                let down = (li + 1..layers.len()).take_while(|i| plane_layers.contains(i)).next();
+                v.extend(up.into_iter().chain(down));
+                if v.is_empty() {
+                    if let Some(&p) = plane_layers.iter().min_by_key(|&&p| ((p as i64 - li as i64).abs(), p)) {
+                        v.push(p);
+                    }
+                }
+            }
+            ref_planes.push(v);
+        }
+        let mut length_groups = Vec::new();
+        for (gi, g) in cold["length_groups"].as_array().into_iter().flatten().enumerate() {
+            let (mut ids, mut unknown) = (Vec::new(), Vec::new());
+            for n in g["nets"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+                match net_index.get(n) {
+                    Some(&id) if !ids.contains(&id) => ids.push(id),
+                    Some(_) => {}
+                    None => unknown.push(n.to_string()),
+                }
+            }
+            // {layer: cost of a millimetre} for the group's nets (at least 1)
+            if let Some(lc) = g["layer_cost"].as_object() {
+                for &id in &ids {
+                    for (si, &li) in signal.iter().enumerate() {
+                        if let Some(v) = lc.get(layers[li].as_str()).and_then(|v| v.as_f64()) {
+                            let c = &mut nets[id as usize].layer_cost[si];
+                            *c = c.max(v.max(1.0));
+                        }
+                    }
+                }
+            }
+            length_groups.push(LengthGroup {
+                name: g["name"].as_str().map(String::from).unwrap_or_else(|| format!("group {}", gi + 1)),
+                nets: ids,
+                max_skew: g["max_skew"].as_f64().unwrap_or(0.1).max(0.0),
+                target: g["target"].as_f64(),
+                unknown,
+            });
+        }
+        let dogbone: Vec<bool> = match &cold["dogbone"] {
+            Value::Bool(b) => vec![*b; nets.len()],
+            Value::Array(a) => {
+                let names: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+                nets.iter().map(|ni| names.contains(&ni.name.as_str())).collect()
+            }
+            _ => vec![false; nets.len()],
+        };
         Ok(Board {
+            dogbone,
+            length_groups,
+            meander_gap: cold["meander_gap"].as_f64(),
+            meander_max_amp: cold["meander_max_amplitude"].as_f64().unwrap_or(1.0),
+            ref_planes,
+            plane_clear,
+            plane_min_w,
+            gap_reflection: cold["gap_reflection"].as_f64().unwrap_or(0.05),
+            gap_z0: cold["gap_z0"].as_f64().unwrap_or(50.0),
+            necks,
+            neck_failed,
+            neck_width,
             plane_regions,
             fill_keepouts,
             via_keepouts,
@@ -430,10 +604,13 @@ impl Board {
             hole_clear,
             hole_to_hole,
             class_pair,
+            track_clear,
+            track_clear_exempt,
             routable_nets,
             partner: Vec::new(),
             pair_gap: Vec::new(),
             family: Vec::new(),
+            ribbon_touch: true,
             ribbon_of: Vec::new(),
         })
     }
@@ -494,6 +671,8 @@ impl Board {
                 wmin,
                 ribbon: Some((i as u32, j as u32)),
                 via_size: Some((pitch + c.via_d, pitch + c.via_drill)),
+                rise: [a.rise, b.rise].into_iter().filter(|&x| x > 0.0).fold(0.0, |m: f64, x| if m == 0.0 { x } else { m.min(x) }),
+                layer_cost: a.layer_cost.iter().zip(&b.layer_cost).map(|(x, y)| x.max(*y)).collect(),
             };
             let id = self.nets.len() as u32;
             self.net_index.insert(r.name.clone(), id);
@@ -549,6 +728,181 @@ impl Board {
         let ni = &self.nets[net as usize];
         ni.via_size.unwrap_or((self.classes[ni.class].via_d, self.classes[ni.class].via_drill))
     }
+    /// A via's gap to other copper: its class clearance, or the hole clearance off its drill where the
+    /// annular ring is thinner than the difference.
+    pub fn via_clear(&self, net: u32) -> f64 {
+        let (d, drill) = self.via_size(net);
+        self.classes[self.nets[net as usize].class].clear.max(self.hole_clear - (d - drill) / 2.0)
+    }
+    /// A track's gap to other copper on signal layer `l`.
+    pub fn track_clear(&self, net: u32, l: usize) -> f64 {
+        let c = self.nets[net as usize].class;
+        let t = if self.track_clear_exempt[c] { 0.0 } else { self.track_clear.get(l).cloned().unwrap_or(0.0) };
+        self.classes[c].clear.max(t)
+    }
+    /// Whether a net keeps off gaps in its reference planes (it has a rise time).
+    pub fn high_speed(&self, net: u32) -> bool {
+        self.nets.get(net as usize).map_or(false, |n| n.rise > 0.0)
+    }
+    /// Longest slot (mm) a high-speed net's track on signal layer `l` may cross: Johnson's slot inductance
+    /// L = 5 D ln(D/W) nH (D, W in inches; W the track width) reflects L / (2 Z0 tr) of an edge, kept at most
+    /// `gap_reflection`. Infinite for a net that is not high-speed.
+    pub fn gap_limit(&self, net: u32, l: usize) -> f64 {
+        let ni = &self.nets[net as usize];
+        if ni.rise <= 0.0 {
+            return f64::INFINITY;
+        }
+        // a ribbon's members carry the signal: their own width
+        let w = match ni.ribbon {
+            Some((p, _)) => self.nets[p as usize].wpref[l],
+            None => ni.wpref[l],
+        }
+        .max(0.01);
+        // D ln(D/W) = L_max (nH) * 25.4 / 5, with L_max = 2 Z0 tr reflection (ohm ns = nH)
+        let k = 2.0 * self.gap_z0 * ni.rise * self.gap_reflection * 25.4 / 5.0;
+        let (mut lo, mut hi) = (w, 1000.0);
+        for _ in 0..60 {
+            let m = 0.5 * (lo + hi);
+            if m * (m / w).ln() > k {
+                hi = m;
+            } else {
+                lo = m;
+            }
+        }
+        lo
+    }
+}
+
+/// Neck-down stubs for the pads that need one (plane nets' pads drop to vias instead): a pad narrower than its
+/// net's class width (or one where that width meets other copper) gets a straight stub at its neck width, outward
+/// along the pad (from the part's centre for a square pad), to the first point where a disc of the class width
+/// clears the other nets' copper and the class-width starts of the stubs laid before it (so neighbouring stubs
+/// stagger), with the stub itself clear.
+/// The stub stops 10 µm short of its pad (touching copper, tied to the pad, not hulled with it) and is pushed as
+/// fixed copper of the net, named "neck:<pad>"; KiCad gets it as a track from the pad's centre.
+#[allow(clippy::too_many_arguments)]
+fn place_necks(objs: &mut Vec<ObjSpec>, escapes: &[(usize, f64, Option<P2>, f64)], nets: &[NetInfo], classes: &[Class], track_clear: &[f64], exempt: &[bool], outline: &[P2], holes: &[Vec<P2>], edge_clear: f64) -> (Vec<Neck>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut failed = Vec::new();
+    let mut centre: HashMap<String, (P2, usize)> = HashMap::new();
+    for o in objs.iter().filter(|o| o.kind == Kind::Pad) {
+        let e = centre.entry(o.name.split('.').next().unwrap_or("").to_string()).or_insert((p2(0., 0.), 0));
+        e.0 = e.0 + o.center;
+        e.1 += 1;
+    }
+    // stub ends laid so far: (end, class half-width, clearance, net)
+    let mut ends: Vec<(P2, f64, f64, u32)> = Vec::new();
+    for &(pi, e, axis, ec) in escapes {
+        let pad = objs[pi].clone();
+        let net = pad.net;
+        let ni = &nets[net as usize];
+        // a plane net's pads drop to vias: a straight drop at the neck width needs no stub
+        if ni.plane.is_some() {
+            continue;
+        }
+        let Some(l) = (0..32).find(|&l| pad.layers == 1 << l) else { continue };
+        let wide = ni.wmin[l].max(ni.wpref[l]);
+        let c = ni.class;
+        let my_clear = classes[c].clear.max(if exempt[c] { 0.0 } else { track_clear.get(l).cloned().unwrap_or(0.0) });
+        // the stub: narrower than the class, or at the class width with a smaller clearance
+        let e = if e > 0.0 { e } else { wide };
+        let stub_clear = if ec > 0.0 { ec.min(my_clear) } else { my_clear };
+        if e >= wide && stub_clear >= my_clear {
+            continue;
+        }
+        // (a pad's own clearance is KiCad's, its class and custom rules resolved; a stub's is its own)
+        let need = |o: &ObjSpec, mine: f64| -> f64 {
+            match o.kind {
+                Kind::Outline => edge_clear,
+                Kind::Hole | Kind::Keepout => o.clear,
+                _ => mine.max(o.clear),
+            }
+        };
+        // everything within 4 mm (by bounding box: a long keepout's centre may lie far away)
+        let near = |o: &ObjSpec| {
+            let (lo, hi) = o.pts.iter().fold((p2(1e9, 1e9), p2(-1e9, -1e9)), |(lo, hi), q| (p2(lo.x.min(q.x), lo.y.min(q.y)), p2(hi.x.max(q.x), hi.y.max(q.y))));
+            let dx = (lo.x - pad.center.x).max(pad.center.x - hi.x).max(0.0);
+            let dy = (lo.y - pad.center.y).max(pad.center.y - hi.y).max(0.0);
+            dx.hypot(dy) - o.r < 4.0
+        };
+        let others: Vec<&ObjSpec> = objs.iter().filter(|o| o.layers & (1 << l) != 0 && (o.net != net || o.kind == Kind::Hole) && near(o)).collect();
+        // gap of a capsule a-b of radius r keeping `mine` to everything else (negative: overlap)
+        let gap = |a: P2, b: P2, r: f64, mine: f64| -> f64 {
+            let mut g = f64::INFINITY;
+            for o in &others {
+                let d = if o.kind == Kind::Keepout {
+                    if point_in_poly(&o.pts, a) || point_in_poly(&o.pts, b) {
+                        -1.0
+                    } else {
+                        (0..o.pts.len()).map(|k| crate::geom::seg_seg_dist(a, b, o.pts[k], o.pts[(k + 1) % o.pts.len()])).fold(f64::INFINITY, f64::min)
+                    }
+                } else {
+                    crate::geom::seg_hull_dist(&o.pts, a, b) - o.r
+                };
+                g = g.min(d - r - need(o, mine));
+            }
+            for &(q, rq, cq, n) in &ends {
+                if n != net {
+                    g = g.min(crate::geom::seg_point_dist(a, b, q) - r - rq - cq.max(mine));
+                }
+            }
+            for ring in std::iter::once(outline).chain(holes.iter().map(|h| h.as_slice())) {
+                if ring.len() >= 3 {
+                    let d = (0..ring.len()).map(|k| crate::geom::seg_seg_dist(a, b, ring[k], ring[(k + 1) % ring.len()])).fold(f64::INFINITY, f64::min);
+                    g = g.min(d - r - edge_clear);
+                }
+            }
+            g
+        };
+        let part = pad.name.split('.').next().unwrap_or("").to_string();
+        let mid = centre.get(&part).map(|&(s, n)| s * (1.0 / n as f64)).unwrap_or(pad.center);
+        let out_dir = pad.center - mid;
+        let dir = match axis {
+            Some(a) => if a.dot(out_dir) >= 0.0 { a } else { a * -1.0 },
+            None if out_dir.norm() > 1e-6 => out_dir.unit(),
+            None => continue,
+        };
+        // a pad as wide as the class width, with room for it, needs none
+        let across = pad.pts.iter().map(|&q| (q - pad.center).dot(dir.perp()).abs()).fold(0.0, f64::max) + pad.r;
+        if 2.0 * across >= wide && gap(pad.center, pad.center, wide / 2.0, my_clear) >= 0.0 {
+            continue;
+        }
+        // where the pad's copper ends along the stub
+        let core = pad.pts.iter().map(|&q| (q - pad.center).dot(dir)).fold(0.0, f64::max);
+        let reach = core + pad.r;
+        // a stub as narrow as the pad runs in from its centre, over its copper, and is modelled from just past
+        // the pad (touching copper); one wider than the pad would stand out along its sides, so it starts, in the
+        // model and on the board, just past the pad's core, inside its rounded end, and ends round there
+        let wider = e > 2.0 * across + 1e-9;
+        let start = if wider { pad.center + dir * (core + 0.01) } else { pad.center + dir * (reach + e / 2.0 + 0.01) };
+        // (KiCad joins a track to a pad its end lies in: on a square-cornered pad that end stays just inside)
+        let from = if wider { pad.center + dir * (core + 0.01).min(reach - 0.005) } else { pad.center };
+        let mut found = None;
+        let mut why = "no room for the class width within 2.5 mm";
+        let mut t = (start - pad.center).dot(dir) + 0.01;
+        while t < reach + 2.5 {
+            let j = pad.center + dir * t;
+            if gap(start, j, e / 2.0, stub_clear) < 0.0 {
+                why = "the stub runs into other copper first";
+                break;
+            }
+            if gap(j, j, wide / 2.0, my_clear) >= 0.005 {
+                found = Some(j);
+                break;
+            }
+            t += 0.01;
+        }
+        let Some(j) = found else {
+            failed.push(format!("{} ({})", pad.name, why));
+            continue;
+        };
+        let name = format!("neck:{}", pad.name);
+        objs.push(ObjSpec { kind: Kind::Pad, net, layers: pad.layers, pts: vec![start, j], r: e / 2.0, clear: stub_clear, center: j, drill: 0.0, name, through: false });
+        // (a wire from a stub with its own clearance starts in the courtyard, where that clearance holds too)
+        ends.push((j, wide / 2.0, stub_clear, net));
+        out.push(Neck { net, layer: l, pad: pad.name.clone(), from, to: j, width: e });
+    }
+    (out, failed)
 }
 
 /// The part of convex polygon `poly` on the side of the line through `o` that normal `n` points away from.

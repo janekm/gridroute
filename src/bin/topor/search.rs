@@ -94,10 +94,32 @@ pub struct Query {
     pub couple_factor: f64,
     /// Width to reserve (per layer) away from the terminals, so a partner fits alongside; 0 = none.
     pub ribbon: Vec<f64>,
+    /// Charge slots in high-speed nets' reference planes (gaps.rs), where the board has such nets.
+    pub gap_rule: bool,
+    /// Dogbone nets (`cold_routing.dogbone`): the only places a via may go, right beside the net's own pads,
+    /// and the layers of those pads (bit per signal layer): each of its vias joins a pad layer to one other
+    /// layer, so there is one at each end and no hop between inner layers.
+    pub via_spots: Option<std::sync::Arc<Vec<P2>>>,
+    pub via_spot_layers: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 struct HeapE(f64, u32);
+
+/// Weight of the distance heuristic (weighted A*), 1 (plain A*) by default: TOPOR_HARD_W / TOPOR_SOFT_W set
+/// one. A greedy soft search (1.5) was faster but ripped other victims, and lost connections on 1BP and EXT.
+fn heuristic_weight(soft: bool) -> f64 {
+    static W: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    let w = W.get_or_init(|| {
+        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.parse().ok()).unwrap_or(d);
+        (env("TOPOR_HARD_W", 1.0), env("TOPOR_SOFT_W", 1.0))
+    });
+    if soft {
+        w.1
+    } else {
+        w.0
+    }
+}
 impl Eq for HeapE {}
 impl PartialOrd for HeapE {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
@@ -140,6 +162,11 @@ pub struct Search<'a> {
     spts: Vec<P2>,
     partner_vias: Vec<P2>,
     pub expansions: usize,
+    /// Plane gap rule (boards with high-speed nets): costs of slots crossed or closed; whether this net keeps
+    /// off them, and the nets whose copper is its own.
+    gaps: Option<crate::gaps::Gaps<'a>>,
+    gap_hs: bool,
+    gap_own: Vec<u32>,
 }
 
 fn nx(i: usize) -> usize {
@@ -218,12 +245,15 @@ impl<'a> Search<'a> {
             partner_vias,
             trace: std::env::var("TOPOR_SEARCHTRACE").is_ok(),
             expansions: 0,
+            gaps: if q.gap_rule && crate::gaps::active(w) { Some(crate::gaps::Gaps::new(w)) } else { None },
+            gap_hs: w.b.high_speed(q.net),
+            gap_own: crate::gaps::own_of(w, q.net),
         }
     }
 
     fn h(&self, l: usize, p: P2) -> f64 {
         let k = if self.q.couple != NONE { self.q.couple_factor } else { 1.0 };
-        k * self.h_raw(l, p)
+        k * self.h_raw(l, p) * heuristic_weight(self.q.soft)
     }
 
     fn h_raw(&self, l: usize, p: P2) -> f64 {
@@ -407,7 +437,7 @@ impl<'a> Search<'a> {
         let v = tr.v[shared];
         let pv = w.vpos(l, v);
         let vobj = w.layers[l].vobj[v as usize];
-        let me = w.net_attr(self.q.net);
+        let me = w.net_attr(self.q.net, l);
         // wires around the shared vertex: chords between edges k_in and k_out, ordered from the vertex
         let in_lo = cy.start[k_in];
         let in_hi = cy.start[k_in + 1];
@@ -427,7 +457,7 @@ impl<'a> Search<'a> {
             };
             if let Some(pi) = pos_in {
                 let pc = &w.pieces[p as usize];
-                around.push((pi, w.net_attr(pc.net), pc.width));
+                around.push((pi, w.net_attr(pc.net, pc.layer as usize), pc.width));
                 around_pieces.push(p);
             }
         }
@@ -495,7 +525,7 @@ impl<'a> Search<'a> {
                     if k + 1 >= q.poly.len() {
                         continue;
                     }
-                    (seg_near(q.poly[k], q.poly[k + 1]) - q.width / 2.0, w.net_attr(q.net), Some(vec![it.id]))
+                    (seg_near(q.poly[k], q.poly[k + 1]) - q.width / 2.0, w.net_attr(q.net, q.layer as usize), Some(vec![it.id]))
                 }
                 _ => {
                     if it.id == vobj {
@@ -972,7 +1002,13 @@ impl<'a> Search<'a> {
                 let ntr = layer.cdt.tris[nt as usize];
                 let nk = ntr.e.iter().position(|&x| x == e2).unwrap();
                 let ngap = nc - g;
-                let pen = q.taboo.get(&(l as u8, nt)).cloned().unwrap_or(0.0) + q.history.get(&(l as u8, nt)).cloned().unwrap_or(0.0);
+                let mut pen = q.taboo.get(&(l as u8, nt)).cloned().unwrap_or(0.0) + q.history.get(&(l as u8, nt)).cloned().unwrap_or(0.0);
+                if self.gap_hs {
+                    if let Some(gs) = &self.gaps {
+                        pen += gs.edge_cost(q.net, &self.gap_own, l, layer.vobj[ed.a as usize], layer.vobj[ed.b as usize], pos, pos - n.pos);
+                        pen += gs.area_cost(q.net, l, n.pos, pos);
+                    }
+                }
                 let step = if g == coupled_gap { q.couple_factor } else { 1.0 };
                 let gg = n.g + n.pos.dist(pos) * q.layer_cost[l] * step + ccost + extra + pen;
                 let vic = self.add_victims(&vics);
@@ -1024,9 +1060,16 @@ impl<'a> Search<'a> {
             return;
         }
         let near_term = n.g < 1.2 || self.h_raw(l, n.pos) < 1.2;
-        let mut pts = self.via_candidates(l, t, n.pos, near_term);
+        let mut pts = match &q.via_spots {
+            // a dogbone net: only its spots beside its pads that lie in this face
+            Some(spots) => {
+                let tr = w.layers[l].cdt.tri_ip(t);
+                spots.iter().cloned().filter(|&x| { let ix = to_ip(x); orient(tr[0], tr[1], ix) > 0 && orient(tr[1], tr[2], ix) > 0 && orient(tr[2], tr[0], ix) > 0 }).collect()
+            }
+            None => self.via_candidates(l, t, n.pos, near_term),
+        };
         let mut paired_vias: Vec<P2> = Vec::new();
-        if q.couple != NONE {
+        if q.couple != NONE && q.via_spots.is_none() {
             let c = &w.b.classes[w.b.nets[q.net as usize].class];
             let pitch = c.via_d + w.b.pair_gap[q.net as usize].max(c.clear) + 0.01;
             let tr2 = w.layers[l].cdt.tri_ip(t);
@@ -1115,7 +1158,8 @@ impl<'a> Search<'a> {
                 }
             }
             let vcost = if paired_vias.iter().any(|&y| y.dist(x) < 1e-9) { q.via_cost * q.couple_factor } else { q.via_cost };
-            let base = n.g + n.pos.dist(x) * q.layer_cost[l] + vcost + vc;
+            let gvc = self.gaps.as_ref().map_or(0.0, |gs| gs.via_cost(q.net, x));
+            let base = n.g + n.pos.dist(x) * q.layer_cost[l] + vcost + vc + gvc;
             let vic = self.add_victims(&vics);
             let nvic = vics.len() as u16;
             if q.plane_goal {
@@ -1130,6 +1174,10 @@ impl<'a> Search<'a> {
             }
             for l2 in 0..w.nsig() {
                 if other_layers & (1 << l2) == 0 {
+                    continue;
+                }
+                // a dogbone via joins its pads' layer to one other layer
+                if q.via_spots.is_some() && q.via_spot_layers & ((1 << l) | (1 << l2)) == 0 {
                     continue;
                 }
                 let lay2 = &w.layers[l2];

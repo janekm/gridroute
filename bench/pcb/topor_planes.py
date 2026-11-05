@@ -11,6 +11,10 @@ layer), plane_regions, fill_keepouts.
 separate ground, poured on the outer layer under it) also gets its outer-layer pours as regions, so an
 SMD pad in one joins the plane on its own layer. On EXT this saves GND1 some 450 mm of track, but other
 nets' wires on that layer then cut the pour apart: it needs the pour kept whole first.
+
+Also written: each plane layer's pour clearance and least width (plane_clearance, plane_min_width: the largest
+zone clearance and the smallest minimum width of its pours), which the plane gap rule uses to find the voids
+under high-speed tracks (nets given a rise_time in cold_routing).
 """
 import json, pathlib, sys
 import pcbnew
@@ -31,6 +35,7 @@ def pts(chain):
 
 regions, keepouts, outer = [], [], []
 cover = {l: 0.0 for l in inner}
+pour_clear, pour_min_w = {}, {}
 for z in b.Zones():
     ls = [b.GetStandardLayerName(l) for l in z.GetLayerSet().CuStack()]
     o = z.Outline()
@@ -48,6 +53,8 @@ for z in b.Zones():
             continue
         if not z.GetNetname():
             continue
+        pour_clear[l] = max(pour_clear.get(l, 0.0), MM(z.GetLocalClearance() or 0))
+        pour_min_w[l] = min(pour_min_w.get(l, 1e9), MM(z.GetMinThickness()))
         for i in range(o.OutlineCount()):
             regions.append(dict(net=z.GetNetname(), layer=l, priority=z.GetAssignedPriority(), points=pts(o.Outline(i)),
                                 holes=[pts(o.Hole(i, j)) for j in range(o.HoleCount(i))]))
@@ -91,7 +98,10 @@ cr['planes'] = {n: l for n, (l, _) in best.items()}
 cr['plane_layers'] = plane_layers
 cr['plane_regions'] = regions
 cr['fill_keepouts'] = keepouts
+cr['plane_clearance'] = {l: round(pour_clear[l], 4) for l in plane_layers if pour_clear.get(l)}
+cr['plane_min_width'] = {l: round(pour_min_w[l], 4) for l in plane_layers if l in pour_min_w}
 (case / 'model.json').write_text(json.dumps(m, indent=2))
 print(json.dumps(dict(plane_layers=plane_layers, coverage={l: round(cover[l] / board_area, 2) for l in inner},
                       planes=cr['planes'], regions=len(regions), fill_keepouts=len(keepouts),
+                      plane_clearance=cr['plane_clearance'], plane_min_width=cr['plane_min_width'],
                       outer_pours_for=[dict(net=n, pads_on_inner_pours=c, pads=t) for n, c, t in poor])))

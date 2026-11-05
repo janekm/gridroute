@@ -4,10 +4,13 @@
 The case directory (bench/pcb/cases/CASE, or --input) is copied to OUT/input, so the KiCad export and
 acceptance steps read exactly the model the engine routed. Internal rules come first; --kicad adds the
 native export, DRC and baseline comparison. RF frontend nets are marked on the copy first (topor_rf.py, KiCad
-Python) unless the model already lists them, so the engine keeps each on one layer.
+Python) unless the model already lists them, so the engine keeps each on one layer. Overlapping rule areas
+are merged into their union first (topor_keepouts.py), so the engine does not hull them, and custom design
+rules (unrouted.kicad_dru) are read into the model (topor_rules.py). $TOPOR overrides the engine binary.
 """
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -34,11 +37,17 @@ def main():
     a.out.mkdir(parents=True)
     shutil.copytree(src, a.out / 'input')
     model = json.loads((a.out / 'input' / 'model.json').read_text())
+    if 'custom_rules' not in model and (a.out / 'input' / 'unrouted.kicad_dru').exists():
+        r = subprocess.run([sys.executable, str(ROOT / 'topor_rules.py'), str(a.out / 'input')], capture_output=True, text=True)
+        print('custom rules:', r.stdout.strip().splitlines()[-1:] if r.returncode == 0 else r.stderr.strip().splitlines()[-1:], flush=True)
+    if not model.get('rule_areas_merged') and model.get('rule_areas') and pathlib.Path(a.kicad_python).exists():
+        r = subprocess.run([a.kicad_python, str(ROOT / 'topor_keepouts.py'), str(a.out / 'input')], capture_output=True, text=True)
+        print('rule areas:', r.stdout.strip().splitlines()[-1:] if r.returncode == 0 else r.stderr.strip().splitlines()[-1:], flush=True)
     if not a.no_rf and 'rf_nets' not in model and pathlib.Path(a.kicad_python).exists():
         r = subprocess.run([a.kicad_python, str(ROOT / 'topor_rf.py'), str(a.out / 'input')], capture_output=True, text=True)
         if r.returncode:
             print('RF frontend detection failed:', r.stderr.strip().splitlines()[-1:], flush=True)
-    exe = ROOT.parents[1] / 'target/release/topor'
+    exe = os.environ.get('TOPOR') or ROOT.parents[1] / 'target/release/topor'
     cmd = [str(exe), 'route', str(a.out / 'input'), '--out', str(a.out), '--seconds', str(a.seconds)] + a.engine_args.split()
     with (a.out / 'engine.log').open('w') as log:
         code = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
