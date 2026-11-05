@@ -120,7 +120,7 @@ for k, l in enumerate(sc['lumped']):
         el.AddBox(lo, hi, priority=1000)
 
 CSX.Write2XML(str(out / 'scene.xml'))
-FDTD.Run(str(sim_path), verbose=1, cleanup=True)
+FDTD.Run(str(sim_path), verbose=0, cleanup=True)
 
 freqs = np.array(fs['ports'][0]['freqs'])
 res = {'freqs': freqs.tolist(), 'ports': []}

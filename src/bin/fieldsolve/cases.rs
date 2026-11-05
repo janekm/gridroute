@@ -72,7 +72,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
     let z = lines_1d(0.0, 14.0, &[h], &[Refine { a: 0.0, b: h + 0.4, h: h / (4.0 * scale) }], 1.3, 2.0, &[(0.0, h, (4.0 * scale).round() as usize)]);
     let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
     let strip = Sheet { name: "top".into(), z: h, prims: vec![rect(0.0, -w / 2.0, len, w / 2.0)] };
-    let lay = Layout { sheets: vec![strip], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![] };
+    let lay = Layout { sheets: vec![strip], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [0.0, -w / 2.0, 0.0], hi: [0.0, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let fmax = 3e9;
     let pml = [8, 8, 8, 8, 0, 8];
@@ -84,7 +84,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
         p.add_iprobe(&format!("i{q}"), 0, xq, [0.0, -w / 2.0 - 0.3, h - 0.1], [0.0, w / 2.0 + 0.3, h + 0.1]);
     }
     let exc = gauss_excite(0.0, fmax, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc, max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc, max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
     let freqs = linspace(200e6, 2.0e9, 19);
     let sp = |k: usize, toff: f64| crate::post::dft(&r.probes[k].iter().map(|&v| v as f64).collect::<Vec<f64>>(), p.dt, toff, &freqs);
     let (v1, i1, v2, _i2, v3, i3) = (sp(0, 0.0), sp(1, -0.5), sp(2, 0.0), sp(3, -0.5), sp(4, 0.0), sp(5, -0.5));
@@ -126,11 +126,12 @@ pub fn patch_capacitance(run: &Runner, scale: f64) -> CaseResult {
         slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }],
         barrels: vec![],
         outline: vec![],
+        copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [a / 2.0, a / 2.0, 0.0], hi: [a / 2.0, a / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95 });
     let exc = gauss_excite(0.0, 4e9, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
     let freqs = linspace(50e6, 1000e6, 20);
     let (v, i) = port_spectra(&r.v[0], &exc, 50.0, p.dt, &freqs);
     // well below the first patch resonance (~7 GHz) the feed is a series L-C: Im Z = w L - 1 / (w C);
@@ -174,11 +175,12 @@ pub fn cavity(run: &Runner, scale: f64) -> CaseResult {
         slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.02 }],
         barrels: vec![],
         outline: vec![],
+        copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [3.0, 3.0, 0.0], hi: [3.0, 3.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95 });
     let exc = gauss_excite(0.0, 4e9, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 400_000, end_db: -90.0, check_every: 500, dft_freqs: vec![], dft_every: 1 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 400_000, end_db: -90.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
     let freqs = linspace(1.0e9, 3.5e9, 1001);
     let (v, i) = port_spectra(&r.v[0], &exc, 50.0, p.dt, &freqs);
     let zm: Vec<f64> = v.iter().zip(&i).map(|(&v, &i)| (v / i).abs()).collect();
@@ -216,7 +218,7 @@ pub fn pec_box(run: &Runner, scale: f64) -> CaseResult {
     let port = Lumped { name: "P1".into(), axis: 2, lo: [7.0, 6.0, 4.0], hi: [7.0, 6.0, 6.0], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95 });
     let exc = gauss_excite(0.0, 20e9, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -60.0, check_every: 500, dft_freqs: vec![], dft_every: 1 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -60.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
     let freqs = linspace(5e9, 16e9, 5501);
     let (v, i) = port_spectra(&r.v[0], &exc, 50.0, p.dt, &freqs);
     let zm: Vec<f64> = v.iter().zip(&i).map(|(&v, &i)| (v / i).abs()).collect();
@@ -234,4 +236,112 @@ pub fn pec_box(run: &Runner, scale: f64) -> CaseResult {
         lines.push((format!("TM{}{}0 [GHz]", m as i32, n as i32), fb * 1e-9, fr * 1e-9));
     }
     CaseResult { name: format!("PEC box {a}x{b}x{c} mm (graded mesh)"), lines, cells: p.n(), steps: r.steps, seconds: r.seconds, backend: r.backend }
+}
+
+/// A single series loop for port checks: ground plane at z = 0, FR4 0.154 mm, a 0.2 mm trace 3 mm long on
+/// top between two 0.5 mm square pads. One pad gets a vertical port to the plane, the other a vertical
+/// short. With nothing else present, the loop impedance must not depend on which end holds the port, and it
+/// must converge with the mesh. `footprint`: port and short span the pad (80 %) instead of one node.
+pub fn port_loop_setup(cell: f64, footprint: bool, swap: bool) -> crate::sim::Setup {
+    let (h, er, len, pad, w) = (0.154, 4.3, 3.0, 0.5, 0.2);
+    let fp = if footprint { 0.8 * pad } else { 0.0 };
+    let ends = [0.0, len];
+    let mut fx = vec![-pad / 2.0, pad / 2.0, len - pad / 2.0, len + pad / 2.0, 0.0, len];
+    let mut fy = vec![-pad / 2.0, pad / 2.0, -w / 2.0, w / 2.0, 0.0];
+    if footprint {
+        for e in ends {
+            fx.extend([e - fp / 2.0, e + fp / 2.0]);
+        }
+        fy.extend([-fp / 2.0, fp / 2.0]);
+    }
+    let pml_w = 8.0 * 1.0;
+    let x = lines_1d(-6.0 - pml_w, len + 6.0 + pml_w, &fx, &[Refine { a: -0.6, b: len + 0.6, h: cell }], 1.3, 1.0, &[]);
+    let y = lines_1d(-6.0 - pml_w, 6.0 + pml_w, &fy, &[Refine { a: -0.6, b: 0.6, h: cell }], 1.3, 1.0, &[]);
+    let z = lines_1d(-3.0 - pml_w, h + 3.0 + pml_w, &[0.0, h], &[Refine { a: 0.0, b: h, h: (h / 3.0).min(cell) }], 1.3, 1.0, &[(0.0, h, 3)]);
+    let grid = Grid { x: mm(x), y: mm(y), z: mm(z) };
+    let top = vec![rect(-pad / 2.0, -pad / 2.0, pad / 2.0, pad / 2.0), rect(len - pad / 2.0, -pad / 2.0, len + pad / 2.0, pad / 2.0), rect(0.0, -w / 2.0, len, w / 2.0)];
+    let layout = Layout {
+        sheets: vec![Sheet { name: "F.Cu".into(), z: h, prims: top }, Sheet { name: "GND".into(), z: 0.0, prims: vec![rect(-5.0, -5.0, len + 5.0, 5.0)] }],
+        slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }],
+        barrels: vec![],
+        outline: vec![],
+        copper_window: None,
+    };
+    let vert = |name: &str, xc: f64, port: bool| Lumped {
+        name: name.into(),
+        axis: 2,
+        lo: [xc - fp / 2.0, -fp / 2.0, 0.0],
+        hi: [xc + fp / 2.0, fp / 2.0, h],
+        plus_at_hi: true,
+        r: if port { 10.0 } else { 0.0 },
+        c: 0.0,
+        port,
+    };
+    let (pa, pb) = if swap { (len, 0.0) } else { (0.0, len) };
+    let lumped = vec![vert("P", pa, true), vert("short", pb, false)];
+    crate::sim::Setup {
+        grid,
+        layout,
+        lumped,
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95 },
+        freqs: linspace(10e6, 3e9, 300),
+        fmax: 3e9,
+        end_db: -70.0,
+        max_steps: 400_000,
+    }
+}
+
+/// Width of a 50-ohm microstrip by bisection on Hammerstad-Jensen.
+pub fn microstrip_width(z0: f64, h: f64, er: f64) -> f64 {
+    let (mut lo, mut hi) = (0.01 * h, 20.0 * h);
+    for _ in 0..60 {
+        let m = 0.5 * (lo + hi);
+        if hammerstad(m, h, er).0 > z0 {
+            lo = m
+        } else {
+            hi = m
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// A fast edge on a 50-ohm microstrip crossing a slot in its ground plane. Trace 30 mm long on top of
+/// 0.2 mm FR4 over a 16 mm wide ground plane; matched 50-ohm ports at both ends (P1 excited). With `slot`,
+/// a 1 mm x 10 mm slot is cut out of the plane across the trace's path at x = 15 mm: the return current
+/// under the trace has to detour around the slot's ends, which adds series inductance, a reflection and
+/// a common-mode / radiating current on the plane.
+pub fn gap_setup(slot: bool, cell: f64, fmax: f64) -> crate::sim::Setup {
+    let (h, er, len, pw) = (0.2, 4.3, 30.0, 16.0);
+    let w = microstrip_width(50.0, h, er);
+    let (sx, sg, sl) = (len / 2.0, 1.0, 10.0);
+    let fx = vec![-2.0, len + 2.0, 0.0, len, sx - sg / 2.0, sx + sg / 2.0];
+    let fy = vec![-pw / 2.0, pw / 2.0, -sl / 2.0, sl / 2.0, -w / 2.0, w / 2.0, 0.0];
+    let pml_w = 8.0;
+    let x = lines_1d(-6.0 - pml_w, len + 6.0 + pml_w, &fx, &[Refine { a: -2.5, b: len + 2.5, h: cell }], 1.3, 1.0, &[]);
+    let y = lines_1d(-pw / 2.0 - 4.0 - pml_w, pw / 2.0 + 4.0 + pml_w, &fy, &[Refine { a: -pw / 2.0 - 0.5, b: pw / 2.0 + 0.5, h: cell }], 1.3, 1.0, &[]);
+    let z = lines_1d(-4.0 - pml_w, h + 4.0 + pml_w, &[0.0, h], &[Refine { a: 0.0, b: h, h: h / 4.0 }], 1.3, 1.0, &[(0.0, h, 4)]);
+    let grid = Grid { x: mm(x), y: mm(y), z: mm(z) };
+    let net = |p: Prim, n: &str| Prim { net: Some(n.into()), ..p };
+    let mut gnd = vec![net(rect(-2.0, -pw / 2.0, len + 2.0, pw / 2.0), "GND")];
+    if slot {
+        gnd.push(Prim { dark: false, ..rect(sx - sg / 2.0, -sl / 2.0, sx + sg / 2.0, sl / 2.0) });
+    }
+    let layout = Layout {
+        sheets: vec![Sheet { name: "TOP".into(), z: h, prims: vec![net(rect(0.0, -w / 2.0, len, w / 2.0), "SIG")] }, Sheet { name: "GND".into(), z: 0.0, prims: gnd }],
+        slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }],
+        barrels: vec![],
+        outline: vec![vec![P2::new(-2.0, -pw / 2.0), P2::new(len + 2.0, -pw / 2.0), P2::new(len + 2.0, pw / 2.0), P2::new(-2.0, pw / 2.0)]],
+        copper_window: None,
+    };
+    let port = |name: &str, x: f64| Lumped { name: name.into(), axis: 2, lo: [x, -w / 2.0, 0.0], hi: [x, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
+    crate::sim::Setup {
+        grid,
+        layout,
+        lumped: vec![port("P1", 0.0), port("P2", len)],
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95 },
+        freqs: linspace(0.0, fmax, 1001),
+        fmax,
+        end_db: -60.0,
+        max_steps: 200_000,
+    }
 }

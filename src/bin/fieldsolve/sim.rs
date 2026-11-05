@@ -128,6 +128,29 @@ pub struct Setup {
 pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let sp = cx.spec.clone();
     let mask = sp.get("solder_mask").and_then(|v| v.as_bool()).unwrap_or(false);
+    // "dielectrics": [{"t": mm, "er": .., "tand": ..}, ...] top to bottom between the copper layers,
+    // overriding the job file (or its absence)
+    if let Some(d) = sp.get("dielectrics").and_then(|v| v.as_array()) {
+        use crate::gerber::StackLayer;
+        let cu: Vec<String> = cx.board.layers.iter().map(|l| l.name.clone()).collect();
+        if d.len() + 1 != cu.len() {
+            return Err(format!("\"dielectrics\" needs {} entries for {} copper layers", cu.len().saturating_sub(1), cu.len()));
+        }
+        let mut st = Vec::new();
+        for (k, name) in cu.iter().enumerate() {
+            st.push(StackLayer { name: name.clone(), kind: StackKind::Copper, thickness_mm: 0.035, eps_r: 1.0, loss_tan: 0.0 });
+            if let Some(e) = d.get(k) {
+                st.push(StackLayer {
+                    name: format!("{}/{}", name, cu.get(k + 1).cloned().unwrap_or_default()),
+                    kind: StackKind::Dielectric,
+                    thickness_mm: num(e, "t", 0.2),
+                    eps_r: num(e, "er", 4.4),
+                    loss_tan: num(e, "tand", 0.02),
+                });
+            }
+        }
+        cx.board.stack = st;
+    }
     let (zs, slabs) = stack_layout(&cx.board, mask);
     cx.zs = zs.clone();
     let cell = num(&sp, "cell", 0.1);
@@ -159,8 +182,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         let prims = l.prims.iter().filter(|p| p.shape.bbox().overlaps(&grown)).cloned().collect();
         sheets.push(Sheet { name: name.clone(), z: *z, prims });
     }
-    let mut fx: Vec<f64> = vec![roi.x0, roi.x1];
-    let mut fy: Vec<f64> = vec![roi.y0, roi.y1];
+    let mut fx: Vec<f64> = vec![roi.x0, roi.x1, dom.x0, dom.x1];
+    let mut fy: Vec<f64> = vec![roi.y0, roi.y1, dom.y0, dom.y1];
     let mut fz: Vec<f64> = zs.iter().map(|x| x.1).collect();
     for s in &slabs {
         fz.push(s.z0);
@@ -189,9 +212,17 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         if let Some(at) = e.get("at") {
             let from = e.get("from").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
             let to = e.get("to").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
-            let (c, _) = cx.locate(at, Some(from))?;
+            let (c, pbb) = cx.locate(at, Some(from))?;
             let (zf, zt) = (cx.z_of(from)?, cx.z_of(to)?);
-            let size = e.get("size").and_then(|v| v.as_array()).map(|a| [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)]).unwrap_or([0.0, 0.0]);
+            // footprint: explicit [w, h]; "point" for a single mesh line; default for a pad reference is the
+            // pad's bounding box shrunk to 80 % (a single node column is a zero-radius wire whose inductance
+            // depends on the cell size)
+            let size = match e.get("size") {
+                Some(Value::Array(a)) => [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)],
+                Some(Value::String(s)) if s == "point" => [0.0, 0.0],
+                _ if at.is_string() => [0.8 * (pbb.x1 - pbb.x0), 0.8 * (pbb.y1 - pbb.y0)],
+                _ => [0.0, 0.0],
+            };
             fx.push(c.x);
             fy.push(c.y);
             if size[0] > 0.0 {
@@ -231,8 +262,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let cell_z = num(&sp, "cell_z", cell.min(slabs.iter().map(|s| s.z1 - s.z0).fold(f64::INFINITY, f64::min) / 2.0));
     let min_layer = num(&sp, "min_cells_layer", 2.0) as usize;
     let pml_w = npml as f64 * hmax.min(1.0).max(cell);
-    let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &[Refine { a: roi.x0, b: roi.x1, h: cell }], 1.3, hmax, &[]);
-    let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &[Refine { a: roi.y0, b: roi.y1, h: cell }], 1.3, hmax, &[]);
+    let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &[Refine { a: dom.x0, b: dom.x1, h: cell }], 1.3, hmax, &[]);
+    let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &[Refine { a: dom.y0, b: dom.y1, h: cell }], 1.3, hmax, &[]);
     let mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
     let gz = lines_1d(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &[Refine { a: zlo, b: zhi, h: cell_z }], 1.3, hmax, &mc);
     // keep only fixed lines that fall inside the domain
@@ -273,7 +304,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                     } else {
                         vec![P2::new(oc - w / 2.0, lo), P2::new(oc + w / 2.0, lo), P2::new(oc + w / 2.0, hi), P2::new(oc - w / 2.0, hi)]
                     };
-                    Prim { shape: Shape::Polygon(pts), dark: true, net: None, pad: None }
+                    Prim { shape: Shape::Polygon(pts), dark: true, net: Some(format!("~{}", pd.name)), pad: None }
                 };
                 if kind == "short" && !pd.port {
                     sheet.prims.push(bar(pa, pb));
@@ -318,7 +349,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             barrels.push(Barrel { c: e, r: h.d / 2.0, z0: za.min(zb), z1: za.max(zb) });
         }
     }
-    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone() };
+    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: Some(dom) };
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
     Ok(Setup {
@@ -373,9 +404,81 @@ pub fn scene_json(st: &Setup, exc_port: Option<usize>) -> Value {
 
 pub type Backend<'a> = &'a dyn Fn(&Problem, &RunSpec) -> RunResult;
 
-/// Run every excitation, write results to `out`.
+/// What to run on a set-up: which ports to excite (names, or all), field snapshot frequencies, L-fit band.
+#[derive(Clone, Debug, Default)]
+pub struct RunOpts {
+    pub excite_all: bool,
+    pub excite: Vec<String>,
+    pub fields: Vec<f64>,
+    pub l_band: Option<(f64, f64)>,
+    /// Report positions in KiCad's frame (y negated).
+    pub kicad: bool,
+    /// Time-domain surface-current snapshots of these copper layers (first excitation only), every
+    /// `snap_ps` picoseconds, written to out/frames/.
+    pub snap_layers: Vec<String>,
+    pub snap_ps: f64,
+    pub snap_until_ps: f64,
+}
+
+impl RunOpts {
+    pub fn from_spec(spec: &Value) -> RunOpts {
+        RunOpts {
+            excite_all: spec.get("excite").and_then(|v| v.as_str()) == Some("all"),
+            excite: spec.get("excite").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+            fields: spec.pointer("/fields/freqs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default(),
+            l_band: spec.get("l_band").and_then(|v| v.as_array()).map(|a| (a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0))),
+            kicad: spec.get("coords").and_then(|v| v.as_str()).unwrap_or("kicad") == "kicad",
+            snap_layers: spec.pointer("/frames/layers").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+            snap_ps: spec.pointer("/frames/every_ps").and_then(|v| v.as_f64()).unwrap_or(5.0),
+            snap_until_ps: spec.pointer("/frames/until_ps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        }
+    }
+}
+
+/// Run every excitation of a board spec, write results to `out`.
 pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> {
     let st = setup(cx)?;
+    run_setup(&st, out, backend, &RunOpts::from_spec(&cx.spec))
+}
+
+/// Z = Z0 (I + S)(I - S)^-1 for an N-port at one frequency.
+pub fn z_from_s(s: &[Vec<Cx>], z0: f64) -> Option<Vec<Vec<Cx>>> {
+    let n = s.len();
+    let one = Cx::new(1.0, 0.0);
+    // a = I - S, b = I + S; solve X a = b  <=>  a^T X^T = b^T (Gauss-Jordan on augmented [a^T | b^T])
+    let mut m: Vec<Vec<Cx>> = (0..n)
+        .map(|i| {
+            let mut row: Vec<Cx> = (0..n).map(|j| if i == j { one - s[j][i] } else { Cx::default() - s[j][i] }).collect();
+            row.extend((0..n).map(|j| if i == j { one + s[j][i] } else { s[j][i] }));
+            row
+        })
+        .collect();
+    for c in 0..n {
+        let piv = (c..n).max_by(|&a, &b| m[a][c].abs().partial_cmp(&m[b][c].abs()).unwrap())?;
+        if m[piv][c].abs() < 1e-30 {
+            return None;
+        }
+        m.swap(c, piv);
+        let d = m[c][c];
+        for k in 0..2 * n {
+            m[c][k] = m[c][k] / d;
+        }
+        for r in 0..n {
+            if r != c {
+                let f = m[r][c];
+                for k in 0..2 * n {
+                    let t = m[c][k] * f;
+                    m[r][k] = m[r][k] - t;
+                }
+            }
+        }
+    }
+    // m[:, n..] = X^T
+    Some((0..n).map(|i| (0..n).map(|j| m[j][n + i] * z0).collect()).collect())
+}
+
+/// Run a prepared set-up, write `scene.json`, `result.json`, Touchstone and fields to `out`.
+pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Result<Value, String> {
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let t0 = std::time::Instant::now();
     let p = build(&st.grid, &st.layout, &st.lumped, &st.opts);
@@ -387,13 +490,24 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
     if np == 0 {
         return Err("no ports".into());
     }
+    let bridges = crate::connect::check(&st.grid, &st.layout);
+    let bridge_lines = crate::connect::describe(&bridges, ro.kicad);
+    for l in &bridge_lines {
+        eprintln!("fieldsolve: WARNING: mesh short: {l}");
+    }
     let names: Vec<String> = p.ports.iter().map(|x| x.name.clone()).collect();
-    let excite: Vec<usize> = match cx.spec.get("excite") {
-        Some(Value::Array(a)) => a.iter().filter_map(|n| names.iter().position(|m| Some(m.as_str()) == n.as_str())).collect(),
-        Some(Value::String(s)) if s == "all" => (0..np).collect(),
-        _ => vec![0],
+    let excite: Vec<usize> = if ro.excite_all {
+        (0..np).collect()
+    } else if !ro.excite.is_empty() {
+        ro.excite.iter().filter_map(|n| names.iter().position(|m| m == n)).collect()
+    } else {
+        vec![0]
     };
-    let fields_f: Vec<f64> = cx.spec.pointer("/fields/freqs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+    let fields_f = ro.fields.clone();
+    let zmm: Vec<f64> = st.grid.z.iter().map(|v| v * 1e3).collect();
+    let snap_sheets: Vec<&crate::model::Sheet> = ro.snap_layers.iter().filter_map(|n| st.layout.sheets.iter().find(|s| &s.name == n)).collect();
+    let snap_k: Vec<usize> = snap_sheets.iter().map(|s| crate::mesh::snap(&zmm, s.z)).collect();
+    let snap_every = if snap_k.is_empty() { 0 } else { ((ro.snap_ps * 1e-12 / p.dt).round() as usize).max(1) };
     let exc = gauss_excite(0.0, st.fmax, p.dt);
     let dft_every = ((1.0 / (2.0 * st.fmax * 1.5)) / p.dt).floor().max(1.0) as usize;
     std::fs::write(out.join("scene.json"), serde_json::to_string(&scene_json(&st, excite.first().copied())).unwrap()).map_err(|e| e.to_string())?;
@@ -401,6 +515,8 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
     let z0 = 50.0;
     let mut s_mat: Vec<Vec<Vec<Cx>>> = vec![vec![vec![Cx::default(); freqs.len()]; np]; np];
     let mut zself: Vec<Option<Vec<Cx>>> = vec![None; np];
+    let mut vall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
+    let mut iall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut runs = Vec::new();
     for (q, &j) in excite.iter().enumerate() {
         let spec = RunSpec {
@@ -411,6 +527,9 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
             check_every: 1000,
             dft_freqs: if q == 0 { fields_f.clone() } else { vec![] },
             dft_every,
+            snap_every: if q == 0 { snap_every } else { 0 },
+            snap_k: snap_k.clone(),
+            snap_until: if ro.snap_until_ps > 0.0 { (ro.snap_until_ps * 1e-12 / p.dt) as usize } else { 0 },
         };
         let r = backend(&p, &spec);
         eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
@@ -427,15 +546,29 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
             s_mat[k][j] = col[k].clone();
         }
         zself[j] = Some(vs[j].iter().zip(&is[j]).map(|(&v, &i)| v / i).collect());
+        vall[j] = vs;
+        iall[j] = is;
         if let Some(fd) = &r.fields {
             crate::export::write_fields(out, &p, &st, fd).map_err(|e| e.to_string())?;
         }
+        if !r.snaps.is_empty() {
+            let names: Vec<String> = snap_sheets.iter().map(|s| s.name.clone()).collect();
+            crate::export::write_frames(out, &p, &st, &names, &r.snaps, &exc).map_err(|e| e.to_string())?;
+        }
         runs.push(json!({"port": names[j], "steps": r.steps, "seconds": r.seconds, "backend": r.backend}));
     }
+    let mut zmat_out = Value::Null;
     if excite.len() == np {
+        s_mat = crate::post::s_matrix(&vall, &iall, z0);
         write_touchstone(&out.join(format!("sparams.s{np}p")), freqs, &s_mat, z0).map_err(|e| e.to_string())?;
+        // impedance matrix per frequency: z[i][j] = {re: [...], im: [...]}
+        let zs: Vec<Option<Vec<Vec<Cx>>>> = (0..freqs.len()).map(|f| z_from_s(&(0..np).map(|i| (0..np).map(|j| s_mat[i][j][f]).collect()).collect::<Vec<_>>(), z0)).collect();
+        zmat_out = json!((0..np).map(|i| (0..np).map(|j| json!({
+            "re": zs.iter().map(|z| z.as_ref().map(|z| z[i][j].re).unwrap_or(f64::NAN)).collect::<Vec<_>>(),
+            "im": zs.iter().map(|z| z.as_ref().map(|z| z[i][j].im).unwrap_or(f64::NAN)).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>()).collect::<Vec<_>>());
     }
-    let lband = cx.spec.get("l_band").and_then(|v| v.as_array()).map(|a| (a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)));
+    let lband = ro.l_band;
     let mut ports_out = Vec::new();
     for j in 0..np {
         let Some(z) = &zself[j] else { continue };
@@ -445,6 +578,8 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
             "z_re": z.iter().map(|c| c.re).collect::<Vec<_>>(),
             "z_im": z.iter().map(|c| c.im).collect::<Vec<_>>(),
             "s11_db": s_mat[j][j].iter().map(|c| 20.0 * c.abs().max(1e-30).log10()).collect::<Vec<_>>(),
+            // |S_kj| in dB for every port k with this port excited (other ports terminated in their R)
+            "s_col_db": (0..np).map(|k| s_mat[k][j].iter().map(|c| 20.0 * c.abs().max(1e-30).log10()).collect::<Vec<_>>()).collect::<Vec<_>>(),
         });
         let (f0, f1) = lband.unwrap_or((freqs[0], freqs[freqs.len() / 10].max(freqs[0])));
         let (r_fit, l_fit) = fit_rl(freqs, z, f0, f1);
@@ -454,7 +589,7 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
     }
     let res = json!({
         "grid": [p.nx, p.ny, p.nz], "cells": p.n(), "dt": p.dt, "runs": runs, "ports": ports_out,
-        "port_names": names,
+        "port_names": names, "z_matrix": zmat_out, "mesh_shorts": bridge_lines,
     });
     std::fs::write(out.join("result.json"), serde_json::to_string_pretty(&res).unwrap()).map_err(|e| e.to_string())?;
     Ok(res)
@@ -469,4 +604,55 @@ pub fn load(spec_path: &Path) -> Result<(Ctx, PathBuf), String> {
     let board = crate::gerber::load_dir(&gdir)?;
     let kicad = spec.get("coords").and_then(|v| v.as_str()).unwrap_or("kicad") == "kicad";
     Ok((Ctx { spec, board, kicad, zs: vec![] }, out))
+}
+
+/// TDR comparison: `tdr.json` and `tdr.svg` (impedance versus distance from the port, two-way time scaled
+/// by v = c / sqrt(eps_eff)); prints the impedance excursion of each curve.
+pub fn write_tdr(out: &Path, curves: &[(bool, Vec<f64>, Vec<f64>, Vec<f64>, f64)], eps_eff: f64) -> std::io::Result<()> {
+    let v = C0 / eps_eff.sqrt();
+    let mut js = Vec::new();
+    let (w, h, ml, mr, mt, mb) = (900.0, 420.0, 70.0, 20.0, 30.0, 50.0);
+    let dmax = 40.0;
+    let (zlo, zhi) = (40.0, 120.0);
+    let px = |d: f64| ml + (d / dmax) * (w - ml - mr);
+    let py = |z: f64| mt + (1.0 - (z - zlo) / (zhi - zlo)) * (h - mt - mb);
+    let mut svg = format!("<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' font-family='sans-serif' font-size='12'><rect width='100%' height='100%' fill='white'/>");
+    for zt in [40, 50, 60, 70, 80, 90, 100, 110, 120] {
+        let y = py(zt as f64);
+        svg += &format!("<line x1='{ml}' x2='{}' y1='{y}' y2='{y}' stroke='#ddd'/><text x='{}' y='{}' text-anchor='end'>{zt}</text>", w - mr, ml - 6.0, y + 4.0);
+    }
+    for d in (0..=40).step_by(5) {
+        let x = px(d as f64);
+        svg += &format!("<line x1='{x}' x2='{x}' y1='{mt}' y2='{}' stroke='#eee'/><text x='{x}' y='{}' text-anchor='middle'>{d}</text>", h - mb, h - mb + 16.0);
+    }
+    svg += &format!("<text x='{}' y='{}' text-anchor='middle'>distance from port [mm] (v = c / sqrt({eps_eff:.3}))</text>", (ml + w - mr) / 2.0, h - 10.0);
+    svg += &format!("<text x='16' y='{}' transform='rotate(-90 16 {})' text-anchor='middle'>TDR impedance [ohm]</text>", h / 2.0, h / 2.0);
+    for (slot, t, rho, z, tr) in curves {
+        let col = if *slot { "#d62728" } else { "#1f77b4" };
+        let pts: Vec<String> = t.iter().zip(z).filter_map(|(&t, &z)| {
+            let d = v * t / 2.0 * 1e3;
+            (d <= dmax).then(|| format!("{:.1},{:.1}", px(d), py(z.clamp(zlo, zhi))))
+        }).collect();
+        svg += &format!("<polyline fill='none' stroke='{col}' stroke-width='2' points='{}'/>", pts.join(" "));
+        // excursion between the port region and the far termination
+        let (mut zmin, mut zmax, mut dmaxz) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        for (&t, &zz) in t.iter().zip(z) {
+            let d = v * t / 2.0 * 1e3;
+            if d > 3.0 && d < 27.0 {
+                if zz > zmax {
+                    zmax = zz;
+                    dmaxz = d;
+                }
+                zmin = zmin.min(zz);
+            }
+        }
+        let label = if *slot { "slot in ground plane" } else { "solid ground plane" };
+        eprintln!("fieldsolve gap: {label}: TDR {zmin:.1} .. {zmax:.1} ohm along the line (peak at {dmaxz:.1} mm), rise time {:.0} ps", tr * 1e12);
+        js.push(serde_json::json!({"slot": slot, "t": t, "rho": rho, "z": z, "rise_s": tr, "z_peak": zmax, "d_peak_mm": dmaxz}));
+    }
+    svg += &format!("<rect x='{}' y='{}' width='12' height='3' fill='#1f77b4'/><text x='{}' y='{}'>solid ground plane</text>", w - 230.0, mt + 10.0, w - 212.0, mt + 14.0);
+    svg += &format!("<rect x='{}' y='{}' width='12' height='3' fill='#d62728'/><text x='{}' y='{}'>1 x 10 mm slot at 15 mm</text>", w - 230.0, mt + 28.0, w - 212.0, mt + 32.0);
+    svg += "</svg>";
+    std::fs::write(out.join("tdr.svg"), svg)?;
+    std::fs::write(out.join("tdr.json"), serde_json::to_string(&js).unwrap())
 }

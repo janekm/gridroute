@@ -22,6 +22,38 @@ pub struct RunSpec {
     /// Frequencies for field snapshots (running DFT of all six components), sampled every `dft_every` steps.
     pub dft_freqs: Vec<f64>,
     pub dft_every: usize,
+    /// Time-domain snapshots of the surface current on mesh planes `snap_k`, every `snap_every` steps
+    /// (0 = none).
+    pub snap_every: usize,
+    pub snap_k: Vec<usize>,
+    /// No snapshots after this step (0 = no limit).
+    pub snap_until: usize,
+}
+
+/// One time-domain snapshot: per requested plane, the sheet current (Jx, Jy) at the nodes, A/m.
+#[derive(Clone, Debug)]
+pub struct Snap {
+    pub step: usize,
+    pub j: Vec<[Vec<f32>; 2]>,
+}
+
+/// Surface current n x (H+ - H-) on mesh plane k from the H arrays: Jx = Hy(k) - Hy(k-1),
+/// Jy = Hx(k-1) - Hx(k), sampled at the nodes (the half-cell offsets of Hx/Hy are ignored).
+pub fn sheet_current(nx: usize, ny: usize, nz: usize, hx: &[f32], hy: &[f32], k: usize) -> [Vec<f32>; 2] {
+    let mut jx = vec![0.0f32; nx * ny];
+    let mut jy = vec![0.0f32; nx * ny];
+    if k == 0 || k + 1 >= nz {
+        return [jx, jy];
+    }
+    for j in 0..ny {
+        for i in 0..nx {
+            let up = (k * ny + j) * nx + i;
+            let dn = ((k - 1) * ny + j) * nx + i;
+            jx[j * nx + i] = hy[up] - hy[dn];
+            jy[j * nx + i] = hx[dn] - hx[up];
+        }
+    }
+    [jx, jy]
 }
 
 /// Frequency-domain fields: per frequency, per component (Ex..Ez, Hx..Hz), interleaved (re, im).
@@ -39,6 +71,7 @@ pub struct RunResult {
     /// Field probe samples at steps 0..=steps (E probes at n dt, H probes at (n - 1/2) dt).
     pub probes: Vec<Vec<f32>>,
     pub fields: Option<FieldDft>,
+    pub snaps: Vec<Snap>,
     pub seconds: f64,
     pub backend: String,
 }
@@ -318,6 +351,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
     });
     let mut peak = 0.0f64;
     let mut steps = 0;
+    let mut snaps = Vec::new();
     for n in 0..spec.max_steps {
         update_h(p, &mut s);
         pml_h(p, &mut s);
@@ -338,6 +372,9 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
             pv[k].push(x);
         }
         steps = n + 1;
+        if spec.snap_every > 0 && steps % spec.snap_every == 0 && (spec.snap_until == 0 || steps <= spec.snap_until) {
+            snaps.push(Snap { step: steps, j: spec.snap_k.iter().map(|&k| sheet_current(p.nx, p.ny, p.nz, &s.h[0], &s.h[1], k)).collect() });
+        }
         if let Some(fd) = fd.as_mut() {
             if steps % spec.dft_every == 0 {
                 dft_acc(p, &s, steps, spec.dft_every, fd);
@@ -351,7 +388,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
             }
         }
     }
-    RunResult { steps, v, probes: pv, fields: fd, seconds: t0.elapsed().as_secs_f64(), backend: "cpu".into() }
+    RunResult { steps, v, probes: pv, fields: fd, snaps, seconds: t0.elapsed().as_secs_f64(), backend: "cpu".into() }
 }
 
 #[allow(unused)]

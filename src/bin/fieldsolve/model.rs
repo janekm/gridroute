@@ -48,6 +48,9 @@ pub struct Layout {
     pub barrels: Vec<Barrel>,
     /// Board outline loops (even-odd); empty means dielectric everywhere in x/y.
     pub outline: Vec<Vec<P2>>,
+    /// Copper is rasterised only inside this box (mm): the fine-meshed region. Copper outside it would land
+    /// on graded coarse cells and merge across gaps.
+    pub copper_window: Option<BBox>,
 }
 
 impl Layout {
@@ -228,9 +231,12 @@ pub struct SheetMask {
     pub k: usize,
     pub ex: Vec<bool>,
     pub ey: Vec<bool>,
+    /// Net index (into the list returned with the masks; 0 = no net) of the copper that set each edge.
+    pub exn: Vec<u32>,
+    pub eyn: Vec<u32>,
 }
 
-fn paint(mask: &mut [bool], nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
+fn paint(mask: &mut [bool], nets: &mut [u32], net: u32, nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
     // xs: sample x positions (len nx), ys: sample rows; mask[(j * nx) + i]
     let bb = p.shape.bbox();
     let ir = range_in(xs, bb.x0, bb.x1);
@@ -256,6 +262,7 @@ fn paint(mask: &mut [bool], nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
                 for s in xc.chunks_exact(2) {
                     for i in range_in(xs, s[0], s[1]) {
                         mask[j * nx + i] = p.dark;
+                        nets[j * nx + i] = if p.dark { net } else { 0 };
                     }
                 }
             }
@@ -265,6 +272,7 @@ fn paint(mask: &mut [bool], nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
                 for i in ir.clone() {
                     if sh.contains(P2::new(xs[i], ys[j])) {
                         mask[j * nx + i] = p.dark;
+                        nets[j * nx + i] = if p.dark { net } else { 0 };
                     }
                 }
             }
@@ -272,8 +280,27 @@ fn paint(mask: &mut [bool], nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
     }
 }
 
-/// Rasterise copper sheets onto the grid's in-plane edges (coordinates in mm on the layout side).
-pub fn sheet_masks(g: &Grid, lay: &Layout) -> Vec<SheetMask> {
+/// Rasterise copper sheets onto the grid's in-plane edges (coordinates in mm on the layout side). Returns
+/// the masks and the net names they index (entry 0 is "" for copper without a net).
+pub fn sheet_masks(g: &Grid, lay: &Layout) -> (Vec<SheetMask>, Vec<String>) {
+    let mut names: Vec<String> = vec![String::new()];
+    let mut index = std::collections::HashMap::new();
+    let sheet_nets: Vec<Vec<u32>> = lay
+        .sheets
+        .iter()
+        .map(|s| {
+            s.prims
+                .iter()
+                .map(|p| match &p.net {
+                    Some(n) => *index.entry(n.clone()).or_insert_with(|| {
+                        names.push(n.clone());
+                        (names.len() - 1) as u32
+                    }),
+                    None => 0,
+                })
+                .collect()
+        })
+        .collect();
     use rayon::prelude::*;
     let (nx, ny) = (g.nx(), g.ny());
     let xmm: Vec<f64> = g.x.iter().map(|v| v * 1e3).collect();
@@ -284,19 +311,162 @@ pub fn sheet_masks(g: &Grid, lay: &Layout) -> Vec<SheetMask> {
     xh.push(f64::INFINITY);
     let mut yh: Vec<f64> = ymm.windows(2).map(|w| 0.5 * (w[0] + w[1])).collect();
     yh.push(f64::INFINITY);
-    lay.sheets
+    let masks: Vec<SheetMask> = lay
+        .sheets
         .par_iter()
-        .map(|s| {
+        .zip(sheet_nets.par_iter())
+        .map(|(s, sn)| {
             let k = snap(&zmm, s.z);
             let mut ex = vec![false; nx * ny];
             let mut ey = vec![false; nx * ny];
-            for p in &s.prims {
-                paint(&mut ex, nx, &xh, &ymm, p);
-                paint(&mut ey, nx, &xmm, &yh, p);
+            let mut exn = vec![0u32; nx * ny];
+            let mut eyn = vec![0u32; nx * ny];
+            for (p, &net) in s.prims.iter().zip(sn) {
+                if lay.copper_window.is_some_and(|w| !w.overlaps(&p.shape.bbox())) {
+                    continue;
+                }
+                paint(&mut ex, &mut exn, net, nx, &xh, &ymm, p);
+                paint(&mut ey, &mut eyn, net, nx, &xmm, &yh, p);
             }
-            SheetMask { k, ex, ey }
+            if let Some(w) = lay.copper_window {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let q = j * nx + i;
+                        if ex[q] && !w.contains(P2::new(xh[i], ymm[j])) {
+                            ex[q] = false;
+                        }
+                        if ey[q] && !w.contains(P2::new(xmm[i], yh[j])) {
+                            ey[q] = false;
+                        }
+                    }
+                }
+            }
+            SheetMask { k, ex, ey, exn, eyn }
         })
-        .collect()
+        .collect();
+    let mut masks = masks;
+    // copper added for lumped elements ("~name") joins nets on purpose: it never conflicts
+    let wild: Vec<bool> = names.iter().map(|n| n.starts_with('~')).collect();
+    resolve_conflicts(g, lay, &mut masks, &wild);
+    (masks, names)
+}
+
+/// Keep the mesh's connectivity equal to the layout's where gaps are close to a cell:
+/// - at a node where in-plane copper edges of two nets meet, the edges of the net with fewer edges at that
+///   node are removed (the other net's copper is the one the node lies in);
+/// - at a via barrel's nodes, copper edges of nets other than the barrel's are removed (a too-small antipad
+///   in the raster). The barrel's net is the most common net among copper edges at its nodes.
+/// Copper without a net never conflicts. Returns the number of edges removed.
+pub fn resolve_conflicts(g: &Grid, lay: &Layout, masks: &mut [SheetMask], wild: &[bool]) -> usize {
+    let (nx, ny) = (g.nx(), g.ny());
+    // element copper and net-less copper are both net 0 here
+    let real = |n: u32| if wild[n as usize] { 0 } else { n };
+    let mut removed = 0usize;
+    // incident in-plane edges of node (i, j): (is_x, q)
+    let incident = |i: usize, j: usize| -> [(bool, Option<usize>); 4] {
+        [
+            (true, (i + 1 < nx).then_some(j * nx + i)),
+            (true, (i > 0).then(|| j * nx + i - 1)),
+            (false, (j + 1 < ny).then_some(j * nx + i)),
+            (false, (j > 0).then(|| (j - 1) * nx + i)),
+        ]
+    };
+    // barrels: their net, from the copper at their nodes on every sheet they cross
+    let mut barrel_net: Vec<(Vec<(usize, usize)>, usize, usize, u32)> = Vec::new();
+    for b in &lay.barrels {
+        let (cells, k0, k1) = barrel_nodes(g, b);
+        let mut count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for m in masks.iter().filter(|m| m.k >= k0 && m.k <= k1) {
+            for &(i, j) in &cells {
+                for (isx, q) in incident(i, j) {
+                    if let Some(q) = q {
+                        let (on, net) = if isx { (m.ex[q], real(m.exn[q])) } else { (m.ey[q], real(m.eyn[q])) };
+                        if on && net != 0 {
+                            *count.entry(net).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let net = count.into_iter().max_by_key(|&(n, c)| (c, std::cmp::Reverse(n))).map(|x| x.0).unwrap_or(0);
+        barrel_net.push((cells, k0, k1, net));
+    }
+    for m in masks.iter_mut() {
+        // barrels first: they are drilled copper of their own net
+        for (cells, k0, k1, bnet) in &barrel_net {
+            if *bnet == 0 || m.k < *k0 || m.k > *k1 {
+                continue;
+            }
+            for &(i, j) in cells {
+                for (isx, q) in incident(i, j) {
+                    if let Some(q) = q {
+                        let (on, net) = if isx { (&mut m.ex[q], real(m.exn[q])) } else { (&mut m.ey[q], real(m.eyn[q])) };
+                        if *on && net != 0 && net != *bnet {
+                            *on = false;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // copper of two nets at one node
+        for j in 0..ny {
+            for i in 0..nx {
+                let inc = incident(i, j);
+                let mut nets: [(u32, usize); 4] = [(0, 0); 4];
+                let mut nn = 0;
+                for (isx, q) in inc {
+                    if let Some(q) = q {
+                        let (on, net) = if isx { (m.ex[q], real(m.exn[q])) } else { (m.ey[q], real(m.eyn[q])) };
+                        if on && net != 0 {
+                            if let Some(e) = nets[..nn].iter_mut().find(|e| e.0 == net) {
+                                e.1 += 1;
+                            } else {
+                                nets[nn] = (net, 1);
+                                nn += 1;
+                            }
+                        }
+                    }
+                }
+                if nn < 2 {
+                    continue;
+                }
+                let keep = nets[..nn].iter().max_by_key(|e| (e.1, std::cmp::Reverse(e.0))).unwrap().0;
+                for (isx, q) in inc {
+                    if let Some(q) = q {
+                        let (on, net) = if isx { (&mut m.ex[q], real(m.exn[q])) } else { (&mut m.ey[q], real(m.eyn[q])) };
+                        if *on && net != 0 && net != keep {
+                            *on = false;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Mesh nodes (i, j) and the z-edge range k0..k1 a barrel occupies: the nodes within its radius, or the
+/// nearest node when it is thinner than the mesh.
+pub fn barrel_nodes(g: &Grid, b: &Barrel) -> (Vec<(usize, usize)>, usize, usize) {
+    let xmm: Vec<f64> = g.x.iter().map(|v| v * 1e3).collect();
+    let ymm: Vec<f64> = g.y.iter().map(|v| v * 1e3).collect();
+    let zmm: Vec<f64> = g.z.iter().map(|v| v * 1e3).collect();
+    let (k0, k1) = (snap(&zmm, b.z0.min(b.z1)), snap(&zmm, b.z0.max(b.z1)));
+    let r = b.r;
+    let mut cells = Vec::new();
+    for j in range_in(&ymm, b.c.y - r, b.c.y + r) {
+        for i in range_in(&xmm, b.c.x - r, b.c.x + r) {
+            if (xmm[i] - b.c.x).powi(2) + (ymm[j] - b.c.y).powi(2) <= r * r {
+                cells.push((i, j));
+            }
+        }
+    }
+    if cells.is_empty() {
+        cells.push((snap(&xmm, b.c.x), snap(&ymm, b.c.y)));
+    }
+    (cells, k0, k1)
 }
 
 fn cpml_axis(lines: &[f64], nlo: usize, nhi: usize, dt: f64, fmax: f64) -> PmlAxis {
@@ -564,7 +734,7 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
             }
         }
     }
-    for m in sheet_masks(g, lay) {
+    for m in sheet_masks(g, lay).0 {
         for j in 0..ny {
             for i in 0..nx {
                 let id = g.idx(i, j, m.k);
@@ -579,28 +749,8 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
             }
         }
     }
-    let xmm: Vec<f64> = g.x.iter().map(|v| v * 1e3).collect();
-    let ymm: Vec<f64> = g.y.iter().map(|v| v * 1e3).collect();
-    let zmm: Vec<f64> = g.z.iter().map(|v| v * 1e3).collect();
     for b in &lay.barrels {
-        let (k0, k1) = (snap(&zmm, b.z0.min(b.z1)), snap(&zmm, b.z0.max(b.z1)));
-        let r = b.r.max(0.5 * (g.min_step(0).max(g.min_step(1))) * 1e3 * 0.0);
-        let mut ir = range_in(&xmm, b.c.x - r, b.c.x + r);
-        let mut jr = range_in(&ymm, b.c.y - r, b.c.y + r);
-        let mut cells: Vec<(usize, usize)> = Vec::new();
-        for j in jr.clone() {
-            for i in ir.clone() {
-                if (xmm[i] - b.c.x).powi(2) + (ymm[j] - b.c.y).powi(2) <= r * r {
-                    cells.push((i, j));
-                }
-            }
-        }
-        if cells.is_empty() {
-            // thinner than the mesh: the nearest node carries it
-            ir = snap(&xmm, b.c.x)..snap(&xmm, b.c.x) + 1;
-            jr = snap(&ymm, b.c.y)..snap(&ymm, b.c.y) + 1;
-            cells.push((ir.start, jr.start));
-        }
+        let (cells, k0, k1) = barrel_nodes(g, b);
         for (i, j) in cells {
             for k in k0..k1 {
                 let id = g.idx(i, j, k);

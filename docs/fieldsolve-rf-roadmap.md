@@ -90,7 +90,54 @@ Outputs per frontend:
   us whether the antenna needs a ground-plane spacer, a different orientation, or a matching network tuned
   for the installed case.
 
-## 3. Inputs we need
+## 3. 1BP: what we know (Nov 2026)
+
+- **Board:** 1BP_mini R6B is the current 1BP ("1 Pipe Boiler"). 1BP R6B has the same RF section on a longer
+  board.
+- **Radio and RF path:** nRF52840 (U1, AQFN-73), RF pin H23 (net ANT). All parts are 0402 on top, a ladder
+  to an IPEX ANB02001 connector J1 (pin 4):
+  1. C21 1.0 pF shunt
+  2. L4 4.7 nH series
+  3. C18 1.2 pF shunt
+  4. L3 2.2 nH series
+
+  There is no balun or ESD part.
+- **Antenna:** an external FPC (YL1761-2.4, ≤ 1.19 dBi) on a 40 mm 1.13 mm coax, stuck inside the plastic
+  shell. The device straps to a heating pipe.
+- **Layout (KiCad coordinates, mm):**
+  - parts: U1.H23 (149.42, 92.87), C21 at y 91.1, L4 at y 90.1–89.1, C18 at y 88.05, L3 at y 87.0–86.0,
+    J1.4 (149.60, 84.72) with GND pads at y 83.2 and 81.68;
+  - the feed is a ≈ 0.79 mm top-layer fill;
+  - both inner layers are kept out under the matching network, so the feed is referenced to the
+    bottom/top GND.
+- **Stack-up:** JLC 4-layer 0.8 mm:
+
+  | layer | material | thickness | εr | tan δ |
+  |---|---|---|---|---|
+  | top prepreg | 7628 | 0.21 mm | 4.45 | 0.015 |
+  | core | | 0.25 mm | 4.1 | |
+  | bottom prepreg | 7628 | 0.21 mm | 4.45 | 0.015 |
+
+  Copper is 35/15/15/35 µm. Pass the dielectrics in the spec as
+  `"dielectrics": [{"t":0.21,"er":4.45,"tand":0.015},{"t":0.25,"er":4.1,"tand":0.015},{"t":0.21,"er":4.45,"tand":0.015}]`;
+  the KiCad conversion says 1.6 mm, which is wrong.
+- **Gerbers:** X2 with nets and pads from the KiCad conversion,
+  `p-hw/easyeda2kicad/6B/1BP_mini/fabrication/gerbers/`; they load in fieldsolve. The EasyEDA production
+  Gerbers carry no net attributes.
+- **Validation data:** VNA plots of a separate chip-antenna test PCB, "1BP v260427"
+  (`p-hw/docs/antenna/C293767/`). There is no 1BP enclosure CAD and there are no range tests.
+
+First 1BP runs, in order:
+
+1. **Ladder as copper only.** Ports at C21 (ANT–GND), L4, C18, L3 and J1.4–GND: a 5-port EM run. Then
+   connect the Murata LQG15HS/GRM1555 S-parameters (needs F1) and get S chip → J1, checked against the
+   ideal ladder.
+2. **u.FL pad study.** The excess capacitance of J1.4 with and without the inner-layer keep-out, shown as
+   TDR and as S11 at 2.44 GHz.
+3. **Antenna on the pipe** (A1–A4): the FPC antenna's own model is not in our layout. Simulate it as a
+   generic 2.4 GHz FPC dipole, or ask the vendor for its geometry, plus the board, coax and the pipe.
+
+## 4. Inputs we need
 
 - **KiCad sources of EXT and 1BP** (Revision_6B in p-hw). Their prepared inputs were lost on 2026-11-04 and
   have to be re-exported. The nRF54 board's KiCad file is also needed.
@@ -104,7 +151,7 @@ Outputs per frontend:
   data. These calibrate the models. Antmicro's gerber2ems examples come with VNA data that serves as a
   public check of the whole flow.
 
-## 4. Suggested order
+## 5. Suggested order
 
 1. **Port accuracy and RF meshing** (F3, F4) with openEMS cross-checks. Everything else depends on ports
    that are right to ~2 %.

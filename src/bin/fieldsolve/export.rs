@@ -231,3 +231,39 @@ pub fn write_fields(out: &Path, p: &Problem, st: &Setup, fd: &FieldDft) -> std::
     });
     std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap())
 }
+
+/// Time-domain surface-current frames: `out/frames/J_<layer>_<NNNN>.f32` (Jx plane then Jy plane, nx * ny
+/// f32 each, x fastest) and `frames.json` (grid lines, layer heights, frame steps and times, the source
+/// voltage at each frame, and the largest |J| per layer for a fixed colour scale).
+pub fn write_frames(out: &Path, p: &Problem, st: &Setup, layers: &[String], snaps: &[crate::fdtd::Snap], exc: &[f32]) -> std::io::Result<()> {
+    let dir = out.join("frames");
+    std::fs::create_dir_all(&dir)?;
+    let (nx, ny) = (p.nx, p.ny);
+    let mut jmax = vec![0.0f32; layers.len()];
+    for (fi, sn) in snaps.iter().enumerate() {
+        for (li, name) in layers.iter().enumerate() {
+            let [jx, jy] = &sn.j[li];
+            let mut buf = Vec::with_capacity(2 * nx * ny);
+            buf.extend_from_slice(jx);
+            buf.extend_from_slice(jy);
+            for q in 0..nx * ny {
+                jmax[li] = jmax[li].max((jx[q] * jx[q] + jy[q] * jy[q]).sqrt());
+            }
+            write_f32(&dir.join(format!("J_{}_{:04}.f32", name.replace('.', "_"), fi)), &buf)?;
+        }
+    }
+    let zmm: Vec<f64> = p.grid.z.iter().map(|v| v * 1e3).collect();
+    let meta = json!({
+        "shape": [nx, ny],
+        "x": p.grid.x.iter().map(|v| v * 1e3).collect::<Vec<_>>(),
+        "y": p.grid.y.iter().map(|v| v * 1e3).collect::<Vec<_>>(),
+        "layers": layers.iter().zip(&jmax).map(|(n, m)| {
+            let s = st.layout.sheets.iter().find(|s| &s.name == n).unwrap();
+            json!({"name": n, "tag": n.replace('.', "_"), "z": s.z, "k": crate::mesh::snap(&zmm, s.z), "j_max": m})
+        }).collect::<Vec<_>>(),
+        "frames": snaps.iter().map(|s| json!({"step": s.step, "t_ps": s.step as f64 * p.dt * 1e12, "vs": exc.get(s.step).copied().unwrap_or(0.0)})).collect::<Vec<_>>(),
+        "dt": p.dt,
+        "pml": st.opts.pml,
+    });
+    std::fs::write(dir.join("frames.json"), serde_json::to_string_pretty(&meta).unwrap())
+}

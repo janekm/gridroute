@@ -149,8 +149,12 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
     let mut peak = 0.0f64;
     let mut steps = 0usize;
     let mut done = false;
+    let mut snaps = Vec::new();
     while !done && steps < spec.max_steps {
-        let nb = BATCH.min(spec.max_steps - steps);
+        let mut nb = BATCH.min(spec.max_steps - steps);
+        if spec.snap_every > 0 && (spec.snap_until == 0 || steps < spec.snap_until) {
+            nb = nb.min(spec.snap_every - steps % spec.snap_every);
+        }
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         for b in 0..nb {
@@ -305,6 +309,12 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
             }
         }
         steps = end;
+        if spec.snap_every > 0 && steps % spec.snap_every == 0 && (spec.snap_until == 0 || steps <= spec.snap_until) {
+            // unified memory: read H in place
+            let hx = unsafe { std::slice::from_raw_parts(h[0].contents() as *const f32, n) };
+            let hy = unsafe { std::slice::from_raw_parts(h[1].contents() as *const f32, n) };
+            snaps.push(crate::fdtd::Snap { step: steps, j: spec.snap_k.iter().map(|&k| crate::fdtd::sheet_current(nx, ny, nz, hx, hy, k)).collect() });
+        }
         if check {
             let en: f64 = read(&eout, ny * nz).iter().map(|&x| x as f64).sum();
             peak = peak.max(en);
@@ -320,5 +330,5 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
         freqs: spec.dft_freqs.clone(),
         data: dftb.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * n))).collect(),
     });
-    Ok(RunResult { steps, v, probes: pv, fields, seconds: t0.elapsed().as_secs_f64(), backend: format!("metal ({})", dev.name()) })
+    Ok(RunResult { steps, v, probes: pv, fields, snaps, seconds: t0.elapsed().as_secs_f64(), backend: format!("metal ({})", dev.name()) })
 }

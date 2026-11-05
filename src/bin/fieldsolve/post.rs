@@ -98,7 +98,68 @@ pub fn linspace(a: f64, b: f64, n: usize) -> Vec<f64> {
     (0..n).map(|k| a + (b - a) * k as f64 / (n - 1) as f64).collect()
 }
 
-/// Power-wave S-parameter column for excitation port `j`: `S_ij = b_i / a_j`.
+/// Inverse of a small complex matrix (Gauss-Jordan with partial pivoting).
+pub fn inv(m: &[Vec<Cx>]) -> Option<Vec<Vec<Cx>>> {
+    let n = m.len();
+    let mut a: Vec<Vec<Cx>> = m.iter().enumerate().map(|(i, r)| {
+        let mut row = r.clone();
+        row.extend((0..n).map(|j| if i == j { Cx::new(1.0, 0.0) } else { Cx::default() }));
+        row
+    }).collect();
+    for c in 0..n {
+        let piv = (c..n).max_by(|&x, &y| a[x][c].abs().partial_cmp(&a[y][c].abs()).unwrap())?;
+        if a[piv][c].abs() < 1e-300 {
+            return None;
+        }
+        a.swap(c, piv);
+        let d = a[c][c];
+        for k in 0..2 * n {
+            a[c][k] = a[c][k] / d;
+        }
+        for r in 0..n {
+            if r != c {
+                let f = a[r][c];
+                for k in 0..2 * n {
+                    let t = a[c][k] * f;
+                    a[r][k] = a[r][k] - t;
+                }
+            }
+        }
+    }
+    Some(a.into_iter().map(|r| r[n..].to_vec()).collect())
+}
+
+pub fn matmul(a: &[Vec<Cx>], b: &[Vec<Cx>]) -> Vec<Vec<Cx>> {
+    let (n, m, p) = (a.len(), b.len(), b[0].len());
+    (0..n).map(|i| (0..p).map(|j| (0..m).fold(Cx::default(), |s, k| s + a[i][k] * b[k][j])).collect()).collect()
+}
+
+/// Full S-matrix from all excitations: `v[j][k][f]`, `i[j][k][f]` are port k's voltage and current when
+/// port j is excited. With the wave matrices A = (V + Z0 I) / (2 sqrt Z0) and B = (V - Z0 I) / (2 sqrt Z0)
+/// (column j = excitation j), S = B A^-1. This holds for any port terminations, unlike b_i / a_j, which
+/// assumes the other ports are matched to Z0. Returns `s[i][j][f]`.
+pub fn s_matrix(v: &[Vec<Vec<Cx>>], i: &[Vec<Vec<Cx>>], z0: f64) -> Vec<Vec<Vec<Cx>>> {
+    let n = v.len();
+    let nf = v[0][0].len();
+    let k = 1.0 / (2.0 * z0.sqrt());
+    let mut s = vec![vec![vec![Cx::default(); nf]; n]; n];
+    for f in 0..nf {
+        let a: Vec<Vec<Cx>> = (0..n).map(|p| (0..n).map(|j| (v[j][p][f] + i[j][p][f] * z0) * k).collect()).collect();
+        let b: Vec<Vec<Cx>> = (0..n).map(|p| (0..n).map(|j| (v[j][p][f] - i[j][p][f] * z0) * k).collect()).collect();
+        if let Some(ai) = inv(&a) {
+            let sf = matmul(&b, &ai);
+            for p in 0..n {
+                for j in 0..n {
+                    s[p][j][f] = sf[p][j];
+                }
+            }
+        }
+    }
+    s
+}
+
+/// Power-wave reflection/transmission for excitation port `j` with the other ports terminated in their own
+/// resistances: `b_i / a_j`. Equal to S only when those terminations are matched to Z0.
 pub fn s_column(v: &[Vec<Cx>], i: &[Vec<Cx>], z0: f64, j: usize) -> Vec<Vec<Cx>> {
     let k = 1.0 / (2.0 * z0.sqrt());
     let nf = v[j].len();
@@ -148,4 +209,39 @@ pub fn fit_rl(freqs: &[f64], z: &[Cx], f0: f64, f1: f64) -> (f64, f64) {
         }
     }
     (sr / n.max(1.0), sl / n.max(1.0))
+}
+
+/// Time-domain reflectometry from S11 on a uniform frequency grid starting at (or near) DC.
+/// Returns (t [s], step reflection rho(t), impedance Z0 (1 + rho) / (1 - rho)). The spectrum is shaped
+/// by a Gaussian that falls to 0.1 at the top frequency; the step's 10-90 % rise time is then
+/// 0.577 / f_g = 0.88 / f_top (returned as the last value).
+pub fn tdr(freqs: &[f64], s11: &[Cx], z0: f64, t_max: f64, nt: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, f64) {
+    let fmax = *freqs.last().unwrap();
+    let fg = fmax / (10f64.ln()).sqrt();
+    let df = freqs[1] - freqs[0];
+    let w: Vec<f64> = freqs.iter().map(|&f| (-(f / fg).powi(2)).exp()).collect();
+    let dt = t_max / nt as f64;
+    let mut rho = Vec::with_capacity(nt);
+    let mut acc = 0.0;
+    let h = |t: f64| -> f64 {
+        let mut s = 0.0;
+        for (k, (&f, &x)) in freqs.iter().zip(s11).enumerate() {
+            let wk = if k == 0 && f == 0.0 { 0.5 } else { 1.0 };
+            let (sn, cs) = (2.0 * std::f64::consts::PI * f * t).sin_cos();
+            s += wk * w[k] * (x.re * cs - x.im * sn);
+        }
+        2.0 * df * s
+    };
+    let mut prev = h(0.0);
+    let ts: Vec<f64> = (0..nt).map(|k| k as f64 * dt).collect();
+    for (k, &t) in ts.iter().enumerate() {
+        if k > 0 {
+            let cur = h(t);
+            acc += 0.5 * (prev + cur) * dt;
+            prev = cur;
+        }
+        rho.push(acc);
+    }
+    let z: Vec<f64> = rho.iter().map(|&r| z0 * (1.0 + r) / (1.0 - r).max(1e-9)).collect();
+    (ts, rho, z, 0.577 / fg)
 }

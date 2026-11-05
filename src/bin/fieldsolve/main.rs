@@ -1,6 +1,7 @@
 //! fieldsolve: a 3-D FDTD field solver for PCB layouts (CPU reference and Metal backend).
 #![allow(dead_code)]
 mod cases;
+mod connect;
 mod fdtd;
 mod geom;
 mod gerber;
@@ -56,6 +57,45 @@ fn main() {
                 worst = worst.max(r.worst());
             }
             println!("worst relative error {:.2} %", worst * 100.0);
+        }
+        "gap" => {
+            // fast edge over a slot in the ground plane: TDR, S21 and current frames, with and without slot
+            let be = backend(&args);
+            let out = std::path::PathBuf::from(arg(&args, "--out").unwrap_or_else(|| "fieldsolve-gap".into()));
+            let cell: f64 = arg(&args, "--cell").and_then(|v| v.parse().ok()).unwrap_or(0.1);
+            let fmax: f64 = arg(&args, "--fmax").and_then(|v| v.parse().ok()).unwrap_or(20e9);
+            let ro = sim::RunOpts { snap_layers: vec!["TOP".into(), "GND".into()], snap_ps: 2.0, snap_until_ps: 500.0, ..Default::default() };
+            let mut curves = Vec::new();
+            for slot in [false, true] {
+                let st = cases::gap_setup(slot, cell, fmax);
+                let dir = out.join(if slot { "slot" } else { "solid" });
+                let r = sim::run_setup(&st, &dir, &*be, &ro).unwrap_or_else(|e| panic!("{e}"));
+                let p0 = &r["ports"][0];
+                let freqs: Vec<f64> = p0["freqs"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+                let z: Vec<post::Cx> = p0["z_re"].as_array().unwrap().iter().zip(p0["z_im"].as_array().unwrap()).map(|(a, b)| post::Cx::new(a.as_f64().unwrap(), b.as_f64().unwrap())).collect();
+                let s11: Vec<post::Cx> = z.iter().map(|&z| (z - post::Cx::new(50.0, 0.0)) / (z + post::Cx::new(50.0, 0.0))).collect();
+                let (t, rho, zt, tr) = post::tdr(&freqs, &s11, 50.0, 600e-12, 1200);
+                curves.push((slot, t, rho, zt, tr));
+            }
+            sim::write_tdr(&out, &curves, cases::hammerstad(cases::microstrip_width(50.0, 0.2, 4.3), 0.2, 4.3).1).unwrap_or_else(|e| panic!("{e}"));
+        }
+        "ports" => {
+            // port model checks on a single series loop: point vs pad-footprint ports, swapped ends, meshes
+            let be = backend(&args);
+            let out = std::path::PathBuf::from(arg(&args, "--out").unwrap_or_else(|| "fieldsolve-ports".into()));
+            let ro = sim::RunOpts { l_band: Some((50e6, 300e6)), ..Default::default() };
+            println!("{:<10} {:>6} {:>6} {:>10} {:>10}", "port", "cell", "swap", "L [nH]", "R [mohm]");
+            for footprint in [false, true] {
+                for cell in [0.1, 0.05, 0.025] {
+                    for swap in [false, true] {
+                        let st = cases::port_loop_setup(cell, footprint, swap);
+                        let dir = out.join(format!("{}_{}_{}", if footprint { "pad" } else { "point" }, cell, if swap { "B" } else { "A" }));
+                        let r = sim::run_setup(&st, &dir, &*be, &ro).unwrap_or_else(|e| panic!("{e}"));
+                        let lf = &r["ports"][0]["l_fit"];
+                        println!("{:<10} {:>6} {:>6} {:>10.4} {:>10.3}", if footprint { "pad" } else { "point" }, cell, swap, lf["l_h"].as_f64().unwrap() * 1e9, lf["r_ohm"].as_f64().unwrap() * 1e3);
+                    }
+                }
+            }
         }
         "run" => {
             let Some(spec) = args.get(2) else {
@@ -142,6 +182,7 @@ mod tests {
             slabs: vec![model::Slab { z0: 0.0, z1: 0.4, eps: 4.3, tand: 0.02 }],
             barrels: vec![model::Barrel { c: P2::new(9.0, 5.0), r: 0.15, z0: 0.0, z1: 0.4 }],
             outline: vec![vec![P2::new(-2.0, -2.0), P2::new(12.0, -2.0), P2::new(12.0, 8.0), P2::new(-2.0, 8.0)]],
+            copper_window: None,
         };
         let port = model::Lumped { name: "P1".into(), axis: 2, lo: [1.0, 1.0, 0.0], hi: [1.0, 1.0, 0.4], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
         model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95 })
@@ -151,7 +192,7 @@ mod tests {
     fn cpu_and_gpu_agree() {
         let p = small_problem();
         let exc = fdtd::gauss_excite(0.0, 10e9, p.dt);
-        let spec = fdtd::RunSpec { excite: Some(0), exc, max_steps: 3000, end_db: -300.0, check_every: 1000, dft_freqs: vec![3e9], dft_every: 4 };
+        let spec = fdtd::RunSpec { excite: Some(0), exc, max_steps: 3000, end_db: -300.0, check_every: 1000, dft_freqs: vec![3e9], dft_every: 4, snap_every: 0, snap_k: vec![], snap_until: 0 };
         let a = fdtd::run_cpu(&p, &spec);
         let b = auto()(&p, &spec);
         if b.backend == "cpu" {
@@ -187,5 +228,61 @@ mod tests {
         let r = cases::cavity(&*auto(), 1.0);
         r.print();
         assert!(r.worst() < 0.015, "worst {}", r.worst());
+    }
+
+    #[test]
+    fn port_swap_is_symmetric_in_a_series_loop() {
+        let be = auto();
+        let ro = sim::RunOpts { l_band: Some((50e6, 300e6)), ..Default::default() };
+        let dir = std::env::temp_dir().join("fieldsolve-test-ports");
+        let l = |swap: bool| {
+            let st = cases::port_loop_setup(0.1, true, swap);
+            let r = sim::run_setup(&st, &dir.join(format!("{swap}")), &*be, &ro).unwrap();
+            r["ports"][0]["l_fit"]["l_h"].as_f64().unwrap()
+        };
+        let (a, b) = (l(false), l(true));
+        assert!((a / b - 1.0).abs() < 1e-3, "{a} vs {b}");
+        assert!(a > 0.9e-9 && a < 1.3e-9, "loop L {a}");
+    }
+
+    #[test]
+    fn net_aware_raster_keeps_nets_apart() {
+        use geom::{Prim, Shape, P2};
+        // two nets 0.06 mm apart on a 0.1 mm mesh: the plain raster joins them; the check must stay clean
+        let rect = |x0: f64, x1: f64, n: &str| Prim {
+            shape: Shape::Polygon(vec![P2::new(x0, -1.0), P2::new(x1, -1.0), P2::new(x1, 1.0), P2::new(x0, 1.0)]),
+            dark: true,
+            net: Some(n.into()),
+            pad: None,
+        };
+        let l = |a: f64, b: f64| mesh::lines_1d(a, b, &[], &[mesh::Refine { a, b, h: 0.1 }], 1.3, 0.1, &[]).into_iter().map(|v| v * 1e-3).collect();
+        let g = mesh::Grid { x: l(-2.0, 2.0), y: l(-2.0, 2.0), z: vec![0.0, 0.1e-3, 0.2e-3] };
+        let lay = model::Layout {
+            sheets: vec![model::Sheet { name: "top".into(), z: 0.1, prims: vec![rect(-1.5, -0.01, "A"), rect(0.05, 1.5, "B")] }],
+            barrels: vec![model::Barrel { c: P2::new(1.0, 0.0), r: 0.15, z0: 0.0, z1: 0.1 }],
+            ..Default::default()
+        };
+        assert!(connect::check(&g, &lay).is_empty());
+    }
+
+    #[test]
+    fn multiport_s_is_reciprocal_with_mismatched_terminations() {
+        let be = auto();
+        let mut st = cases::gap_setup(true, 0.4, 6e9);
+        for l in &mut st.lumped {
+            l.r = 10.0; // ports terminated far from the 50-ohm reference
+        }
+        st.freqs = post::linspace(0.2e9, 6e9, 30);
+        let ro = sim::RunOpts { excite_all: true, ..Default::default() };
+        let dir = std::env::temp_dir().join("fieldsolve-test-recip");
+        sim::run_setup(&st, &dir, &*be, &ro).unwrap();
+        let txt = std::fs::read_to_string(dir.join("sparams.s2p")).unwrap();
+        for line in txt.lines().filter(|l| !l.starts_with('!') && !l.starts_with('#')) {
+            let v: Vec<f64> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let (s21, s12) = (post::Cx::new(v[3], v[4]), post::Cx::new(v[5], v[6]));
+            assert!((s21 - s12).abs() <= 0.02 * s21.abs().max(1e-3), "f {} S21 {s21:?} S12 {s12:?}", v[0]);
+            // passive: no gain
+            assert!(s21.abs() < 1.0 + 1e-3);
+        }
     }
 }

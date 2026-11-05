@@ -33,11 +33,19 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   PCB models and gerber2ems. An in-plane E edge is metal when its midpoint lies in copper. Gerber
   primitives (flashes, macros, tracks as capsules, regions, LPC clears) are rasterised in file order.
   Plated holes are solid conductor columns: z edges at the mesh nodes inside the drill, or at the nearest
-  node for holes thinner than a cell.
+  node for holes thinner than a cell. Copper is only rasterised inside the fine-meshed copper window (ROI
+  plus `air`).
+- **Net-aware raster.** Every metal edge remembers the Gerber net (X2 `.N`) of the copper that painted
+  it. Wherever two nets' edges would share a mesh node (a gap of about a cell or less), the minority net's
+  edges at that node are dropped. Wherever a via barrel's nodes touch another net's copper (an antipad too
+  small for the mesh), that copper's edges are dropped. Before every run a connectivity check floods net
+  labels through copper and barrels and warns about any remaining place where two nets meet
+  (`mesh_shorts` in `result.json`). Copper added for elements (bridges, shorts) is exempt.
 - **Stack-up.** Dielectric thicknesses, εr and tan δ come from the `.gbrjob`, with 4.5 / 0.02 when it gives
-  none. The bottom copper is at z = 0 and copper thickness is ignored. tan δ becomes a conductivity at
+  none, or from the spec's `"dielectrics": [{"t": mm, "er": .., "tand": ..}, ...]` (top to bottom between
+  the copper layers). The bottom copper is at z = 0 and copper thickness is ignored. tan δ becomes a conductivity at
   `f_loss`. Dielectric fills cells inside the board outline. Solder mask is optional (`solder_mask`).
-- **Mesh.** Uniform `cell` in x/y inside the ROI and `cell_z` (at least `min_cells_layer` cells per
+- **Mesh.** Uniform `cell` in x/y over the copper window (ROI plus `air`) and `cell_z` (at least `min_cells_layer` cells per
   dielectric layer) through the board, growing by at most 1.3× per cell outside, up to λ/20. Every
   copper interface and every port coordinate is a mesh line.
 - **Boundaries.** CPML (κ = 1, cubic σ grading, α for low-frequency absorption), `pml` cells on each face.
@@ -47,7 +55,12 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   parallel, R·m/k and C·k/m per edge. They are semi-implicit (folded into the update coefficients) and so
   unconditionally stable. A port is a resistive voltage source. V is the line integral of E from + to −,
   and I = (Vs − V)/R exactly as the update applies it. Port edges override copper they overlap. A `short`
-  is a perfect conductor.
+  is a perfect conductor. A vertical port or short at a pad spans the pad's footprint (80 % of its
+  bounding box) by default; `"size": "point"` gives a single mesh line, which does not converge with the
+  mesh (it is a zero-radius wire).
+- **Multi-port S-parameters.** With every port excited, S = B·A⁻¹ from the wave matrices of all runs, so
+  the port terminations need not equal the 50 Ω reference. The impedance matrix is in `result.json`.
+  With one excitation, `s_col_db` holds b_k/a_j with the other ports terminated in their own R.
 - **Excitation and stopping.** The excitation is a Gaussian, openEMS's `SetGaussExcite(0, fmax)`. A run
   stops when the field energy falls `end_db` (default −70 dB) below its peak.
 
@@ -120,26 +133,40 @@ Lessons from building these, which also apply to board runs:
 - **Stopping.** End on field energy, not port voltage: −50 dB of energy is only −25 dB of field, which
   truncated the ring-down.
 
+### Port checks
+
+`fieldsolve ports` runs a single series loop: a 3 mm trace over a plane, a port at one pad and a short at
+the other, then the same with the ends swapped, for point and pad-footprint ports at three meshes.
+
+| port | 0.1 mm | 0.05 mm | 0.025 mm | swapped ends |
+|---|---|---|---|---|
+| point (single node) | 1.305 nH | 1.264 nH | 1.284 nH | identical |
+| pad footprint | 1.112 nH | 1.043 nH | 1.029 nH | identical |
+
+Pad-footprint ports converge (steps of 6.6 % then 1.3 %); point ports do not. openEMS on the same scenes
+gives 0.896 / 0.940 nH (pad, 0.1 / 0.05 mm), approaching from below while fieldsolve approaches from above.
+Extrapolated, that is about 0.98 vs 1.02 nH. The two codes rasterise zero-thickness metal edges
+differently, which is a first-order mesh effect.
+
 ### Board case: AMOLED ESP32-S3 3V3 decoupling (U1.46 → C112 → In1 GND)
 
-| cell | cells | steps | Metal time | L |
-|---|---|---|---|---|
-| 0.10 mm | 0.46 M | 37 k | 4.2 s (4.1 Gcell/s) | 0.987 nH |
-| 0.05 mm | 1.97 M | 99 k | 72 s (2.7 Gcell/s) | 0.971 nH |
+| set-up (0.1 mm) | L |
+|---|---|
+| port at U1.46 (pad footprint, F.Cu → In1), C112 shorted | 1.557 nH |
+| port across C112's pads, U1.46 shorted to In1 | 1.507 nH |
+| from one 2-port run: 1/Y₁₁ and 1/Y₂₂ at 60 MHz | 1.540 / 1.540 nH |
+| port at U1.46, C112 shorted, 0.05 mm (3.9 M cells, 400 k steps, 11 min on Metal) | 1.489 nH |
 
-The CPU reference does 200 Mcell/s on the same problem.
+**Correction.** Earlier versions of this page reported 0.99 nH, and a −4.6 % difference from openEMS, for
+this loop. That geometry was wrong: copper outside the ROI was rasterised on graded millimetre cells, and
+sub-cell clearances inside it joined VCC3V3 to GND in dozens of places. The connectivity check now reports
+any such short, and the net-aware raster prevents it. The openEMS comparison of that scene ran on the same
+shorted polygons and does not count as validation. A like-for-like openEMS check needs our resolved
+raster exported to openEMS; until then, see the port checks above.
 
-openEMS on the identical scene (0.1 mm mesh, same ports, mesh lines, copper, vias and excitation) gives
-**L = 1.035 nH against fieldsolve's 0.987 nH (−4.6 %)**. |Z| agrees within 3–4.6 % from 0.3 to 3 GHz, a
-steady offset rather than noise. openEMS needed 20 min on the CPU (400 k steps at 150 Mcell/s) where
-fieldsolve on Metal needed 4.2 s.
-
-**Open issue: port placement.** The reciprocal set-up should give the same loop inductance: a port across
-C112's pads (in-plane, bar with a one-cell gap) and a short from U1.46 to In1. It gives 0.92 nH at 0.1 mm
-and 0.85 nH at 0.05 mm, while the original set-up gives 0.987 / 0.971 nH. The gap grows with refinement.
-The suspects are the single-node vertical column (a zero-radius thin wire whose inductance depends on the
-cell) and the in-plane gap port's current distribution. Until this is resolved, take absolute loop
-inductance to about ±10–15 %. Comparisons between layouts on the same mesh and port set-up are tighter.
+The network around this loop matters: VCC3V3 also feeds U1's other pins and the In4 plane. So "port at
+U1.46 with C112 shorted" and "port at C112 with U1.46 shorted" are different quantities (1/Y₁₁ vs
+1/Y₂₂), and only for a pure series loop are they equal.
 
 ### Cross-check with openEMS
 
@@ -178,6 +205,33 @@ The script builds the copper layers, one emissive plane per layer showing log |J
 magnitude as an OpenVDB volume (resampled to the finest cell, log over 50 dB). It uses only Blender's own
 numpy and openvdb. Scene units are millimetres in Gerber orientation, with z up.
 
+### Time-domain current frames and TDR
+
+A spec's `"frames": {"layers": ["F.Cu", "In1.Cu"], "every_ps": 2, "until_ps": 500}` records the surface
+current on those layers during the first excitation. The output is `frames/J_<layer>_<NNNN>.f32` plus
+`frames.json`. `post::tdr` turns S11 on a uniform grid from DC into a TDR impedance curve, with a Gaussian
+edge of 0.88 / f_top (44 ps for 20 GHz).
+
+`fieldsolve gap --out DIR` is the demonstration case: a fast edge on a 50 Ω microstrip (0.2 mm FR4,
+30 mm long, matched at both ends) whose ground plane has a 1 × 10 mm slot across the trace's path. It is
+run with and without the slot, and writes `tdr.svg`/`tdr.json` and the frames of both runs.
+
+- **Solid plane:** the TDR is flat at 49.9 Ω.
+- **With the slot:** a 112 Ω inductive bump at the slot. The return current, which runs under the trace,
+  has to detour around the slot's ends; you can watch it crowd along the slot edges.
+
+```sh
+Blender -b --python tools/blender_frames.py -- DIR/slot --every 2 --explode 4 --render slot.mp4
+ffmpeg -framerate 20 -i DIR/slot/frames/png/TOP_%04d.png -framerate 20 -i DIR/slot/frames/png/GND_%04d.png \
+       -filter_complex vstack -pix_fmt yuv420p slot_2d.mp4
+```
+
+`blender_frames.py` writes colour-mapped PNGs per layer with a fixed scale over the run; upper layers fade
+out where the current is weak. It then stacks the layers `--explode` mm apart, outlines copper and slots,
+and renders an MP4 (Eevee, then ffmpeg).
+
+![Return current detouring around a ground-plane slot, and the reflected and transmitted pulses](img/fieldsolve_gap_slot.png)
+
 ### Field lines
 
 ```sh
@@ -209,7 +263,7 @@ period. The camera frames the lines, unless you pass `--frame-all`.
 Renders use Cycles on the Metal GPU. For interactive viewing, Eevee's volume range is set to the scene size:
 its default 0.1–100 units turns millimetre fog into blocks.
 
-![H field lines and surface current, AMOLED U1.46 → C112 decoupling loop at 100 MHz](img/fieldsolve_decap_hlines.jpg)
+![H field lines and surface current, AMOLED U1.46 → C112 decoupling loop at 100 MHz (rendered before the mesh-short fix, so the current paths are only indicative)](img/fieldsolve_decap_hlines.jpg)
 
 ## Code map
 
@@ -227,6 +281,8 @@ The code is in `src/bin/fieldsolve/`.
 | `sim.rs` | spec → setup → runs → outputs; scene export |
 | `export.rs` | VTK, raw volumes, complex vector fields, surface currents, copper OBJ |
 | `lines.rs` | field-line tracing |
+| `connect.rs` | mesh connectivity check (shorts between nets) |
+| `tools/blender_frames.py` | time-domain current animation |
 | `cases.rs` | analytic validation cases |
 | `tools/openems_scene.py` | openEMS replay of a scene |
 | `tools/blender_fields.py` | Blender import |
@@ -236,9 +292,10 @@ The code is in `src/bin/fieldsolve/`.
 The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free space, enclosure, pipe) is in
 [fieldsolve-rf-roadmap.md](fieldsolve-rf-roadmap.md). Engine items:
 
-- **Port placement accuracy.** Resolve the reciprocal-port discrepancy, for example with a thin-wire model
-  for single-node vertical ports or by giving ports a finite footprint, and close the 4.6 % offset from
-  openEMS.
+- **openEMS parity on boards.** Export the resolved raster (metal edges) rather than polygons to openEMS,
+  so board scenes compare like for like.
+- **Vertical ports through planes.** A vertical port or short whose column crosses an intermediate copper
+  layer shares a node with it. Warn about this, or route the column only to the nearest reference layer.
 - **Capacitor models.** Series R-L-C elements, so a real capacitor (ESR, ESL, C) can replace the short.
   That gives the PDN impedance curve |Z(f)| directly instead of only the loop L.
 - **Conductor loss.** A surface-impedance (skin-effect) model for copper, for RF insertion loss and the
