@@ -2907,6 +2907,11 @@ impl World {
         v.is_empty()
     }
 
+    /// check_via_margin with nothing allowed (the `vias` debugging command).
+    pub fn check_via_margin_pub(&self, net: u32, pos: P2, out: &mut Vec<Viol>) {
+        self.check_via_margin(net, pos, NONE, out);
+    }
+
     fn check_via_margin(&self, net: u32, pos: P2, allow: u32, out: &mut Vec<Viol>) {
         // same as check_via_at but demanding the routing margin
         let (r, rd) = { let (d, dr) = self.b.via_size(net); (d / 2.0, dr / 2.0) };

@@ -367,6 +367,38 @@ fn main() {
     }
     let bx = args.iter().position(|a| a == "--box").map(|i| [args[i + 1].parse().unwrap(), args[i + 2].parse().unwrap(), args[i + 3].parse().unwrap(), args[i + 4].parse().unwrap()]);
     let scale = arg(&args, "--scale").map(|s| s.parse().unwrap()).unwrap_or(if bx.is_some() { 60.0 } else { 8.0 });
+    // where a via of a net fits among the fixed copper (debugging aid): a character map of the box, '.' fits,
+    // otherwise the first letter of what is in the way (o object, t track, k keepout, r rule area, h hole)
+    if cmd == "vias" {
+        let net = *w.b.net_index.get(arg(&args, "--net").expect("--net").as_str()).expect("net");
+        let b = bx.expect("--box");
+        let step: f64 = arg(&args, "--step").map(|s| s.parse().unwrap()).unwrap_or(0.1);
+        let mut names: Vec<String> = Vec::new();
+        let mut y = b[1];
+        while y <= b[3] + 1e-9 {
+            let mut row = format!("{:6.2} ", y);
+            let mut x = b[0];
+            while x <= b[2] + 1e-9 {
+                let mut v = Vec::new();
+                w.check_via_margin_pub(net, geom::p2(x, y), &mut v);
+                row.push(match v.first() {
+                    None => '.',
+                    Some(e) => {
+                        let who = e.objs.first().map(|&o| w.objs[o as usize].s.name.clone()).or(e.pieces.first().map(|&p| format!("wire {}", w.b.nets[w.pieces[p as usize].net as usize].name))).unwrap_or(e.what.clone());
+                        let k = names.iter().position(|n| *n == who).unwrap_or_else(|| { names.push(who.clone()); names.len() - 1 });
+                        (b'A' + (k % 26) as u8) as char
+                    }
+                });
+                x += step;
+            }
+            println!("{}", row);
+            y += step;
+        }
+        for (k, n) in names.iter().enumerate() {
+            println!("{} {}", (b'A' + (k % 26) as u8) as char, n);
+        }
+        return;
+    }
     if cmd == "build" {
         if let Some(out) = arg(&args, "--svg") {
             let s = svg::render(&w, &svg::Opts { mesh: true, box_: bx, scale, marks: vec![], unrouted: vec![] });

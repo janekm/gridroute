@@ -590,7 +590,7 @@ impl Router {
         }
         if !viol.is_empty() {
             let v = &viol[0];
-            let msg = format!("{} on layer {} at ({:.3},{:.3}) d={:.4} need {:.4}", v.what, v.layer, v.at.x, v.at.y, v.dist, v.need);
+            let msg = format!("{} on layer {} at ({:.3},{:.3}) d={:.4} need {:.4}{}", v.what, v.layer, v.at.x, v.at.y, v.dist, v.need, v.objs.first().map(|&o| format!(" ({})", self.w.objs[o as usize].s.name)).unwrap_or_default());
             let want = std::env::var("TOPOR_DUMP_KIND").map(|k| v.what.contains(&k)).unwrap_or(true);
             if let (Ok(dir), true) = (std::env::var("TOPOR_DUMP"), want) {
                 self.dumps += 1;
@@ -1031,11 +1031,28 @@ impl Router {
             q.allowed &= layers;
         }
         let dbg = std::env::var("TOPOR_REPAIR").is_ok();
+        // a plane pad a neck-down rule covers (a power pin of a fine-pitch part) may leave its pad only at the neck
+        // width (route_plane_comp's last try): when the class width finds no way out, the soft search looks for
+        // what is in the way of that drop instead
+        let neck = if self.is_plane(net) && std::env::var("TOPOR_NO_PLANE_NECK_REPAIR").is_err() {
+            src.iter().filter_map(|&o| self.w.b.neck_width.get(&self.w.objs[o as usize].s.name).cloned()).fold(f64::INFINITY, f64::min)
+        } else {
+            f64::INFINITY
+        };
+        let mut necked = false;
         let mut ripped_nets: Vec<u32> = Vec::new();
         let mut path = None;
         for _attempt in 0..5 {
             let p = match self.search(&q) {
                 Some(p) => p,
+                None if neck.is_finite() && !necked => {
+                    necked = true;
+                    for x in q.width.iter_mut() {
+                        *x = x.min(neck);
+                    }
+                    q.max_len = 2.0;
+                    continue;
+                }
                 None => {
                     if dbg {
                         eprintln!("repair {}: soft search failed (src {:?} targets {:?}) after {} expansions", self.w.b.nets[net as usize].name, src.iter().map(|&o| self.w.objs[o as usize].s.name.clone()).collect::<Vec<_>>(), targets.iter().map(|&o| self.w.objs[o as usize].s.name.clone()).collect::<Vec<_>>(), self.last_exp);
@@ -1061,6 +1078,14 @@ impl Router {
             // whatever other net's copper it names
             let w = q.width.clone();
             match self.commit(net, &p, &w) {
+                // (a drop at the neck width is one straight segment from its pad, else it is taken up again and
+                // the drop left to route_net)
+                Ok(ps) if necked && !ps.iter().all(|&x| self.w.pieces[x as usize].poly.len() == 2 && (src.contains(&self.w.pieces[x as usize].a.obj) || src.contains(&self.w.pieces[x as usize].b.obj))) => {
+                    for x in ps {
+                        self.rip_piece(x);
+                    }
+                    return ripped_nets;
+                }
                 Ok(_) => return ripped_nets,
                 Err(e) => {
                     if dbg {
@@ -3662,6 +3687,11 @@ impl Router {
         // the best board seen: a round can make things worse, the flow then goes on from the best
         type Snap = (World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>, HashMap<u32, PairDiag>);
         let mut best_state: Option<(usize, Snap)> = None;
+        // a repair that leaves the board more incomplete is undone (the history it added stays, so the next try goes
+        // another way): rounds then only keep what pays, where before a round could undo two rounds' progress and
+        // the deficit swung by a fifth from round to round on a crowded board (TOPOR_RIP_UNDO_OFF: kept as before)
+        let rip_undo = std::env::var("TOPOR_RIP_UNDO_OFF").is_err();
+        let mut undone = 0usize;
         for round in 0..self.cfg.rip_rounds {
             if self.stopped() {
                 return;
@@ -3723,6 +3753,14 @@ impl Router {
                 if self.deficit(net) == 0 {
                     continue;
                 }
+                let undo = if rip_undo {
+                    let _t = Instant::now();
+                    let s = (self.total_deficit(), self.w.clone(), self.ties.clone(), self.junctions.clone(), self.pair_diag.clone());
+                    self.prof_add("rip-up: undo snapshots", _t);
+                    Some(s)
+                } else {
+                    None
+                };
                 let _t = Instant::now();
                 let victims = self.repair_net(net);
                 self.prof_add("rip-up: find what to rip (soft search)", _t);
@@ -3745,9 +3783,18 @@ impl Router {
                     }
                 }
                 self.prof_add("rip-up: reroute the ripped", _t);
+                if let Some((d0, w, ties, junctions, pair_diag)) = undo {
+                    if self.total_deficit() > d0 {
+                        self.w = w;
+                        self.ties = ties;
+                        self.junctions = junctions;
+                        self.pair_diag = pair_diag;
+                        undone += 1;
+                    }
+                }
             }
             if self.cfg.verbose {
-                eprintln!("[{:.1}s] rip round {}: deficit {}", self.elapsed(), round, self.total_deficit());
+                eprintln!("[{:.1}s] rip round {}: deficit {}{}", self.elapsed(), round, self.total_deficit(), if rip_undo { format!(" ({} repairs undone so far)", undone) } else { String::new() });
             }
             self.trace_pairs(&format!("rip round {}", round));
         }
@@ -4633,7 +4680,16 @@ impl Router {
                     q.max_len = 5.0;
                     q.allowed &= g.iter().fold(0u32, |m, &o| m | self.w.objs[o as usize].s.layers);
                 }
-                let found = self.search(&q);
+                let mut found = self.search(&q);
+                // (a plane pad a neck-down rule covers drops at the neck width: see repair_net)
+                let neck = if plane { g.iter().filter_map(|&o| self.w.b.neck_width.get(&self.w.objs[o as usize].s.name).cloned()).fold(f64::INFINITY, f64::min) } else { f64::INFINITY };
+                if found.is_none() && neck.is_finite() {
+                    for x in q.width.iter_mut() {
+                        *x = x.min(neck);
+                    }
+                    q.max_len = 2.0;
+                    found = self.search(&q);
+                }
                 let sealed = found.is_none() && self.last_exp < q.max_exp;
                 let way = found.filter(|p| p.cost.is_finite()).map(|p| self.way_of(&p));
                 // what is next to the open pads: other nets' wires and vias, their fixed copper, other parts
