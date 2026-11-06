@@ -203,6 +203,8 @@ pub struct Problem {
     pub grid: Grid,
     /// Debye polarisation currents of wideband dielectrics (see `disp.rs`), if any.
     pub disp: Option<Disp>,
+    /// Surface-impedance copper edges (see `cond.rs`), if conductor loss is modelled.
+    pub cond: Option<crate::cond::Cond>,
 }
 
 /// Dispersive edges live in the mesh-plane range `k0..=k1`; per component the compact index is
@@ -242,11 +244,13 @@ pub struct BuildOpts {
     pub cfl: f64,
     /// Wideband (Debye) dielectric loss instead of the constant conductivity at `f_loss`.
     pub wideband: Option<crate::disp::Wideband>,
+    /// Conductor loss on copper sheets (surface impedance), per sheet in `Layout::sheets` order.
+    pub conductor: Option<crate::cond::Conductor>,
 }
 
 impl Default for BuildOpts {
     fn default() -> Self {
-        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95, wideband: None }
+        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95, wideband: None, conductor: None }
     }
 }
 
@@ -819,7 +823,8 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
             }
         }
     }
-    for m in sheet_masks(g, lay).0 {
+    let (masks, mask_nets) = sheet_masks(g, lay);
+    for m in &masks {
         for j in 0..ny {
             for i in 0..nx {
                 let id = g.idx(i, j, m.k);
@@ -859,6 +864,7 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
             s.2 *= cb[s.0 as usize][s.1 as usize];
         }
     }
+    let cond = o.conductor.as_ref().map(|c| cond_edges(g, &masks, &mask_nets, &cb, &o.pml, c, dt));
 
     let pml = [
         cpml_axis(&g.x, o.pml[0], o.pml[1], dt, o.fmax),
@@ -874,5 +880,51 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         // b_p per edge; metal edges (cb = 0) keep b but are skipped by the updates
         b: std::array::from_fn(|a| (0..nd * npole).map(|qp| pc[qp % npole].2 as f32 * dep[a][qp]).collect()),
     });
-    Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone(), disp }
+    Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone(), disp, cond }
+}
+
+/// Copper sheet edges that get a surface impedance: metal in-plane edges (cb = 0) of real copper outside
+/// the CPML slabs. Element copper ("~name": bars of ports and parts, whose loss is in the part model) and
+/// edges inside the absorber (where the curl carries CPML terms) stay perfect conductors.
+fn cond_edges(g: &Grid, masks: &[SheetMask], nets: &[String], cb: &[Vec<f32>; 3], pml: &[usize; 6], c: &crate::cond::Conductor, dt: f64) -> crate::cond::Cond {
+    use crate::cond::*;
+    let (nx, ny, nz) = (g.nx(), g.ny(), g.nz());
+    let fk = corners(c);
+    let mut tab = Vec::new();
+    for (si, m) in c.metals.iter().enumerate() {
+        let f = fit(m, &fk, c.f_lo, c.f_hi);
+        eprintln!(
+            "fieldsolve: conductor on sheet {si}: sigma {:.2e} S/m, t {:.0} um, roughness {:.1} um; R_s {:.1} mohm at 2.44 GHz; fit {} sections, worst {:.1} %",
+            m.sigma, m.t * 1e6, m.rough * 1e6, zs(m, 2.44e9).re * 1e3, fk.len(), 100.0 * f.worst
+        );
+        tab.push(f.r0 as f32);
+        tab.extend(f.rk.iter().map(|&r| r as f32));
+    }
+    let dec: Vec<f32> = fk.iter().map(|&f| (-dt * 2.0 * std::f64::consts::PI * f).exp() as f32).collect();
+    let wild: Vec<bool> = nets.iter().map(|n| n.starts_with('~')).collect();
+    let inside = |i: usize, j: usize, k: usize| i >= pml[0] && i + pml[1] < nx && j >= pml[2] && j + pml[3] < ny && k >= pml[4] && k + pml[5] < nz;
+    let (mut ids, mut fac, mut layer) = (Vec::new(), Vec::new(), Vec::new());
+    for (si, m) in masks.iter().enumerate() {
+        if si >= c.metals.len() {
+            break;
+        }
+        let k = m.k;
+        // dual z length at plane k
+        let dz = if k == 0 { g.z[1] - g.z[0] } else if k + 1 >= nz { g.z[k] - g.z[k - 1] } else { 0.5 * (g.z[k + 1] - g.z[k - 1]) };
+        for j in 0..ny {
+            for i in 0..nx {
+                let q = j * nx + i;
+                let id = g.idx(i, j, k);
+                for (a, on, net) in [(0usize, m.ex[q], m.exn[q]), (1usize, m.ey[q], m.eyn[q])] {
+                    if on && !wild[net as usize] && cb[a][id] == 0.0 && inside(i, j, k) && i > 0 && j > 0 && k > 0 {
+                        ids.push(id as u32 | (a as u32) << 30);
+                        fac.push(dz as f32);
+                        layer.push(si as u32);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("fieldsolve: conductor loss on {} copper edges", ids.len());
+    Cond { ids, fac, layer, nb: fk.len(), dec, tab }
 }

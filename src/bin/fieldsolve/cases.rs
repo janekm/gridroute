@@ -76,7 +76,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
     let port = Lumped { name: "P1".into(), axis: 2, lo: [0.0, -w / 2.0, 0.0], hi: [0.0, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let fmax = 3e9;
     let pml = [8, 8, 8, 8, 0, 8];
-    let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95, wideband: None });
+    let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None });
     for q in 0..3 {
         let xq = xa + q as f64 * d;
         p.add_vprobe(&format!("v{q}"), 2, [xq, 0.0, h], 0.0);
@@ -129,7 +129,7 @@ pub fn patch_capacitance(run: &Runner, scale: f64) -> CaseResult {
         copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [a / 2.0, a / 2.0, 0.0], hi: [a / 2.0, a / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95, wideband: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None });
     let exc = gauss_excite(0.0, 4e9, p.dt);
     let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(50e6, 1000e6, 20);
@@ -178,7 +178,7 @@ pub fn cavity(run: &Runner, scale: f64) -> CaseResult {
         copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [3.0, 3.0, 0.0], hi: [3.0, 3.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95, wideband: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95, wideband: None, conductor: None });
     let exc = gauss_excite(0.0, 4e9, p.dt);
     let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 400_000, end_db: -90.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(1.0e9, 3.5e9, 1001);
@@ -216,7 +216,7 @@ pub fn pec_box(run: &Runner, scale: f64) -> CaseResult {
     let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
     let lay = Layout::default();
     let port = Lumped { name: "P1".into(), axis: 2, lo: [7.0, 6.0, 4.0], hi: [7.0, 6.0, 6.0], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95, wideband: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None });
     let exc = gauss_excite(0.0, 20e9, p.dt);
     let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -60.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(5e9, 16e9, 5501);
@@ -283,12 +283,12 @@ pub fn port_loop_setup(cell: f64, footprint: bool, swap: bool) -> crate::sim::Se
         grid,
         layout,
         lumped,
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95, wideband: None },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95, wideband: None, conductor: None },
         freqs: linspace(10e6, 3e9, 300),
         fmax: 3e9,
         end_db: -70.0,
         max_steps: 400_000,
-        port_stop: false,
+        port_stop: false, bars: vec![],
     }
 }
 
@@ -339,12 +339,12 @@ pub fn gap_setup(slot: bool, cell: f64, fmax: f64) -> crate::sim::Setup {
         grid,
         layout,
         lumped: vec![port("P1", 0.0), port("P2", len)],
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None, conductor: None },
         freqs: linspace(0.0, fmax, 1001),
         fmax,
         end_db: -60.0,
         max_steps: 200_000,
-        port_stop: false,
+        port_stop: false, bars: vec![],
     }
 }
 
@@ -368,12 +368,12 @@ pub fn dipole_setup(len: f64, cell: f64, fmax: f64, air: f64) -> crate::sim::Set
         grid,
         layout,
         lumped: vec![port],
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None, conductor: None },
         freqs: linspace(fmax / 50.0, fmax, 300),
         fmax,
         end_db: -60.0,
         max_steps: 100_000,
-        port_stop: false,
+        port_stop: false, bars: vec![],
     }
 }
 
@@ -440,7 +440,7 @@ pub fn lossy_cavity(be: &Runner, wideband: bool, tand: f64) -> Vec<(f64, f64)> {
     let lay = Layout { sheets: vec![], slabs: vec![Slab { z0: 0.0, z1: c, eps: 4.0, tand }], barrels: vec![], outline: vec![], copper_window: None };
     let port = Lumped { name: "P".into(), axis: 2, lo: [7.0, 6.0, 0.0], hi: [7.0, 6.0, c], plus_at_hi: true, r: 1e4, c: 0.0, port: true };
     let wb = wideband.then(|| crate::disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false });
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: wb });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: wb, conductor: None });
     let exc = gauss_excite(6e9, 4e9, p.dt);
     let r = be(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -80.0, check_every: 1000, dft_every: 1, ..Default::default() });
     let freqs = linspace(3e9, 9e9, 3001);
@@ -465,3 +465,60 @@ pub fn lossy_cavity(be: &Runner, wideband: bool, tand: f64) -> Vec<(f64, f64)> {
     }
     out
 }
+
+/// Copper loss against theory: a thin cavity between two copper sheets h apart (PEC side walls, lossless
+/// dielectric). Its TM_mn0 modes have Q_c = h / delta from the plates alone, independent of the mode.
+/// The probe port is weakly coupled (1 Mohm, loading Q ~1e5), so the measured Q is the plates' Q_c.
+/// Returns per mode (f, Q with surface-impedance copper, h / delta / K_rough).
+pub fn copper_cavity(be: &Runner, rough_um: f64) -> Vec<(f64, f64, f64)> {
+    let (a, b, h) = (30.0, 20.0, 0.5);
+    let x = lines_1d(0.0, a, &[7.0], &[], 1.2, 0.5, &[]);
+    let y = lines_1d(0.0, b, &[6.0], &[], 1.2, 0.5, &[]);
+    let z = lines_1d(-1.0, h + 1.0, &[0.0, h], &[Refine { a: 0.0, b: h, h: 0.1 }], 1.3, 0.5, &[]);
+    let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
+    let plate = |zz: f64| Sheet {
+        name: format!("plate{zz}"),
+        z: zz,
+        prims: vec![Prim { shape: Shape::Polygon(vec![P2::new(-1.0, -1.0), P2::new(a + 1.0, -1.0), P2::new(a + 1.0, b + 1.0), P2::new(-1.0, b + 1.0)]), dark: true, net: None, pad: None }],
+    };
+    let lay = Layout { sheets: vec![plate(h), plate(0.0)], slabs: vec![Slab { z0: 0.0, z1: h, eps: 4.0, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None };
+    // a weakly coupled probe port (1 Mohm): its loading Q is ~1e5, so the plates set the Q
+    let rp = 1e6;
+    let port = Lumped { name: "P".into(), axis: 2, lo: [7.0, 6.0, 0.0], hi: [7.0, 6.0, h], plus_at_hi: true, r: rp, c: 0.0, port: true };
+    let sigma = 5.8e7;
+    let metal = crate::cond::Metal { sigma, t: 35e-6, rough: rough_um * 1e-6 };
+    let q = |conductor: Option<crate::cond::Conductor>, steps: usize| -> Vec<(f64, f64)> {
+        let p = build(&g, &lay, &[port.clone()], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor });
+        let exc = gauss_excite(6e9, 4e9, p.dt);
+        let r = be(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: steps, end_db: -90.0, check_every: 1000, dft_every: 1, ..Default::default() });
+        let freqs = linspace(3e9, 9e9, 12001);
+        let (v, i) = port_spectra(&r.v[0], &exc, rp, p.dt, &freqs);
+        let re: Vec<f64> = v.iter().zip(&i).map(|(&v, &i)| (v / i).re).collect();
+        let mut out = Vec::new();
+        for (lo, hi) in [(3.5e9, 5.4e9), (5.4e9, 7.0e9), (7.0e9, 8.8e9)] {
+            let rng: Vec<usize> = (0..freqs.len()).filter(|&k| freqs[k] >= lo && freqs[k] <= hi).collect();
+            let &kmax = rng.iter().max_by(|&&p, &&q| re[p].partial_cmp(&re[q]).unwrap()).unwrap();
+            let half = re[kmax] / 2.0;
+            let cross = |dir: isize| -> f64 {
+                let mut k = kmax as isize;
+                while k + dir >= 0 && ((k + dir) as usize) < freqs.len() && re[(k + dir) as usize] > half {
+                    k += dir;
+                }
+                let (k0, k1) = (k as usize, (k + dir) as usize);
+                freqs[k0] + (freqs[k1] - freqs[k0]) * (re[k0] - half) / (re[k0] - re[k1])
+            };
+            out.push((freqs[kmax], freqs[kmax] / (cross(1) - cross(-1))));
+        }
+        out
+    };
+    let q1 = q(Some(crate::cond::Conductor { metals: vec![metal.clone(), metal.clone()], f_lo: 0.3e9, f_hi: 10e9 }), 3_000_000);
+    q1.iter()
+        .map(|&(f, qc)| {
+            let delta = (1.0 / (std::f64::consts::PI * f * 1.256_637_062_12e-6 * sigma)).sqrt();
+            // with roughness the plate resistance is K times higher
+            let k = crate::cond::zs(&metal, f).re / crate::cond::zs(&crate::cond::Metal { rough: 0.0, ..metal.clone() }, f).re;
+            (f, qc, h * 1e-3 / delta / k)
+        })
+        .collect()
+}
+

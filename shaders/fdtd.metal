@@ -306,6 +306,38 @@ kernel void pml_e(device float* f0 [[buffer(0)]], device float* f1 [[buffer(1)]]
     }
 }
 
+// Copper with a surface impedance (cond.rs): one thread per sheet edge; E = Z_s J_s with J_s the curl of H
+// across the sheet times the dual length, Z_s a Foster chain R_0 + sum R_k s tau_k / (1 + s tau_k) whose
+// section currents decay exactly over a step. p.axis = sections per edge, p.slab_len = edge count.
+kernel void cond_e(device float* ex [[buffer(0)]], device float* ey [[buffer(1)]],
+                   device const float* hx [[buffer(3)]], device const float* hy [[buffer(4)]], device const float* hz [[buffer(5)]],
+                   device const float* inv_dd [[buffer(6)]], constant P& p [[buffer(7)]],
+                   device const uint* ids [[buffer(8)]], device const float* fac [[buffer(9)]], device const uint* lay [[buffer(10)]],
+                   device float* ci [[buffer(11)]], device const float* tab [[buffer(12)]], device const float* dec [[buffer(13)]],
+                   uint t [[thread_position_in_grid]]) {
+    if (t >= p.slab_len) return;
+    uint w = ids[t];
+    uint a = w >> 30, id = w & 0x3fffffffu;
+    uint sy = p.nx, sz = p.nx * p.ny;
+    uint i = id % p.nx, j = (id / p.nx) % p.ny, k = id / sz;
+    device const float* idx = inv_dd;
+    device const float* idy = inv_dd + p.nx;
+    device const float* idz = inv_dd + p.nx + p.ny;
+    float curl = (a == 0) ? (hz[id] - hz[id - sy]) * idy[j] - (hy[id] - hy[id - sz]) * idz[k]
+                          : (hx[id] - hx[id - sz]) * idz[k] - (hz[id] - hz[id - 1]) * idx[i];
+    float js = curl * fac[t];
+    uint nb = p.axis;
+    device const float* r = tab + lay[t] * (nb + 1);
+    device float* ik = ci + t * nb;
+    float e = r[0] * js;
+    for (uint q = 0; q < nb; q++) {
+        float v = js + (ik[q] - js) * dec[q];
+        ik[q] = v;
+        e += r[q + 1] * (js - v);
+    }
+    if (a == 0) ex[id] = e; else ey[id] = e;
+}
+
 // The fused E kernel has already updated the Debye currents from E_new - E_old; the source's share of the
 // E change is added here to E and, on dispersive edges, to the currents (J_p += b_p dE), which equals
 // injecting the source before the current update (as the CPU reference does).

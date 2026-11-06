@@ -117,6 +117,8 @@ pub enum Part {
     L { l: f64, cp: f64, q: f64, fq: f64 },
     /// impedance table from a vendor file
     Table { freqs: Vec<f64>, z: Vec<Cx> },
+    /// another part with a series inductance added (negative: removed), e.g. the port bar de-embedding
+    Series { inner: Box<Part>, l: f64 },
 }
 
 impl Part {
@@ -190,6 +192,7 @@ impl Part {
                     Some(zl)
                 }
             }
+            Part::Series { inner, l } => inner.z(f).map(|z| z + Cx::new(0.0, w * l)),
             Part::Table { freqs, z } => {
                 let k = freqs.partition_point(|&x| x < f).clamp(1, freqs.len() - 1);
                 let t = ((f - freqs[k - 1]) / (freqs[k] - freqs[k - 1])).clamp(0.0, 1.0);
@@ -252,6 +255,21 @@ pub fn waves(s: &[Vec<Cx>], e: &[usize], ae: &[Cx], t: &[(usize, Cx)]) -> Vec<Cx
         a[tx] = g * bt;
     }
     a
+}
+
+/// Add a series impedance `zs[i]` in front of every port of S (reference z0): Z' = Z + diag(zs).
+pub fn add_series(s: &[Vec<Cx>], z0: f64, zs: &[Cx]) -> Vec<Vec<Cx>> {
+    let n = s.len();
+    let one = Cx::new(1.0, 0.0);
+    let eye = |i: usize, j: usize| if i == j { one } else { Cx::default() };
+    let ims: Vec<Vec<Cx>> = (0..n).map(|i| (0..n).map(|j| eye(i, j) - s[i][j]).collect()).collect();
+    let ips: Vec<Vec<Cx>> = (0..n).map(|i| (0..n).map(|j| eye(i, j) + s[i][j]).collect()).collect();
+    let z = matmul(&ips, &inv(&ims).expect("S has an eigenvalue 1"));
+    let z: Vec<Vec<Cx>> = (0..n).map(|i| (0..n).map(|j| z[i][j] * z0 + if i == j { zs[i] } else { Cx::default() }).collect()).collect();
+    let z0c = Cx::new(z0, 0.0);
+    let a: Vec<Vec<Cx>> = (0..n).map(|i| (0..n).map(|j| z[i][j] - if i == j { z0c } else { Cx::default() }).collect()).collect();
+    let b: Vec<Vec<Cx>> = (0..n).map(|i| (0..n).map(|j| z[i][j] + if i == j { z0c } else { Cx::default() }).collect()).collect();
+    matmul(&a, &inv(&b).expect("Z + Z0 singular"))
 }
 
 /// Renormalise S (reference z0 on all ports) to power waves with reference impedances `zr` (complex).
@@ -407,6 +425,21 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         }
         None => None,
     };
+    // "deembed": true removes, from every part, the partial inductance of the bare stretch of its port's bar
+    // (result.json "port_bars"): a vendor model measured on its fixture already holds its body's
+    // inductance across the pad gap, and the EM bar adds it a second time. "deembed_kept": true also moves
+    // the kept ports' reference planes to the pad edges (their bars' inductance removed in series).
+    let bar_l: std::collections::HashMap<String, f64> = res["port_bars"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|b| Some((b["name"].as_str()?.to_string(), b["l_gap_nh"].as_f64()? * 1e-9))).collect())
+        .unwrap_or_default();
+    let deembed = cfg["deembed"].as_bool().unwrap_or(false);
+    let deembed_kept = cfg["deembed_kept"].as_bool().unwrap_or(false);
+    if deembed || deembed_kept {
+        let mut v: Vec<_> = bar_l.iter().collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        println!("bar inductance removed (nH): {}", v.iter().map(|(n, l)| format!("{n} {:.3}", *l * 1e9)).collect::<Vec<_>>().join(", "));
+    }
     let gam_t = |z: Cx, fi: usize| target.as_ref().map(|t| ((z - t[fi]) / (z + t[fi].conj())).abs());
     // "farfield": true -> per-port patterns from farfield.json next to the EM file
     let far = if cfg["farfield"].as_bool().unwrap_or(false) { Some(crate::nf2ff::read_farfield(&em_path.with_file_name("farfield.json"))?) } else { None };
@@ -430,7 +463,12 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
                     }
                 }
             }
-            let p = Part::parse(&spec)?;
+            let mut p = Part::parse(&spec)?;
+            if deembed {
+                if let Some(&l) = bar_l.get(pn) {
+                    p = Part::Series { inner: Box::new(p), l: -l };
+                }
+            }
             by_name.insert(pn.clone(), p.clone());
             parts.push((idx(pn)?, p));
         }
@@ -445,6 +483,11 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
             let sf: Vec<Vec<Cx>> = (0..em.s.len()).map(|i| (0..em.s.len()).map(|j| em.s[i][j][fi]).collect()).collect();
             let t: Vec<(usize, Cx)> = parts.iter().map(|(k, p)| (*k, p.gamma(f, em.z0))).collect();
             let mut r = terminate(&sf, &keep, &t);
+            if deembed_kept {
+                let w = 2.0 * std::f64::consts::PI * f;
+                let zs: Vec<Cx> = keep.iter().map(|&k| Cx::new(0.0, -w * bar_l.get(&names[k]).copied().unwrap_or(0.0))).collect();
+                r = add_series(&r, em.z0, &zs);
+            }
             if renorm {
                 r = renormalise(&r, em.z0, &zr);
             }

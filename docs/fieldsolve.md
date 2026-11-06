@@ -29,7 +29,7 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
 
 ## Model
 
-- **Geometry.** Copper is a zero-thickness perfect conductor on the mesh plane of its layer, as in openEMS
+- **Geometry.** Copper is a zero-thickness conductor on the mesh plane of its layer (perfect, or with a surface impedance: see conductor loss below), as in openEMS
   PCB models and gerber2ems. An in-plane E edge is metal when its midpoint lies in copper. Gerber
   primitives (flashes, macros, tracks as capsules, regions, LPC clears) are rasterised in file order.
   Plated holes are solid conductor columns: z edges at the mesh nodes inside the drill, or at the nearest
@@ -53,8 +53,23 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   fitted by NNLS. εr is matched at `f_ref`. The fit is flat to about 1 % over the band (`disp.rs`). The poles
   run as auxiliary-current ADEs on the edges in dielectric, on the CPU and in the fused Metal kernels.
   `"copper": true` adds the plane-pair copper loss of each slab as an extra tan δ of about δ_s/h (skin depth
-  over slab thickness, rising as √f). That is a stand-in for conductor loss between planes; traces stay
-  lossless.
+  over slab thickness, rising as √f). That is a stand-in for conductor loss between planes only; use
+  `"conductor"` (below) instead.
+- **Conductor loss.** `"conductor": {"sigma": 5.8e7, "roughness_um": 1.0}` (or `true` for these defaults)
+  gives every copper sheet edge a surface impedance instead of a perfect conductor (`cond.rs`). For a
+  conductor of thickness t with current on one face, Z_s = k/σ · coth(kt), k = (1 + j)/δ: 1/(σt) at DC and
+  (1 + j)/(σδ) once the skin depth δ is well below t. Roughness multiplies it by the Hammerstad-Jensen
+  factor 1 + (2/π) atan(1.4 (Δ/δ)²), which approaches 2 when the rms roughness Δ exceeds δ; standard
+  electrodeposited foil on FR4 is about 1-2 µm, against δ = 1.3 µm at 2.4 GHz. Thickness per layer comes
+  from the stack-up (`"thickness_um"` overrides it).
+  - On a sheet edge, E = Z_s · J_s. J_s is the curl of H across the sheet times the dual edge length.
+  - Z_s is fitted as a chain of parallel RL sections, two per decade from below the thickness transition to
+    3 · f_hi. Each section's current is integrated exactly over a step, so the update is explicit and stable.
+    `fieldsolve cond-fit` prints the fit; the loss (Re Z_s) is within 1-5 % over the band.
+  - Current is assumed to flow on one face. That is right for a trace over a plane and for a plane under a
+    trace. It overestimates an isolated strip carrying current on both faces by up to 2×.
+  - Vias and barrels, port and element bars (the part bodies, whose loss is in the part model) and copper
+    inside the absorber stay perfect conductors.
 - **Mesh.** Uniform `cell` in x/y over the copper window (ROI plus `air`) and `cell_z` (at least `min_cells_layer` cells per
   dielectric layer) through the board, growing by at most 1.3× per cell outside, up to λ/20. Every
   copper interface and every port coordinate is a mesh line.
@@ -95,6 +110,8 @@ target/release/fieldsolve selftest                 # analytic validation cases
 target/release/fieldsolve farfield-check           # free-space dipoles against theory (far field)
 target/release/fieldsolve loss-check               # lossy cavity Q: constant sigma vs wideband dielectric
 target/release/fieldsolve debye-port-check         # two-port microstrip with the wideband dielectric: passivity
+target/release/fieldsolve copper-check             # copper cavity Q against h/delta (conductor loss)
+target/release/fieldsolve cond-fit [--rough-um 1]  # copper surface impedance: exact vs the fitted network
 target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see below)
 target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
@@ -205,6 +222,20 @@ Optional settings:
   includes their layout, so their parasitics are already in the target. A hot S22 measured at the
   connector with the chip transmitting is not this target.
 - **`plot_ideal`:** `false` leaves the ideal-ladder curves out of the plot and the table.
+- **`deembed`:** `true` removes, from every part, the inductance of its port's bar across the pad gap.
+  - Why: an in-plane port is a copper bar between the pads with a one-cell gap. The current crossing the
+    pad gap through that bar has inductance in the EM model. A vendor part measured on its own fixture
+    already contains its body's inductance across the same gap, so connecting it to the bar counts that
+    inductance twice.
+  - How much: the run measures the stretch of each bar that lies over no copper and writes its partial
+    self-inductance to `result.json` (`port_bars`, Grover's flat-strip formula). Across an 0402 pad gap
+    (about 0.5 mm) that is 0.1-0.2 nH. It shifts a 1 pF capacitor's self-resonance by 10-15 % and moves
+    harmonic traps accordingly.
+  - It is a first-order correction. The real body sits above the pads and its loop over the board's ground
+    differs from the vendor fixture's. The faithful alternative is a 3-D part body with an intrinsic part
+    model, which needs a calibration against the vendor's fixture for each part family.
+- **`deembed_kept`:** `true` also removes the kept ports' bar inductance in series, which moves their
+  reference planes to the pad edges (for comparison with measurements referenced there).
 
 The S11 in the table and plot is referenced to 50 Ω at the chip side. A chip whose RF pin does not want
 50 Ω looks mismatched there however well it is matched, so judge the match by the target column.
@@ -283,6 +314,8 @@ are at the default mesh; Metal and CPU agree to about 1e-6 relative.
 | Hertzian dipole, exact fields on a box (unit test) | P_rad, Poynting flux, D | within 3 % | analytic | |
 | Cavity filled with tan δ 0.02 (`loss-check`), constant σ at 1 GHz | Q at 4.5 / 6.2 / 8.4 GHz | 218 / 310 / 408 | 1/tan δ = 50 | 4-8× |
 | same, wideband (Debye) | Q at 4.55 / 6.32 / 8.49 GHz | 47.5 / 47.9 / 44.5 | 50 (port loading alone: Q ≥ 894) | −5 to −11 % |
+| Copper cavity 30×20 mm, plates 0.5 mm apart, smooth copper (`copper-check`) | Q at 4.50 / 6.24 / 8.37 GHz | 528 / 624 / 717 | h/δ = 508 / 598 / 692 | +3.6 to +4.4 % |
+| same, 1 µm rms roughness | Q | 337 / 369 / 406 | h/δ/K = 315 / 351 / 391 | +3.9 to +7.2 % |
 | Matched 30 mm microstrip, tan δ 0.015, wideband (`debye-port-check`) | 1 − \|S11\|² − \|S21\|² at 0.1 / 1.1 / 3.1 / 5.1 GHz | 0.3 / 2.1 / 5.8 / 9.7 % | passive, rising ∝ f | CPU and Metal agree to 0.001 |
 
 Lessons from building these, which also apply to board runs:
@@ -471,6 +504,7 @@ The code is in `src/bin/fieldsolve/`.
 | `cosim.rs` | Touchstone reader, part models, port termination, ideal ladder, renormalisation, radiated vs conducted |
 | `nf2ff.rs` | near-to-far-field transform: box plan, face currents, patterns, power, polar plots |
 | `disp.rs` | wideband dielectric: Debye pole fit to a flat tan δ, plane copper loss, update constants |
+| `cond.rs` | conductor loss: copper surface impedance (skin effect, thickness, roughness), Foster fit, sheet edges |
 | `tools/blender_frames.py` | time-domain current animation |
 | `tools/blender_farfield.py`, `tools/render_farfield_panels.py` | far-field patterns over the board, panel comparisons |
 | `cases.rs` | analytic validation cases |
@@ -488,9 +522,10 @@ The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free
   layer shares a node with it. Warn about this, or route the column only to the nearest reference layer.
 - **Capacitor models.** Series R-L-C elements, so a real capacitor (ESR, ESL, C) can replace the short.
   That gives the PDN impedance curve |Z(f)| directly instead of only the loop L.
-- **Conductor loss.** A surface-impedance (skin-effect) model for copper, for RF insertion loss and the
-  resistive part of loop impedance. Traces are lossless now; `"loss": {"copper": true}` only adds the
-  plane-pair loss as an equivalent tan δ.
+- **Conductor loss on vias and in the absorber.** Barrels and element bars stay perfect conductors, and so
+  does copper inside the CPML. A two-face current model for isolated strips is also open.
+- **Part bodies.** 3-D part bodies with intrinsic part models, calibrated against the vendors' fixtures,
+  instead of the bar inductance correction.
 - **Antennas.** The near-to-far-field transform is in place and validated on dipoles. Next: chip and trace
   antennas on a board, and an enclosure.
 - **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins); the thirds rule

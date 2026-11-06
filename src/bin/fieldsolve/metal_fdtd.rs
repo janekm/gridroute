@@ -40,6 +40,7 @@ struct Pipes {
     dft: ComputePipelineState,
     gather: ComputePipelineState,
     energy: ComputePipelineState,
+    cond: ComputePipelineState,
 }
 
 fn buf_f32(dev: &Device, v: &[f32]) -> Buffer {
@@ -77,7 +78,7 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
         let f = lib.get_function(name, None).map_err(|e| e.to_string())?;
         dev.new_compute_pipeline_state_with_function(&f).map_err(|e| e.to_string())
     };
-    let pp = Pipes { h: pipe("update_h")?, e: pipe("update_e")?, ei: pipe("update_e_idx")?, hf: pipe("update_h_f")?, ef: pipe("update_e_f")?, ph: pipe("pml_h")?, pe: pipe("pml_e")?, src: pipe("add_src")?, probe: pipe("probe")?, dft: pipe("dft")?, gather: pipe("dft_gather")?, energy: pipe("energy")? };
+    let pp = Pipes { h: pipe("update_h")?, e: pipe("update_e")?, ei: pipe("update_e_idx")?, hf: pipe("update_h_f")?, ef: pipe("update_e_f")?, ph: pipe("pml_h")?, pe: pipe("pml_e")?, src: pipe("add_src")?, probe: pipe("probe")?, dft: pipe("dft")?, gather: pipe("dft_gather")?, energy: pipe("energy")?, cond: pipe("cond_e")? };
     let queue = dev.new_command_queue();
     let (nx, ny, nz) = (p.nx, p.ny, p.nz);
     let n = p.n();
@@ -191,6 +192,12 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
             (zeros(&dev, 3 * nd * d.np), buf_f32(&dev, &b), buf_f32(&dev, &kh), [d.k0 as u32, d.k1 as u32, d.np as u32])
         }
         None => (zeros(&dev, 1), zeros(&dev, 1), zeros(&dev, 2), [0, 0, 0]),
+    };
+    // surface-impedance copper edges
+    let ncond = p.cond.as_ref().map(|c| c.ids.len()).unwrap_or(0);
+    let (cidb, cfacb, clayb, ccib, ctabb, cdecb, cnb) = match &p.cond {
+        Some(c) if ncond > 0 => (buf_u32(&dev, &c.ids), buf_f32(&dev, &c.fac), buf_u32(&dev, &c.layer), zeros(&dev, ncond * c.nb), buf_f32(&dev, &c.tab), buf_f32(&dev, &c.dec), c.nb),
+        _ => (zeros(&dev, 1), zeros(&dev, 1), zeros(&dev, 1), zeros(&dev, 1), zeros(&dev, 1), zeros(&dev, 1), 0),
     };
     let prm = P { nx: nx as u32, ny: ny as u32, nz: nz as u32, kmu: (p.dt / MU0) as f32, nsrc: nsrc as u32, nprobe: nprobe as u32, pl: [pml[0].len as u32, pml[1].len as u32, pml[2].len as u32], kd, ..Default::default() };
     // fused H/E kernels (CPML inline, material indices) unless disabled for comparison
@@ -362,6 +369,27 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
                 q.vs = spec.exc[n_step];
                 set_p(&q);
                 enc.dispatch_threads(MTLSize { width: nsrc as u64, height: 1, depth: 1 }, MTLSize { width: 64.min(nsrc as u64).max(1), height: 1, depth: 1 });
+            }
+            // conductor loss: E on copper edges from the sheet current (after the source, before the probes)
+            if ncond > 0 {
+                enc.set_compute_pipeline_state(&pp.cond);
+                enc.set_buffer(0, Some(&e[0]), 0);
+                enc.set_buffer(1, Some(&e[1]), 0);
+                for c in 0..3 {
+                    enc.set_buffer(3 + c as u64, Some(&h[c]), 0);
+                }
+                enc.set_buffer(6, Some(&inv_dd), 0);
+                enc.set_buffer(8, Some(&cidb), 0);
+                enc.set_buffer(9, Some(&cfacb), 0);
+                enc.set_buffer(10, Some(&clayb), 0);
+                enc.set_buffer(11, Some(&ccib), 0);
+                enc.set_buffer(12, Some(&ctabb), 0);
+                enc.set_buffer(13, Some(&cdecb), 0);
+                let mut q = prm;
+                q.axis = cnb as u32;
+                q.slab_len = ncond as u32;
+                set_p(&q);
+                enc.dispatch_threads(MTLSize { width: ncond as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
             }
             // probes
             if nprobe > 0 {

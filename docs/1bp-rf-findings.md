@@ -82,8 +82,9 @@ shunt capacitors are past their self-resonance, and the ladder's transfer rises 
 - **The model's frequencies run 10-15 % low** against Nordic's measurement (Validation). If the real
   features sit that much higher, the board at 7.32 GHz behaves like the model near 6.4-6.6 GHz: 25-30 dB
   better.
-- **Losses are missing.** There is no copper loss in the traces, and the reference run had the plane
-  copper-loss term off. Real losses blunt the resonance further.
+- **Copper loss blunts the resonance.** These runs had no copper loss; the model has it now, and it makes
+  nulls and traps shallower by a few dB. Near the trap the result also changes by several dB with the
+  mesh (see Validation).
 - **"Per W into a 50 ohm port" exaggerates a near-short load.** The chip's real behaviour at H3 is
   unknown.
 - **The measured data agree.** Nordic measured -48 to -51 dBc of H3 at their connector, which is far
@@ -103,13 +104,38 @@ do not depend on the measurement's offset reference planes.
 - **The shape matches:** low-pass, the H2 null, total reflection at the harmonics.
 - **The simulated cutoff sits about 10-15 % low.** At 2.44 GHz the model gives S11 -3 dB and S21 -3.7 dB,
   against -7.8 dB and -1.5 dB measured.
-- **Likely causes:**
-  - the measured board is not exactly this layout: the measurement carries about 400 ps of extra cable or
-    trace delay;
-  - zero-thickness copper edges on the mesh make conductors act slightly wider, which narrows Nordic's
-    0.15-0.25 mm coplanar gaps and adds capacitance.
-- **Next step:** a mesh-refinement run, 0.025 mm on configuration 1, would separate the two causes.
 
+**What was ruled out (Nov 2026).** Each candidate cause was added to the model or tested separately:
+
+| change to the config 1 model (v1.0 parts) | S11 / S21 at 2.44 GHz | rms error 1-8 GHz, \|S21\| | S21 at 4.88 / 7.32 GHz |
+|---|---|---|---|
+| as first simulated | -3.0 / -3.7 dB | 10.5 dB | -49.5 / -22.9 dB |
+| + copper loss (35 um, 1 um roughness) | -3.1 / -3.8 dB | 10.2 dB | -49.4 / -23.2 dB |
+| + part bar de-embedding (0.06-0.11 nH per port) | -3.4 / -3.5 dB | 9.4 dB | -51.5 / -24.9 dB |
+| same, 0.035 mm mesh instead of 0.05 mm | -3.4 / -3.5 dB | 11.2 dB | -47.6 / -24.0 dB |
+| measured | -7.8 / -1.5 dB | | -32.5 / -27.9 dB |
+
+- **Copper loss is real but small in band.** Traces, pads and planes now have a skin-effect surface
+  impedance. That adds about 0.1 dB in band and makes the nulls shallower. It does not move the cutoff.
+- **Part losses are already in.** The vendor files are measurements of the mounted parts, so their ESR and
+  Q are included. Losses in the pads and traces under the parts are now covered by the copper model.
+- **Port-bar double counting is real but small.** Each part sits on a copper bar across its pad gap, and
+  the vendor data already contains the body's inductance across that gap. Removing the bar's partial
+  inductance (0.06-0.11 nH here, from its geometry) improves the fit slightly.
+  - A free fit wanted about 0.3 nH per part plus 0.6 nH at the output port. That is 3-5x more than the
+    geometry gives, and even then it reached only 4 dB rms error.
+- **The mesh is converged in band.** 0.035 mm cells give the same in-band result as 0.05 mm.
+- **Near the harmonic nulls the results are not converged.** H2 and H3 move by 1-6 dB between the two
+  meshes. That is a further reason to treat the modelled harmonic levels near traps as uncertain.
+- **What remains is most likely the comparison itself, not the solver.**
+  - Nordic publish two value sets for this network (v1.0 and v1.1), and the measurement does not say which
+    was fitted. A free choice of Murata parts still leaves 4 dB rms error.
+  - The measurement carries about 400 ps of extra cable or trace (a test fixture with its own launches).
+    Its S11 has a shoulder at 1.5-2 GHz that no variant of this layout reproduces.
+  - The stack-up's 70 um top prepreg at εr 4.8 looks like an Altium default rather than a fabricator's
+    value.
+- **The real validation is a measurement of our own board,** with known parts and a known reference plane:
+  a VNA on the 1BP network with the chip removed.
 ## Other findings along the way
 
 - **In1 is the VCC2V4 plane.** Referencing a port to it, without its decoupling capacitors modelled, made

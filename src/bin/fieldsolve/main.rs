@@ -10,6 +10,7 @@ mod mesh;
 mod model;
 mod nf2ff;
 mod disp;
+mod cond;
 mod post;
 mod export;
 mod sim;
@@ -71,6 +72,33 @@ fn main() {
                     print!(" {:.2}GHz:{:+.3}", v[0] * 1e-9, 1.0 - s11.abs().powi(2) - s21.abs().powi(2));
                 }
                 println!("   steps {:?}", r["runs"].as_array().unwrap().iter().map(|x| x["steps"].as_u64().unwrap()).collect::<Vec<_>>());
+            }
+        }
+        "copper-check" => {
+            // thin copper cavity: plate-loss Q against h / delta
+            let be = backend(&args);
+            for rough in [0.0, 1.0] {
+                println!("roughness {rough} um:");
+                for (f, qc, th) in cases::copper_cavity(&*be, rough) {
+                    println!("  {:.3} GHz  Q {:6.1}  theory h/delta/K {:6.1}  ({:+.1} %)", f * 1e-9, qc, th, 100.0 * (qc / th - 1.0));
+                }
+            }
+        }
+        "cond-fit" => {
+            // surface impedance of copper: exact against the Foster fit the solver uses
+            let num = |k: &str, d: f64| arg(&args, k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+            let m = cond::Metal { sigma: num("--sigma", 5.8e7), t: num("--t-um", 35.0) * 1e-6, rough: num("--rough-um", 1.0) * 1e-6 };
+            let c = cond::Conductor { metals: vec![m.clone()], f_lo: num("--f-lo", 0.1e9), f_hi: num("--f-hi", 10e9) };
+            let fk = cond::corners(&c);
+            let ft = cond::fit(&m, &fk, c.f_lo, c.f_hi);
+            println!("{} sections, worst {:.1} % over {:.2e}..{:.2e} Hz", fk.len(), 100.0 * ft.worst, c.f_lo, c.f_hi);
+            println!("{:>10} {:>12} {:>12} {:>12} {:>12}", "f [Hz]", "Re exact", "Im exact", "Re fit", "Im fit");
+            for e in 6..=10 {
+                for m10 in [1.0, 2.5, 5.0] {
+                    let f = m10 * 10f64.powi(e);
+                    let (z, zf) = (cond::zs(&m, f), ft.z(f));
+                    println!("{f:>10.2e} {:>12.4e} {:>12.4e} {:>12.4e} {:>12.4e}", z.re, z.im, zf.re, zf.im);
+                }
             }
         }
         "loss-check" => {
@@ -298,6 +326,10 @@ mod tests {
     }
 
     fn small_problem_with(wideband: Option<disp::Wideband>) -> model::Problem {
+        small_problem_full(wideband, None)
+    }
+
+    fn small_problem_full(wideband: Option<disp::Wideband>, conductor: Option<cond::Conductor>) -> model::Problem {
         use geom::{Prim, Shape, P2};
         let rect = |x0: f64, y0: f64, x1: f64, y1: f64| Prim {
             shape: Shape::Polygon(vec![P2::new(x0, y0), P2::new(x1, y0), P2::new(x1, y1), P2::new(x0, y1)]),
@@ -315,7 +347,7 @@ mod tests {
             copper_window: None,
         };
         let port = model::Lumped { name: "P1".into(), axis: 2, lo: [1.0, 1.0, 0.0], hi: [1.0, 1.0, 0.4], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-        model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband })
+        model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband, conductor })
     }
 
     #[test]
@@ -380,6 +412,28 @@ mod tests {
         let fpk = fa.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         let fdiff = fa.iter().zip(fb).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
         assert!(fdiff <= 1e-3 * fpk, "field DFT differs: {fdiff} vs peak {fpk}");
+    }
+
+    #[test]
+    fn cpu_and_gpu_agree_with_conductor_loss() {
+        let m = cond::Metal { sigma: 5.8e7, t: 35e-6, rough: 1e-6 };
+        let p = small_problem_full(Some(disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false }), Some(cond::Conductor { metals: vec![m.clone(), m], f_lo: 0.3e9, f_hi: 10e9 }));
+        assert!(p.cond.as_ref().is_some_and(|c| !c.ids.is_empty()), "the planes should have surface-impedance edges");
+        let exc = fdtd::gauss_excite(0.0, 10e9, p.dt);
+        let spec = fdtd::RunSpec { excite: Some(0), exc, max_steps: 4000, end_db: -300.0, check_every: 1000, ..Default::default() };
+        let a = fdtd::run_cpu(&p, &spec);
+        // stable, and lossier than the same problem with perfect copper: the late ringing is weaker
+        let lossless = fdtd::run_cpu(&small_problem_full(Some(disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false }), None), &spec);
+        let peak = a.v[0].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let tail = |v: &[f32]| v[v.len() - 1000..].iter().map(|x| (x * x) as f64).sum::<f64>();
+        let (t1, t0) = (tail(&a.v[0]), tail(&lossless.v[0]));
+        assert!(t1.is_finite() && t1 < t0, "late energy with conductor loss {t1:.3e} vs perfect copper {t0:.3e}");
+        let b = auto()(&p, &spec);
+        if b.backend == "cpu" {
+            return;
+        }
+        let diff = a.v[0].iter().zip(&b.v[0]).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff <= 1e-4 * peak, "port voltage differs: {diff} vs peak {peak}");
     }
 
     #[test]

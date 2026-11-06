@@ -152,6 +152,19 @@ pub struct Setup {
     /// stop when the port signals have decayed by end_db (spec "stop": "ports", the default for board
     /// runs; "energy" waits for the total field energy)
     pub port_stop: bool,
+    /// in-plane ports and elements: (name, length of the bar over no copper (the pad gap) mm, bar width mm,
+    /// partial self-inductance of that bare stretch nH). A vendor part model measured on its own fixture
+    /// already contains its body's inductance across this gap, so `cosim` can subtract it ("deembed").
+    pub bars: Vec<(String, f64, f64, f64)>,
+}
+
+/// Partial self-inductance (nH) of a thin flat strip, length l and width w in mm (Grover, t = 0):
+/// L = mu0 l / (2 pi) [ln(2 l / w) + 1/2 + w / (3 l)].
+pub fn strip_inductance_nh(l: f64, w: f64) -> f64 {
+    if l <= 0.0 || w <= 0.0 {
+        return 0.0;
+    }
+    (2e-7 * l * 1e-3 * ((2.0 * l / w).ln() + 0.5 + w / (3.0 * l))).max(0.0) * 1e9
 }
 
 /// Build layout, mesh and lumped elements from the spec.
@@ -293,6 +306,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         Plane { a: P2, b: P2, axis: usize, w: f64, z: f64, layer: String },
     }
     let mut geos = Vec::new();
+    let mut bars = Vec::new();
     for pd in &pend {
         let e = &pd.el;
         if let Some(at) = e.get("at") {
@@ -336,6 +350,16 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let z = cx.z_of(&layer)?;
             // a straight bridge on the line through pos along the axis
             let b2 = if axis == 0 { P2::new(b.x, a.y) } else { P2::new(a.x, b.y) };
+            // the stretch of the bar over no copper: the gap between the pads that the part body spans
+            {
+                let n = 400;
+                let bare = (0..n).filter(|&k| {
+                    let t = (k as f64 + 0.5) / n as f64;
+                    cx.net_at(P2::new(a.x + (b2.x - a.x) * t, a.y + (b2.y - a.y) * t), &layer).is_none()
+                }).count();
+                let gap = bare as f64 / n as f64 * ((b2.x - a.x).abs() + (b2.y - a.y).abs());
+                bars.push((pd.name.clone(), gap, w, strip_inductance_nh(gap, w)));
+            }
             if axis == 0 {
                 fy.extend([a.y - w / 2.0, a.y + w / 2.0]);
                 fx.push(0.5 * (a.x + b.x));
@@ -478,6 +502,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) } };
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
+    let sheet_names: Vec<String> = layout.sheets.iter().map(|s| s.name.clone()).collect();
     Ok(Setup {
         grid,
         layout,
@@ -495,12 +520,28 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 f_ref: num(l, "f_ref", 1e9),
                 copper: l.get("copper").and_then(|c| c.as_bool()).unwrap_or(false),
             }),
+            // "conductor": true or {"sigma": 5.8e7, "roughness_um": 1.0, "thickness_um": 35, "f_lo", "f_hi"}:
+            // surface-impedance copper (cond.rs); thickness per layer from the stack-up unless given
+            conductor: sp.get("conductor").filter(|c| c.as_bool() != Some(false)).map(|c| {
+                let o = |k: &str| c.get(k).and_then(|v| v.as_f64());
+                let metals = sheet_names
+                    .iter()
+                    .map(|name| {
+                        let t_mm = o("thickness_um").map(|t| t * 1e-3).unwrap_or_else(|| {
+                            cx.board.stack.iter().find(|l| l.kind == crate::gerber::StackKind::Copper && &l.name == name).map(|l| l.thickness_mm).filter(|&t| t > 0.0).unwrap_or(0.035)
+                        });
+                        crate::cond::Metal { sigma: o("sigma").unwrap_or(5.8e7), t: t_mm * 1e-3, rough: o("roughness_um").unwrap_or(1.0) * 1e-6 }
+                    })
+                    .collect();
+                crate::cond::Conductor { metals, f_lo: o("f_lo").unwrap_or(fmin.max(0.1e9)), f_hi: o("f_hi").unwrap_or(fmax) }
+            }),
         },
         freqs: linspace(fmin, fmax, nf),
         fmax,
         end_db: num(&sp, "end_db", -70.0),
         max_steps: num(&sp, "max_steps", 400_000.0) as usize,
         port_stop: sp.get("stop").and_then(|v| v.as_str()).unwrap_or("ports") == "ports",
+        bars,
     })
 }
 
@@ -799,7 +840,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     };
     let res = json!({
         "grid": [p.nx, p.ny, p.nz], "cells": p.n(), "dt": p.dt, "runs": runs, "ports": ports_out,
-        "port_names": names, "z_matrix": zmat_out, "mesh_shorts": bridge_lines, "farfield": far_summary, "port_power_balance": balance_out,
+        "port_names": names, "port_bars": st.bars.iter().map(|b| json!({"name": b.0, "gap_mm": b.1, "width_mm": b.2, "l_gap_nh": b.3})).collect::<Vec<_>>(), "z_matrix": zmat_out, "mesh_shorts": bridge_lines, "farfield": far_summary, "port_power_balance": balance_out,
     });
     std::fs::write(out.join("result.json"), serde_json::to_string_pretty(&res).unwrap()).map_err(|e| e.to_string())?;
     Ok(res)

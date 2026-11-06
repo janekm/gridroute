@@ -155,6 +155,8 @@ pub struct CpuState {
     /// Debye currents (compact, `np` per edge) and E before the update over the dispersive planes
     dj: [Vec<f32>; 3],
     e0: [Vec<f32>; 3],
+    /// surface-impedance section currents, `nb` per conductor edge
+    ci: Vec<f32>,
 }
 
 impl CpuState {
@@ -167,7 +169,7 @@ impl CpuState {
             std::array::from_fn(|_| vec![0.0f32; len])
         });
         let (nd, np) = p.disp.as_ref().map(|d| (d.nd(p.nx, p.ny), d.np)).unwrap_or((0, 0));
-        CpuState { e: [z(), z(), z()], h: [z(), z(), z()], psi, dj: std::array::from_fn(|_| vec![0.0f32; nd * np]), e0: std::array::from_fn(|_| vec![0.0f32; nd]) }
+        CpuState { e: [z(), z(), z()], h: [z(), z(), z()], psi, dj: std::array::from_fn(|_| vec![0.0f32; nd * np]), e0: std::array::from_fn(|_| vec![0.0f32; nd]), ci: vec![0.0f32; p.cond.as_ref().map(|c| c.ids.len() * c.nb).unwrap_or(0)] }
     }
 }
 
@@ -236,6 +238,39 @@ pub fn update_e(p: &Problem, s: &mut CpuState) {
                     *ez.at(id) = caz[id] * *ez.at(id) + cbz[id] * ((hy[id] - hy[id - 1]) * idx[i] - (hx[id] - hx[id - sy]) * idy[j]);
                 }
             }
+        }
+    });
+}
+
+/// Copper with a surface impedance (cond.rs): on every listed sheet edge, E = Z_s * J_s with J_s the
+/// sheet current from the curl of H across the sheet (after the E update, which left these edges at 0).
+pub fn cond_update(p: &Problem, s: &mut CpuState) {
+    let Some(c) = &p.cond else { return };
+    let (nx, ny) = (p.nx, p.ny);
+    let (sy, sz) = (nx, nx * ny);
+    let [hx, hy, hz] = &s.h;
+    let [idx, idy, idz] = &p.inv_dd;
+    let nb = c.nb;
+    let ex = Ptr(s.e[0].as_mut_ptr());
+    let ey = Ptr(s.e[1].as_mut_ptr());
+    s.ci.par_chunks_mut(nb.max(1)).enumerate().for_each(|(t, ik)| {
+        let w = c.ids[t];
+        let (a, id) = ((w >> 30) as usize, (w & 0x3fff_ffff) as usize);
+        let (i, j, k) = (id % nx, (id / nx) % ny, id / sz);
+        let curl = if a == 0 {
+            (hz[id] - hz[id - sy]) * idy[j] - (hy[id] - hy[id - sz]) * idz[k]
+        } else {
+            (hx[id] - hx[id - sz]) * idz[k] - (hz[id] - hz[id - 1]) * idx[i]
+        };
+        let js = curl * c.fac[t];
+        let r = &c.tab[c.layer[t] as usize * (nb + 1)..];
+        let mut e = r[0] * js;
+        for q in 0..nb {
+            ik[q] = js + (ik[q] - js) * c.dec[q];
+            e += r[q + 1] * (js - ik[q]);
+        }
+        unsafe {
+            *(if a == 0 { ex } else { ey }).at(id) = e;
         }
     });
 }
@@ -494,6 +529,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
             }
         }
         disp_update(p, &mut s);
+        cond_update(p, &mut s);
         for (k, x) in probe(p, &s).into_iter().enumerate() {
             v[k].push(x);
         }
