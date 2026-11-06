@@ -73,6 +73,7 @@ kicad-cli pcb export drill --format excellon --excellon-separate-th -o gbr/ boar
 target/release/fieldsolve run spec.json            # --backend auto|metal|cpu, --out DIR
 target/release/fieldsolve svg gbr/ board.svg       # the imported layout, layers toggleable
 target/release/fieldsolve selftest                 # analytic validation cases
+target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see below)
 ```
 
 A decoupling-loop spec for the AMOLED board's ESP32-S3 3V3 pin 46 and its capacitor C112. Coordinates are
@@ -100,12 +101,80 @@ Ports and elements come in two forms:
 `kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
 
+The run prints the net under each port terminal (`port CHIP: + ANT (F.Cu) / - GND (F.Cu)`). It warns when
+neither end of a vertical port is on a net whose name contains `GND`. Check the reference before a long
+run. An inner layer is often a power plane, not ground. In the window, a power plane connects to nothing
+unless its decoupling capacitors are modelled. A port referenced to that plane, or a feed running over
+it, then sees the plane ringing as a patch between the ground layers. On 1BP, In1 is the `VCC2V4` plane.
+A chip port from the ANT ball down to In1 showed sharp absorption notches at 2.32, 2.95 and 7.55 GHz.
+The fix is to reference the port to a neighbouring GND ball, or a GND pad, on the same layer. Also add the
+plane's decoupling capacitors in the window as `short` elements, so the plane is tied to ground the way
+it is at RF.
+
 Outputs in `out/`:
 
 - `result.json`: per excited port, Z(f), |S11| in dB and the R + jωL fit over `l_band`.
 - `sparams.sNp`.
 - `scene.json`: exactly what was simulated, for the openEMS cross-check.
 - `fields/`: see below, including the vector fields for `fieldsolve lines`.
+
+### Co-simulation: parts on the EM N-port
+
+For a frontend, run the board with the parts removed. Put a port across every part's pads, plus ports at the
+chip pin and the connector (`"excite": "all"`). `fieldsolve cosim` then connects part models to that
+N-port. A two-terminal part across its own port is a one-port load, so connecting it terminates that port:
+with Γ = (Z − Z0)/(Z + Z0) on the terminated ports t and the kept ports e,
+S'ₑₑ = Sₑₑ + Sₑₜ Γ (I − Sₜₜ Γ)⁻¹ Sₜₑ. That takes microseconds per frequency, so part values and part numbers
+can be swapped without a new EM run.
+
+```json
+{ "em": "run/sparams.s6p", "out": "cosim", "keep": ["CHIP", "J1"],
+  "ladder": [["shunt", "C21"], ["series", "L4"], ["shunt", "C18"], ["series", "L3"]],
+  "variants": {
+    "ideal parts":  {"C21": "C:1p", "L4": "L:4.7n", "C18": "C:1.2p", "L3": "L:2.2n"},
+    "typical 0402": {"C21": "C:1p,esr=0.3,esl=0.35n", "L4": "L:4.7n,srf=6G,q=20@2.4G",
+                     "C18": "C:1.2p,esr=0.3,esl=0.35n", "L3": "L:2.2n,srf=10G,q=20@2.4G"} },
+  "zref": {"CHIP": [50, 0]},
+  "report": [2.44e9, 4.88e9, 7.32e9] }
+```
+
+Part models:
+
+| Model | Meaning |
+|---|---|
+| `C:<value>` | Capacitor. Optional `esr=` and `esl=` add series ESR and ESL. |
+| `L:<value>` | Inductor. Optional `srf=` adds a parallel C. Optional `q=Q@f` adds a series R that scales as √f. |
+| `R:<value>` | Resistor. |
+| `open`, `short` | Open or short circuit. |
+| `s2p:FILE` | Vendor two-port measured in series through a fixture (Murata): Z = 2Z0·S11/S21. |
+| `s2p-shunt:FILE` | Vendor two-port measured as a shunt to ground on a through line (Yageo): Z = −Z0·S21/(2·S11). Check the file: a shunt part has \|S21 − S11\| = 1, a series part \|S11 + S21\| = 1. |
+| `s1p:FILE` | Vendor one-port. |
+
+Both two-port forms are ratios, so a symmetric matched fixture line left in the data cancels. Outside a
+file's frequency range the nearest value is held.
+
+Port names come from `result.json` next to the EM file.
+
+Optional settings:
+- **`ladder`:** the same parts are also cascaded as an ideal ladder (ABCD) with no layout, so the
+  layout's own effect is the difference between the two.
+- **`zref`:** renormalises the kept ports to complex reference impedances (power waves), e.g. a chip's
+  optimum load.
+- **`target`:** a measured matching network, a two-port with port 1 on the chip side. Loaded with 50 Ω,
+  it gives the impedance the chip is designed to see. Each case gets a column |Γ| = |(Zin − Zt)/(Zin + Zt*)|
+  against it, which is only meaningful in band. Use the vendor's own measured reference network: it
+  includes their layout, so their parasitics are already in the target. A hot S22 measured at the
+  connector with the chip transmitting is not this target.
+- **`plot_ideal`:** `false` leaves the ideal-ladder curves out of the plot and the table.
+
+The S11 in the table and plot is referenced to 50 Ω at the chip side. A chip whose RF pin does not want
+50 Ω looks mismatched there however well it is matched, so judge the match by the target column.
+
+Outputs:
+- `<variant>.s2p` for each variant;
+- `cosim.svg`, a plot of |S11| and |S21|;
+- `cosim.json`;
+- a table of S11, S21 and Zin at the report frequencies.
 
 ## Validation
 
@@ -282,6 +351,7 @@ The code is in `src/bin/fieldsolve/`.
 | `export.rs` | VTK, raw volumes, complex vector fields, surface currents, copper OBJ |
 | `lines.rs` | field-line tracing |
 | `connect.rs` | mesh connectivity check (shorts between nets) |
+| `cosim.rs` | Touchstone reader, part models, port termination, ideal ladder, renormalisation |
 | `tools/blender_frames.py` | time-domain current animation |
 | `cases.rs` | analytic validation cases |
 | `tools/openems_scene.py` | openEMS replay of a scene |

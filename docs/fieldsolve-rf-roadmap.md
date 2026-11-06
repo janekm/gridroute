@@ -39,7 +39,7 @@ What this buys:
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| F1 | **Touchstone reader and network connection** in `post.rs`: N-port S with complex reference impedances, connect/terminate, power-wave renormalisation, mixed-mode (differential) conversion | Co-simulation core. The chip's RF pin impedance from the datasheet becomes a complex reference. Differential balun ports need mixed-mode. | M |
+| F1 | **Touchstone reader and network connection**: N-port S with complex reference impedances, connect/terminate, power-wave renormalisation, mixed-mode (differential) conversion. *Done (Nov 2026), in `cosim.rs` / `fieldsolve cosim`:* Touchstone reader, two-terminal parts as port terminations (ideal, parasitic, `s2p`/`s1p`), ideal-ladder comparison, complex reference renormalisation. *Still to do:* multi-terminal parts (a balun `.s3p` connected port to port) and mixed-mode conversion. | Co-simulation core. The chip's RF pin impedance from the datasheet becomes a complex reference. Differential balun ports need mixed-mode. | M |
 | F2 | **Ports from parts**: `"components": ["L3", "C7", "FL1", "U4"]` puts a port on every signal pad, referenced to the nearest GND pad or the plane underneath. Two-pad parts get an in-plane gap port; balun and filter GND pins are shorted to their pads/vias. Ports on RF nets are found the way `bench/pcb/topor_rf.py` already finds them. | Writing 20 port definitions by hand does not scale. | M |
 | F3 | **Port accuracy**: resolve the reciprocal-port discrepancy (single-node vertical columns act as zero-radius thin wires; the gap port's current spreads differently). Plan: ports with a finite footprint matching the pad, a thin-wire correction, and an openEMS cross-check per port type. | At 2.4 GHz, 0.1 nH is 1.5 Ω of reactance: the matching network sees it. | M |
 | F4 | **RF meshing**: on RF nets, mesh lines follow the copper edges with the thirds rule (the microstrip case showed 6 % εeff error without it); optional two-plane thick copper (35 µm) for gaps ≤ 0.15 mm; a sub-cell solder-mask layer (εr ≈ 3.5 over the traces, folded into edge averaging, no extra mesh plane) | Without these, line impedance and coupling are off by a few percent. CPWG and filter gaps are sensitive to all three. | M |
@@ -109,7 +109,9 @@ Outputs per frontend:
     J1.4 (149.60, 84.72) with GND pads at y 83.2 and 81.68;
   - the feed is a ≈ 0.79 mm top-layer fill;
   - both inner layers are kept out under the matching network, so the feed is referenced to the
-    bottom/top GND.
+    bottom/top GND;
+  - In1 is the `VCC2V4` power plane and In2 is GND. Reference ports to GND, not to In1 (see the results
+    below).
 - **Stack-up:** JLC 4-layer 0.8 mm:
 
   | layer | material | thickness | εr | tan δ |
@@ -129,13 +131,103 @@ Outputs per frontend:
 
 First 1BP runs, in order:
 
-1. **Ladder as copper only.** Ports at C21 (ANT–GND), L4, C18, L3 and J1.4–GND: a 5-port EM run. Then
-   connect the Murata LQG15HS/GRM1555 S-parameters (needs F1) and get S chip → J1, checked against the
-   ideal ladder.
+1. **Ladder as copper only.** *Done (Nov 2026), results below.* The EM run has six ports:
+   - CHIP: H23 to the GND ball F23;
+   - C21, L4, C18 and L3 at their pads;
+   - J1.4 to B.Cu.
+
+   The parts are connected afterwards with `fieldsolve cosim`, using vendor S-parameters: Murata
+   GRM1555C1H1R0CA01D, LQG15HS4N7B02D and LQG15HS2N2B02D, and Yageo CC0402BRNPO9BN1R2, which was
+   measured as a shunt. The result is S chip → J1, checked against the ideal ladder.
 2. **u.FL pad study.** The excess capacitance of J1.4 with and without the inner-layer keep-out, shown as
    TDR and as S11 at 2.44 GHz.
 3. **Antenna on the pipe** (A1–A4): the FPC antenna's own model is not in our layout. Simulate it as a
    generic 2.4 GHz FPC dipole, or ask the vendor for its geometry, plus the board, coax and the pipe.
+
+### 1BP results: matching ladder chip → J1 (Nov 2026)
+
+Run settings:
+- window x 146.5–153.5, y 80.5–94.5, plus a 3 mm margin; cell 0.05 mm; 6.2 M cells;
+- six ports at 250 k steps each, 88 min in all on an M3 Max.
+
+The decoupling capacitors in the window, C4, C8, C9, C3, C11, C13, C14, C17 and C24, are `short`
+elements. They tie the In1 power plane and the DEC nets to ground.
+
+Chip-side impedance looking towards J1, with J1 at 50 Ω:
+
+| case | 2.44 GHz Zin | S21 at 2.44 GHz | S21 at 4.87 GHz | S21 at 7.33 GHz |
+|---|---|---|---|---|
+| ladder alone, nominal values | 65.9 − j30.4 Ω | −0.37 dB | −11.7 dB | −27.6 dB |
+| ladder alone, vendor models | 65.8 − j30.3 Ω | −0.77 dB | −38.2 dB | −95 dB |
+| layout + nominal parts | 53.7 − j36.3 Ω | −1.07 dB | −23.0 dB | −35.6 dB |
+| layout + vendor parts | 42.5 − j47.6 Ω | −2.38 dB | −42.0 dB | −38.7 dB |
+| layout, no parts | 48.0 + j1.6 Ω (S11 −31.7 dB) | −0.40 dB | −0.55 dB | −0.63 dB |
+
+- **The feed copper on its own is a good 50 Ω line.** With L4 and L3 shorted and the capacitors open,
+  S11 is −31.7 dB at 2.44 GHz.
+- **Pads and vias pull the impedance the chip sees.** With the vendor parts it moves from 66 − j30 Ω
+  to 42 − j48 Ω.
+  - Against the ladder-alone impedance that would be |Γ| ≈ 0.27. But that is the wrong target: Nordic's
+    measured network presents 35 − j35 Ω; see the re-tune below. Against that, the fitted design is at
+    |Γ| ≈ 0.16–0.20 over 2.40–2.48 GHz, about 0.17 dB of mismatch.
+  - Dissipated loss, from the power the network accepts to the power reaching J1, is 1.33 dB with the
+    vendor parts. About 0.37 dB of that is the port-calibration floor; see the last point.
+- **The third-harmonic rejection is limited by the layout.** C18's self-resonance near 7.4 GHz would
+  give −95 dB as a bare part. On the board it gives −39 dB: the pad and via inductance move the series
+  resonance, and the two ends of the ladder couple directly.
+- **Port-calibration floor.** Every port loses a constant 1–7 % of power, the same from 100 MHz to
+  8 GHz: 6.7 % at the floating L4 port, 1.8 % at CHIP. This is a port-extraction error, not physics. It
+  shows as about 0.37 dB of "loss" on bare copper at 300 MHz. The largest eigenvalue of S^H S is 1.016,
+  so the matrix is slightly non-passive. Fixing this is a follow-up.
+- **First attempt, kept as a warning.** The chip port first ran vertically from H23 to In1, the
+  `VCC2V4` plane, and the decoupling caps were not modelled. The floating plane rang as a patch:
+  absorption notches at 2.32, 2.95 and 7.55 GHz, and S21 −1.4 dB on bare copper. `fieldsolve run` now
+  prints each port terminal's net and warns about vertical ports with no GND end.
+
+
+### 1BP re-tune against Nordic's measured network (Nov 2026)
+
+**Target.** Nordic's matching-network data for the nRF52840 QIAAC0, dated 2018-10-03, contains
+`nRF52840 QIAAC0 matching network.s2p`. It is their reference network measured as a two-port on their
+board, port 1 on the chip side. Loaded with 50 Ω it presents:
+- 38.1 − j34.9 Ω at 2.40 GHz;
+- 35.2 − j35.5 Ω at 2.44 GHz;
+- 32.4 − j35.7 Ω at 2.48 GHz.
+
+This is the load the chip is designed for, Nordic's layout parasitics included. Their network's own
+rejection is −32.5 dB at H2 and −28 dB at H3, and it dissipates 0.7 dB.
+
+The same PDF shows impedances measured with the chip transmitting, e.g. 115.8 − j33.4 Ω at 0 dBm. Those
+are hot impedances seen from the antenna connector into the network plus the running chip, not the chip
+pin's load. A forum post reads 115.8 − j33.4 Ω as the pin impedance. Its "check" uses the nRF52832's
+two-part network (0.8 pF shunt, 3.9 nH series: 111.8 − j32.9 Ω), a different chip at a different
+reference plane.
+
+**Search.** `tune_ladder.py` in the session scratchpad went through every combination of Murata
+GRM1555C1H capacitors (0.5–2.5 pF) and LQG15HS inductors (1.0–6.8 nH) on the four pad sets, 194 k in
+all, in 1.4 s. It reuses the one EM run, and every part uses Murata's measured S-parameters. Candidates
+were scored on:
+- the worst |Γ| against the target over 2.40–2.48 GHz;
+- H2 and H3 rejection;
+- the worst |Γ| over the 3⁴ tolerance corners (C ±0.1 pF, L ±0.1 nH, B tolerance).
+
+| C21 / L4 / C18 / L3 | nominal \|Γ\| | worst-corner \|Γ\| | H2 / H3 (worst in band) |
+|---|---|---|---|
+| as fitted: 1.0 / 4.7 / 1.2 (Yageo) / 2.2 | 0.20 | 0.32 (Murata 1.2 pF) | −41 / −37 dB |
+| C18 → 1.0 pF | 0.04 | 0.24 | −39 / −35 dB |
+| **1.2 / 4.7 / 1.2 / 3.0** | **0.04** | **0.20** | **−39 / −55 dB** |
+| same, Yageo C18 kept | 0.10 | | −41 / −65 dB |
+
+**Recommendation: C21 1.0 → 1.2 pF (GRM1555C1H1R2BA01D) and L3 2.2 → 3.0 nH (LQG15HS3N0B02D). L4 and C18
+stay.**
+- Matching gains little: about 0.15 dB, because the fitted design is already close.
+- The third harmonic drops from about −37 dB to about −55 dB in this model. This is where Nordic says
+  the four-part network matters, at 5 dBm or more.
+- The H3 figure rests on the EM model's coupling between the two ends of the ladder. Check it with a
+  spectrum analyser before relying on it for approval margins.
+- The calibration floor (about 0.37 dB) still sits in every loss figure. Port-model accuracy and the
+  0.05 mm mesh limit the absolute numbers. The ranking between candidates, which share the same EM run,
+  is more reliable than the absolute values.
 
 ## 4. Inputs we need
 

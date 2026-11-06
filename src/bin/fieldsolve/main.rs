@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 mod cases;
 mod connect;
+mod cosim;
 mod fdtd;
 mod geom;
 mod gerber;
@@ -147,13 +148,23 @@ fn main() {
                 }
             }
         }
+        "cosim" => {
+            let Some(cfg) = args.get(2) else {
+                eprintln!("usage: fieldsolve cosim CONFIG.json");
+                std::process::exit(2);
+            };
+            if let Err(e) = cosim::run(std::path::Path::new(cfg)) {
+                eprintln!("fieldsolve cosim: {e}");
+                std::process::exit(1);
+            }
+        }
         "svg" => {
             let dir = args.get(2).expect("usage: fieldsolve svg GERBER_DIR OUT.svg");
             let b = gerber::load_dir(std::path::Path::new(dir)).unwrap_or_else(|e| panic!("{e}"));
             gerber::render_svg(&b, std::path::Path::new(args.get(3).map(|s| s.as_str()).unwrap_or("board.svg")));
         }
         _ => {
-            eprintln!("usage:\n  fieldsolve run SPEC.json [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve svg GERBER_DIR OUT.svg");
+            eprintln!("usage:\n  fieldsolve run SPEC.json [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve svg GERBER_DIR OUT.svg");
         }
     }
 }

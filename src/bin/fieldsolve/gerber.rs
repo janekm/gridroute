@@ -983,18 +983,17 @@ impl Gerber {
                 }
             }
             "TO" => {
-                let body = x2_unescape(rest);
-                let mut f = body.split(',');
+                // split on the field commas first: an escaped comma (,) belongs to the value
+                let mut f = rest.split(',');
                 let key = f.next().unwrap_or("");
-                let vals: Vec<&str> = f.collect();
+                let vals: Vec<String> = f.map(x2_unescape).collect();
                 match key {
                     ".N" => {
-                        let n = vals.first().copied().unwrap_or("");
+                        let n = vals.first().map(String::as_str).unwrap_or("");
                         self.net = if n.is_empty() || n == "N/C" { None } else { Some(n.to_string()) };
                     }
                     ".P" => {
-                        self.pad =
-                            vals.first().map(|r| (r.to_string(), vals.get(1).copied().unwrap_or("").to_string()));
+                        self.pad = vals.first().map(|r| (r.clone(), vals.get(1).cloned().unwrap_or_default()));
                     }
                     _ => {}
                 }
@@ -1987,6 +1986,16 @@ mod tests {
         assert!(p[0].dark);
         assert_eq!(p[0].net.as_deref(), Some("VCC"));
         assert_eq!(p[0].pad, Some(("U1".to_string(), "3".to_string())));
+    }
+
+    #[test]
+    fn escaped_comma_stays_in_net_name() {
+        let g = format!(
+            "{HDR}%ADD10C,0.500000*%\nD10*\n%TO.N,/Radio\\u002C Power/ANT*%\nX0Y0D03*\n%TO.N,/Radio\\u002C Power/XC1*%\nX1000000Y0D03*\n%TD*%\nM02*\n"
+        );
+        let p = parse_gerber(&g).unwrap();
+        assert_eq!(p[0].net.as_deref(), Some("/Radio, Power/ANT"));
+        assert_eq!(p[1].net.as_deref(), Some("/Radio, Power/XC1"));
     }
 
     #[test]

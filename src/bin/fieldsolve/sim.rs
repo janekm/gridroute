@@ -75,6 +75,31 @@ impl Ctx {
         }
         Ok((P2::new(0.5 * (bb.x0 + bb.x1), 0.5 * (bb.y0 + bb.y1)), bb))
     }
+
+    /// Net of the copper at `p` on `layer` (the last Gerber object covering the point decides: dark with its
+    /// net, clear with none). `None` for bare board or copper without a net attribute.
+    pub fn net_at(&self, p: P2, layer: &str) -> Option<String> {
+        let l = self.board.layers.iter().find(|l| l.name == layer)?;
+        let mut net = None;
+        for q in &l.prims {
+            if q.shape.bbox().contains(p) && q.shape.contains(p) {
+                net = if q.dark { q.net.clone() } else { None };
+            }
+        }
+        net
+    }
+}
+
+/// Port terminal report: `+ NET (layer) / - NET (layer)`, and a warning when a vertical port's ends sit on
+/// no ground net (a port referenced to a power plane or a floating island sees that conductor's own
+/// resonances; reference it to ground, or tie the plane to ground with its decoupling capacitors).
+fn port_nets(name: &str, plus: (Option<String>, &str), minus: (Option<String>, &str), vertical: bool) {
+    let show = |n: &Option<String>| n.clone().unwrap_or_else(|| "no copper".into());
+    eprintln!("fieldsolve: port {name}: + {} ({}) / - {} ({})", show(&plus.0), plus.1, show(&minus.0), minus.1);
+    let gnd = |n: &Option<String>| n.as_deref().is_some_and(|s| s.to_ascii_uppercase().contains("GND"));
+    if vertical && !gnd(&plus.0) && !gnd(&minus.0) {
+        eprintln!("fieldsolve: WARNING: port {name}: neither end is on a GND net");
+    }
 }
 
 /// Copper z positions and dielectric slabs from the stack (bottom copper at z = 0, copper zero-thickness).
@@ -214,6 +239,9 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let to = e.get("to").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
             let (c, pbb) = cx.locate(at, Some(from))?;
             let (zf, zt) = (cx.z_of(from)?, cx.z_of(to)?);
+            if pd.port {
+                port_nets(&pd.name, (cx.net_at(c, from), from), (cx.net_at(c, to), to), true);
+            }
             // footprint: explicit [w, h]; "point" for a single mesh line; default for a pad reference is the
             // pad's bounding box shrunk to 80 % (a single node column is a zero-radius wire whose inductance
             // depends on the cell size)
@@ -236,6 +264,9 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let layer = e.get("layer").and_then(|v| v.as_str()).unwrap_or("F.Cu").to_string();
             let (a, ba) = cx.locate(e.get("pos").ok_or_else(|| format!("{}: needs pos/neg or at", pd.name))?, Some(&layer))?;
             let (b, bb) = cx.locate(e.get("neg").ok_or_else(|| format!("{}: needs pos/neg or at", pd.name))?, Some(&layer))?;
+            if pd.port {
+                port_nets(&pd.name, (cx.net_at(a, &layer), &layer), (cx.net_at(b, &layer), &layer), false);
+            }
             let axis = if (b.x - a.x).abs() >= (b.y - a.y).abs() { 0 } else { 1 };
             // bridge width: the smaller pad dimension across the axis
             let wa = if axis == 0 { ba.y1 - ba.y0 } else { ba.x1 - ba.x0 };
@@ -262,6 +293,19 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let cell_z = num(&sp, "cell_z", cell.min(slabs.iter().map(|s| s.z1 - s.z0).fold(f64::INFINITY, f64::min) / 2.0));
     let min_layer = num(&sp, "min_cells_layer", 2.0) as usize;
     let pml_w = npml as f64 * hmax.min(1.0).max(cell);
+    // fixed lines closer than 3/4 of a cell would make a sliver cell that sets the time step for the whole
+    // run (e.g. a port footprint edge 0.014 mm from a part's bridge edge); keep the earlier one
+    let merge = |v: &[f64]| -> Vec<f64> {
+        let tol = 0.75 * cell;
+        let mut out: Vec<f64> = Vec::with_capacity(v.len());
+        for &x in v {
+            if !out.iter().any(|&y| (x - y).abs() < tol) {
+                out.push(x);
+            }
+        }
+        out
+    };
+    let (fx, fy) = (merge(&fx), merge(&fy));
     let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &[Refine { a: dom.x0, b: dom.x1, h: cell }], 1.3, hmax, &[]);
     let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &[Refine { a: dom.y0, b: dom.y1, h: cell }], 1.3, hmax, &[]);
     let mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
