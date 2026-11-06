@@ -3724,20 +3724,25 @@ impl Router {
                 if stale >= if self.cfg.fast { 2 } else if self.relax_pairs { 10 } else { 4 } {
                     // stuck with pairs held: let the remaining nets move them, once (the quick look stops here:
                     // its blocker report searches with pairs crossable, so a pair in the way shows there)
-                    if self.relax_pairs || self.cfg.fast {
+                    if self.cfg.fast || (self.relax_pairs && std::env::var("TOPOR_NOSTALL").is_err()) {
                         break;
                     }
-                    self.relax_pairs = true;
-                    // (TOPOR_RELAX_BUDGET: another factor; 1 was faster, no success needed more on dut-pi or EXT,
-                    // but the changed searches cost EXT its last net)
-                    self.budget_scale = std::env::var("TOPOR_RELAX_BUDGET").ok().and_then(|x| x.parse().ok()).unwrap_or(if self.cfg.fast { 1.0 } else { 3.0 });
-                    stale = 0;
-                    let stuck: Vec<String> = (0..nn).filter(|&x| self.deficit(x) > 0).map(|x| self.w.b.nets[x as usize].name.clone()).collect();
-                    let ev = format!("rip-up stalled at round {} with deficit {} ({}) while moving differential pairs was costly (and barred to plane drops); from here on any net may move pairs", round, d, stuck.join(", "));
-                    if self.cfg.verbose {
-                        eprintln!("[{:.1}s] {}", self.elapsed(), ev);
+                    if self.relax_pairs {
+                        // (TOPOR_NOSTALL: rounds go on to the round limit)
+                        stale = 0;
+                    } else {
+                        self.relax_pairs = true;
+                        // (TOPOR_RELAX_BUDGET: another factor; 1 was faster, no success needed more on dut-pi or EXT,
+                        // but the changed searches cost EXT its last net)
+                        self.budget_scale = std::env::var("TOPOR_RELAX_BUDGET").ok().and_then(|x| x.parse().ok()).unwrap_or(if self.cfg.fast { 1.0 } else { 3.0 });
+                        stale = 0;
+                        let stuck: Vec<String> = (0..nn).filter(|&x| self.deficit(x) > 0).map(|x| self.w.b.nets[x as usize].name.clone()).collect();
+                        let ev = format!("rip-up stalled at round {} with deficit {} ({}) while moving differential pairs was costly (and barred to plane drops); from here on any net may move pairs", round, d, stuck.join(", "));
+                        if self.cfg.verbose {
+                            eprintln!("[{:.1}s] {}", self.elapsed(), ev);
+                        }
+                        self.events.push(ev);
                     }
-                    self.events.push(ev);
                 }
             }
             // pairs stand firm first; whatever is still blocked later may move them
@@ -3811,7 +3816,7 @@ impl Router {
                 self.pair_diag = st.4;
             }
         }
-        if self.hurried() || self.cfg.fast {
+        if self.hurried() || self.cfg.fast || std::env::var("TOPOR_NO_ENDGAME").is_ok() {
             return;
         }
         { let _t = Instant::now(); self.clear_area_repairs(); self.prof_add("end game: clear areas", _t); }
