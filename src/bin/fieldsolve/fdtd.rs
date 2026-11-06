@@ -9,7 +9,7 @@
 use crate::model::{Problem, MU0, NONE};
 use rayon::prelude::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RunSpec {
     /// Port excited (index into `Problem::ports`), or none (e.g. a pure ring-down).
     pub excite: Option<usize>,
@@ -28,6 +28,49 @@ pub struct RunSpec {
     pub snap_k: Vec<usize>,
     /// No snapshots after this step (0 = no limit).
     pub snap_until: usize,
+    /// Running DFT of selected samples only (e.g. the faces of a near-to-far-field box): `gather[c]` lists
+    /// the indices of component c (Ex, Ey, Ez, Hx, Hy, Hz) to accumulate at `gather_freqs`, every
+    /// `dft_every` steps.
+    pub gather_freqs: Vec<f64>,
+    pub gather: [Vec<u32>; 6],
+    /// Also stop when every port's signal energy over the last `check_every` steps has fallen `end_db`
+    /// below the largest port's peak window energy (the S-parameters only need the port signals to have
+    /// decayed; high-Q modes that do not reach the ports can keep the field energy up for much longer).
+    pub port_stop: bool,
+    /// With the port stop: also require these per-frequency quantities of the gathered DFT (e.g. the
+    /// Poynting flux through a far-field box) to have settled, i.e. changed by less than `gather_tol`
+    /// (relative) since the check `gather_lag` checks earlier.
+    pub gather_metric: Option<GatherMetric>,
+    pub gather_tol: f64,
+    pub gather_lag: usize,
+}
+
+/// A per-frequency scalar of the gathered DFT, evaluated at the energy checks.
+#[derive(Clone)]
+pub struct GatherMetric(pub std::sync::Arc<dyn Fn(&[[Vec<f32>; 6]]) -> Vec<f64> + Send + Sync>);
+
+impl std::fmt::Debug for GatherMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GatherMetric")
+    }
+}
+
+/// Settling test on a history of gathered-DFT metrics (one Vec per check).
+pub fn gather_settled(hist: &[Vec<f64>], lag: usize, tol: f64) -> bool {
+    if hist.len() <= lag {
+        return false;
+    }
+    let (now, then) = (&hist[hist.len() - 1], &hist[hist.len() - 1 - lag]);
+    now.iter().zip(then).all(|(a, b)| (a - b).abs() <= tol * a.abs().max(b.abs()).max(1e-300))
+}
+
+/// Port-signal decay test over the last `win` samples of each port: true when every port's window
+/// energy is at most `10^(end_db/10)` times the largest window energy seen on any port (`peak`, updated).
+pub fn ports_decayed(v: &[Vec<f32>], win: usize, end_db: f64, peak: &mut f64) -> bool {
+    let w: Vec<f64> = v.iter().map(|s| s[s.len().saturating_sub(win)..].iter().map(|&x| (x as f64) * (x as f64)).sum()).collect();
+    let m = w.iter().cloned().fold(0.0, f64::max);
+    *peak = peak.max(m);
+    *peak > 0.0 && m <= *peak * 10f64.powf(end_db / 10.0)
 }
 
 /// One time-domain snapshot: per requested plane, the sheet current (Jx, Jy) at the nodes, A/m.
@@ -71,6 +114,10 @@ pub struct RunResult {
     /// Field probe samples at steps 0..=steps (E probes at n dt, H probes at (n - 1/2) dt).
     pub probes: Vec<Vec<f32>>,
     pub fields: Option<FieldDft>,
+    /// Gathered DFT: per `gather_freqs` entry, per component, interleaved (re, im) in `gather` order.
+    pub gathered: Vec<[Vec<f32>; 6]>,
+    /// field energy (arbitrary units) at each energy check: (step, energy)
+    pub energy: Vec<(usize, f64)>,
     pub snaps: Vec<Snap>,
     pub seconds: f64,
     pub backend: String,
@@ -105,6 +152,9 @@ pub struct CpuState {
     pub h: [Vec<f32>; 3],
     /// CPML memory per axis a: [E comp (a+1)%3, E comp (a+2)%3, H comp (a+1)%3, H comp (a+2)%3].
     psi: [[Vec<f32>; 4]; 3],
+    /// Debye currents (compact, `np` per edge) and E before the update over the dispersive planes
+    dj: [Vec<f32>; 3],
+    e0: [Vec<f32>; 3],
 }
 
 impl CpuState {
@@ -116,7 +166,8 @@ impl CpuState {
             let len = p.pml[a].len() * n / nn[a];
             std::array::from_fn(|_| vec![0.0f32; len])
         });
-        CpuState { e: [z(), z(), z()], h: [z(), z(), z()], psi }
+        let (nd, np) = p.disp.as_ref().map(|d| (d.nd(p.nx, p.ny), d.np)).unwrap_or((0, 0));
+        CpuState { e: [z(), z(), z()], h: [z(), z(), z()], psi, dj: std::array::from_fn(|_| vec![0.0f32; nd * np]), e0: std::array::from_fn(|_| vec![0.0f32; nd]) }
     }
 }
 
@@ -302,6 +353,53 @@ pub fn pml_e(p: &Problem, s: &mut CpuState) {
     }
 }
 
+/// Before the E update: keep E over the dispersive planes.
+pub fn disp_save(p: &Problem, s: &mut CpuState) {
+    if let Some(d) = &p.disp {
+        let (a, b) = (d.k0 * p.nx * p.ny, (d.k1 + 1) * p.nx * p.ny);
+        for c in 0..3 {
+            s.e0[c].copy_from_slice(&s.e[c][a..b]);
+        }
+    }
+}
+
+/// After the E update and its CPML correction: E -= cb sum (1 + k_p)/2 J_p, then
+/// J_p = k_p J_p + b_p (E_new - E_old) (disp.rs).
+pub fn disp_update(p: &Problem, s: &mut CpuState) {
+    let Some(d) = &p.disp else { return };
+    let base = d.k0 * p.nx * p.ny;
+    let np = d.np;
+    for c in 0..3 {
+        let e = Ptr(s.e[c].as_mut_ptr());
+        let cb = &p.cb[c];
+        let b = &d.b[c];
+        let e0 = &s.e0[c];
+        s.dj[c].par_chunks_mut(np).enumerate().for_each(|(q, jj)| {
+            let id = base + q;
+            let k = cb[id];
+            if k == 0.0 {
+                return;
+            }
+            let bq = &b[q * np..q * np + np];
+            if bq.iter().all(|&x| x == 0.0) {
+                return;
+            }
+            let mut sum = 0.0f32;
+            for pp in 0..np {
+                sum += d.hk[pp] * jj[pp];
+            }
+            unsafe {
+                let e1 = *e.at(id) - k * sum;
+                *e.at(id) = e1;
+                let de = e1 - e0[q];
+                for pp in 0..np {
+                    jj[pp] = d.kp[pp] * jj[pp] + bq[pp] * de;
+                }
+            }
+        });
+    }
+}
+
 pub fn energy(s: &CpuState) -> f64 {
     let eta2 = (crate::model::ETA0 * crate::model::ETA0) as f32;
     let mut t = 0.0f64;
@@ -340,6 +438,28 @@ fn dft_acc(p: &Problem, s: &CpuState, n: usize, every: usize, fd: &mut FieldDft)
     }
 }
 
+/// DFT weights (re, im) of component c at step `n` for angular frequency `w`: E at n dt, H at (n - 1/2) dt.
+pub fn dft_weight(p: &Problem, c: usize, n: usize, every: usize, w: f64) -> (f32, f32) {
+    let t = if c < 3 { n as f64 * p.dt } else { (n as f64 - 0.5) * p.dt };
+    let (sn, cs) = (-w * t).sin_cos();
+    ((cs * p.dt * every as f64) as f32, (sn * p.dt * every as f64) as f32)
+}
+
+fn gather_acc(p: &Problem, s: &CpuState, n: usize, spec: &RunSpec, acc: &mut [[Vec<f32>; 6]]) {
+    for (fi, &f) in spec.gather_freqs.iter().enumerate() {
+        let w = 2.0 * std::f64::consts::PI * f;
+        for c in 0..6 {
+            let (wr, wi) = dft_weight(p, c, n, spec.dft_every, w);
+            let src = if c < 3 { &s.e[c] } else { &s.h[c - 3] };
+            acc[fi][c].par_chunks_mut(2).zip(spec.gather[c].par_iter()).for_each(|(o, &id)| {
+                let v = src[id as usize];
+                o[0] += v * wr;
+                o[1] += v * wi;
+            });
+        }
+    }
+}
+
 pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
     let t0 = std::time::Instant::now();
     let mut s = CpuState::new(p);
@@ -349,14 +469,22 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
         freqs: spec.dft_freqs.clone(),
         data: spec.dft_freqs.iter().map(|_| std::array::from_fn(|_| vec![0.0f32; 2 * p.n()])).collect(),
     });
+    let mut gathered: Vec<[Vec<f32>; 6]> = spec.gather_freqs.iter().map(|_| std::array::from_fn(|c| vec![0.0f32; 2 * spec.gather[c].len()])).collect();
     let mut peak = 0.0f64;
+    let mut port_peak = 0.0f64;
+    let mut ghist: Vec<Vec<f64>> = Vec::new();
+    let mut ehist: Vec<(usize, f64)> = Vec::new();
     let mut steps = 0;
     let mut snaps = Vec::new();
     for n in 0..spec.max_steps {
         update_h(p, &mut s);
         pml_h(p, &mut s);
+        disp_save(p, &mut s);
         update_e(p, &mut s);
         pml_e(p, &mut s);
+        // the source is part of this step's E change: inject it before the Debye currents see E_new - E_old
+        // (with dispersion the order matters; injecting after left the port edges' polarisation without the
+        // source's share and made the S-matrix non-passive)
         if let Some(pi) = spec.excite {
             if n < spec.exc.len() {
                 let vs = spec.exc[n];
@@ -365,6 +493,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
                 }
             }
         }
+        disp_update(p, &mut s);
         for (k, x) in probe(p, &s).into_iter().enumerate() {
             v[k].push(x);
         }
@@ -380,18 +509,59 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
                 dft_acc(p, &s, steps, spec.dft_every, fd);
             }
         }
+        if !gathered.is_empty() && steps % spec.dft_every == 0 {
+            gather_acc(p, &s, steps, spec, &mut gathered);
+        }
         if steps % spec.check_every == 0 {
             let en = energy(&s);
+            ehist.push((steps, en));
             peak = peak.max(en);
             if steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
                 break;
             }
+            if spec.port_stop {
+                let pd = ports_decayed(&v, spec.check_every, spec.end_db, &mut port_peak) && steps > spec.exc.len();
+                let gs = match &spec.gather_metric {
+                    Some(m) => {
+                        ghist.push((m.0)(&gathered));
+                        gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
+                    }
+                    None => true,
+                };
+                if pd && gs {
+                    break;
+                }
+            }
         }
     }
-    RunResult { steps, v, probes: pv, fields: fd, snaps, seconds: t0.elapsed().as_secs_f64(), backend: "cpu".into() }
+    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), backend: "cpu".into() }
 }
 
 #[allow(unused)]
 pub fn none_used() -> u32 {
     NONE
+}
+
+/// Late-time decay of the field energy over the last third of the checks: (dB per ns, Q at `f`).
+/// A positive rate means the energy grows (an instability, not ringing).
+pub fn energy_decay(hist: &[(usize, f64)], dt: f64, f: f64) -> Option<(f64, f64)> {
+    let n = hist.len();
+    if n < 6 {
+        return None;
+    }
+    let tail = &hist[n - n / 3..];
+    let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+    for &(s, e) in tail {
+        let x = s as f64 * dt * 1e9;
+        let y = 10.0 * e.max(1e-300).log10();
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    let m = tail.len() as f64;
+    let slope = (m * sxy - sx * sy) / (m * sxx - sx * sx);
+    // energy ~ exp(-w t / Q): dB/ns = -10 log10(e) w / Q * 1e-9
+    let q = -10.0 * std::f64::consts::LOG10_E * 2.0 * std::f64::consts::PI * f * 1e-9 / slope;
+    Some((slope, q))
 }

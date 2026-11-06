@@ -43,8 +43,18 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   (`mesh_shorts` in `result.json`). Copper added for elements (bridges, shorts) is exempt.
 - **Stack-up.** Dielectric thicknesses, εr and tan δ come from the `.gbrjob`, with 4.5 / 0.02 when it gives
   none, or from the spec's `"dielectrics": [{"t": mm, "er": .., "tand": ..}, ...]` (top to bottom between
-  the copper layers). The bottom copper is at z = 0 and copper thickness is ignored. tan δ becomes a conductivity at
-  `f_loss`. Dielectric fills cells inside the board outline. Solder mask is optional (`solder_mask`).
+  the copper layers). The bottom copper is at z = 0 and copper thickness is ignored. Dielectric fills cells
+  inside the board outline. Solder mask is optional (`solder_mask`).
+- **Dielectric loss.** By default tan δ becomes a constant conductivity at `f_loss`, so the loss is right
+  only near `f_loss`: the effective tan δ falls as 1/f above it, and resonances ring far too long (Q 4-8×
+  too high at 4-8 GHz with `f_loss` at 1 GHz). `"loss": {"model": "wideband", "f_lo": 0.3e9, "f_hi": 10e9,
+  "f_ref": 1e9}` instead fits a sum of Debye poles to a flat tan δ, which is how FR4 behaves
+  (Djordjevic-Sarkar): one pole per decade from f_lo/3 to 3·f_hi, at most eight, with non-negative weights
+  fitted by NNLS. εr is matched at `f_ref`. The fit is flat to about 1 % over the band (`disp.rs`). The poles
+  run as auxiliary-current ADEs on the edges in dielectric, on the CPU and in the fused Metal kernels.
+  `"copper": true` adds the plane-pair copper loss of each slab as an extra tan δ of about δ_s/h (skin depth
+  over slab thickness, rising as √f). That is a stand-in for conductor loss between planes; traces stay
+  lossless.
 - **Mesh.** Uniform `cell` in x/y over the copper window (ROI plus `air`) and `cell_z` (at least `min_cells_layer` cells per
   dielectric layer) through the board, growing by at most 1.3× per cell outside, up to λ/20. Every
   copper interface and every port coordinate is a mesh line.
@@ -61,8 +71,17 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
 - **Multi-port S-parameters.** With every port excited, S = B·A⁻¹ from the wave matrices of all runs, so
   the port terminations need not equal the 50 Ω reference. The impedance matrix is in `result.json`.
   With one excitation, `s_col_db` holds b_k/a_j with the other ports terminated in their own R.
-- **Excitation and stopping.** The excitation is a Gaussian, openEMS's `SetGaussExcite(0, fmax)`. A run
-  stops when the field energy falls `end_db` (default −70 dB) below its peak.
+- **Excitation and stopping.** The excitation is a Gaussian, openEMS's `SetGaussExcite(0, fmax)`. Two rules
+  can stop a run; `"stop"` chooses:
+  - `"ports"` (default): stop when the signal energy at every port, over a sliding window, has fallen
+    `end_db` below the largest seen. This is what the S-parameters depend on. It ignores slow ringing of
+    plane modes that the ports do not see.
+  - `"energy"`: stop when the total field energy falls `end_db` (default −70 dB) below its peak.
+
+  With a far-field box the run also waits for the Poynting flux through the box to settle, at every far-field
+  frequency, to within `farfield.tol` (default 1 %). Stopping on the ports alone underestimated radiated
+  power by 1.3-2.2 dB on 1BP. Every run logs the late-time energy decay: dB/ns and the Q it implies at
+  fmax/3. A positive rate is flagged as numerical growth, not ringing.
 
 ## Usage
 
@@ -73,8 +92,19 @@ kicad-cli pcb export drill --format excellon --excellon-separate-th -o gbr/ boar
 target/release/fieldsolve run spec.json            # --backend auto|metal|cpu, --out DIR
 target/release/fieldsolve svg gbr/ board.svg       # the imported layout, layers toggleable
 target/release/fieldsolve selftest                 # analytic validation cases
+target/release/fieldsolve farfield-check           # free-space dipoles against theory (far field)
+target/release/fieldsolve loss-check               # lossy cavity Q: constant sigma vs wideband dielectric
+target/release/fieldsolve debye-port-check         # two-port microstrip with the wideband dielectric: passivity
 target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see below)
+target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
+target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
+target/release/fieldsolve prims board.GTL > prims.json        # a Gerber's primitives (shape, polarity, net)
 ```
+
+`raster` shows what the mesh actually made of the copper in a small window: metal edges, element and port
+edges, cleared gaps. Use it to check a port or a narrow gap before a long run. `prims` dumps a layer's
+primitives as polygons, circles and capsules, for editing layouts in scripts (the 1BP transplant was built
+this way).
 
 A decoupling-loop spec for the AMOLED board's ESP32-S3 3V3 pin 46 and its capacitor C112. Coordinates are
 in KiCad's frame (`"coords": "kicad"`); pads are `REF.PIN` from the Gerber X2 attributes:
@@ -97,6 +127,10 @@ Ports and elements come in two forms:
   Optionally `"size": [w, h]` spreads the port over an area.
 - **In-plane, between two pads.** `"pos"`/`"neg"` with `"layer"`. A copper bar as wide as the smaller pad
   joins the pads, and a one-cell gap at the midpoint holds the element: the body of a two-terminal part.
+  The element's edges span 80 % of the bar's width, and the gap column is cleared of other copper (a pour
+  between the pads would otherwise short the element). With edges on the full width, the outermost ones
+  could have no metal at one end: they carried source and probe without being in the circuit, which read
+  as a flat 2-14 % "loss" in the port.
 
 `kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
@@ -110,6 +144,11 @@ A chip port from the ANT ball down to In1 showed sharp absorption notches at 2.3
 The fix is to reference the port to a neighbouring GND ball, or a GND pad, on the same layer. Also add the
 plane's decoupling capacitors in the window as `short` elements, so the plane is tied to ground the way
 it is at RF.
+
+With `"excite": "all"` the run checks each port's power balance, 1 − Σ|S_kj|², over the lowest tenth of
+the band, where radiation and dielectric loss are negligible. It warns when that exceeds 2 %: a port whose
+edges are not all in the circuit, or a port across something it should not be. The values are
+`port_power_balance` in `result.json`.
 
 Outputs in `out/`:
 
@@ -176,6 +215,55 @@ Outputs:
 - `cosim.json`;
 - a table of S11, S21 and Zin at the report frequencies.
 
+### Far field: near-to-far-field transform
+
+`"farfield": {"freqs": [2.44e9, 4.88e9], "step_deg": 5, "gap": 3}` in a run spec puts a closed box of
+mesh planes `gap` cells inside the absorbing boundary on every side. Every excitation records the
+tangential E and H on its faces as running DFTs at those frequencies. The engines' gathered DFT does this
+on Metal and on the CPU, touching only the face samples. Afterwards each face cell carries the equivalent
+currents J = n × H and M = −n × E. The radiation integrals give r·E_θ and r·E_φ on a θ/φ grid
+(Balanis, *Advanced Engineering Electromagnetics* 6.8; e^{jωt}, the sign of the field DFT).
+
+**The box must be in free space, with everything that radiates inside it.** The run warns when tangential E
+edges on its faces are not free space. A window of a board (the default `roi` domain) is cut at the domain
+edge, so its far field is meaningless. For far-field runs use:
+
+- **`"extent": "board"`:** the domain is the whole board outline plus `air` (and `air_z` above and
+  below). The `roi` stays the fine-meshed region; cells grade up to `max_cell` outside it. Copper is
+  rasterised everywhere: on coarse cells small gaps merge, which is fine for planes and wrong for fine
+  detail away from the `roi`. The absorbing layer gets its own width beyond the air margin.
+- **`"decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}]`:** every two-pad part outside the
+  `roi` with one pad on `net` and the other on GND becomes a vertical short at that pad. This ties a power
+  plane to ground the way its capacitors do at RF. Without it, a power plane floats and rings (see the
+  power-plane note under ports). `"esr": 0.03` makes each a resistor instead of a short, which damps the
+  plane modes the way real capacitors do. Inside the `roi`, list the capacitors as elements yourself.
+
+Use at least λ/8 of air at the lowest far-field frequency, or reactive near fields reach the absorber and
+read as radiated power. The transform itself is exact for any closed box in free space.
+
+Radiation efficiency divides by the power the port accepts, 1 − |S11|². When that is tiny, for example an
+electrically short antenna on a 50 Ω port at 4 × 10⁻⁶, the f32 port probes cannot resolve it: the short
+dipole read 110 % at 1 GHz although its radiated power matched the box flux to 0.2 %.
+
+**Patterns per port.** With `"excite": "all"` the patterns are combined with the inverse of the wave
+matrix, F = F_run·A⁻¹, exactly as S = B·A⁻¹. Each port then has a pattern per 1 W incident with the
+other ports matched to 50 Ω. Those patterns add linearly with any port waves.
+
+Outputs:
+- **`farfield.json`:** θ/φ grid, per-port patterns (r·E_θ, r·E_φ, peak, per 1 W incident) and a summary.
+- **Summary per port and frequency:** radiated power, power accepted at the port, power out of the other
+  ports, loss, directivity, gain, realised gain, radiation efficiency, direction of the maximum, and a
+  check: the far field integrated over the sphere against the Poynting flux through the box.
+- **`farfield_<port>_<f>GHz.svg`:** polar cuts of the realised gain (xz, yz, xy planes).
+
+**Radiated against conducted power with parts.** `"farfield": true` in a `fieldsolve cosim` config reads
+`farfield.json` next to the EM file. For each variant it drives the first kept port with 1 W incident,
+lets the parts set the waves on their ports (a_t = Γ(I − S_tt Γ)⁻¹ S_te a_e), and adds the per-port
+patterns with those waves. It reports the power reaching the other kept port (the connector), the
+radiated power, their difference, and the maximum EIRP relative to the conducted power. For harmonics
+this split does not depend on how much the chip generates: a conducted harmonic level at the connector
+plus "radiated − conducted" gives the radiated level.
+
 ## Validation
 
 `fieldsolve selftest` and `cargo test --release --bin fieldsolve` run closed-form cases. The numbers below
@@ -188,6 +276,14 @@ are at the default mesh; Metal and CPU agree to about 1e-6 relative.
 | same, 2× mesh | Z0, εeff | 50.68 Ω, 3.277 | | −0.9 %, +0.6 % |
 | Plane pair 40×30 mm, h 0.5 mm, εr 4.3 | f10 / f01 / f11 | 1.770 / 2.350 / 2.975 GHz | cavity model with open-end extension | −0.9 / −1.0 / +0.2 % |
 | Patch 10×10 mm over ground, h 0.2 mm | C | 20.86 pF | wide-microstrip C with fringing | +4.1 % |
+| Half-wave dipole 48 mm, 1 mm cells, free space (`farfield-check`) | D at 2.6 / 2.8 / 3.0 / 3.2 GHz | 2.06 / 2.11 / 2.17 / 2.24 dBi | sinusoidal-current theory 2.02 / 2.07 / 2.12 / 2.17 dBi | +0.04 to +0.07 dB |
+| same | P_rad (far field) / P accepted at the port | 99.9–100.0 % | lossless: 100 % | ≤ 0.1 % |
+| same | Poynting flux through the box / far-field P_rad | 0.999–1.000 | 1 | ≤ 0.1 % |
+| Short dipole 10 mm (λ/30, λ/20) | D at 1.0 / 1.5 GHz | 1.76 / 1.77 dBi | 1.76 dBi | ≤ 0.01 dB |
+| Hertzian dipole, exact fields on a box (unit test) | P_rad, Poynting flux, D | within 3 % | analytic | |
+| Cavity filled with tan δ 0.02 (`loss-check`), constant σ at 1 GHz | Q at 4.5 / 6.2 / 8.4 GHz | 218 / 310 / 408 | 1/tan δ = 50 | 4-8× |
+| same, wideband (Debye) | Q at 4.55 / 6.32 / 8.49 GHz | 47.5 / 47.9 / 44.5 | 50 (port loading alone: Q ≥ 894) | −5 to −11 % |
+| Matched 30 mm microstrip, tan δ 0.015, wideband (`debye-port-check`) | 1 − \|S11\|² − \|S21\|² at 0.1 / 1.1 / 3.1 / 5.1 GHz | 0.3 / 2.1 / 5.8 / 9.7 % | passive, rising ∝ f | CPU and Metal agree to 0.001 |
 
 Lessons from building these, which also apply to board runs:
 
@@ -201,6 +297,9 @@ Lessons from building these, which also apply to board runs:
   ~10 mm of a discontinuity picked up evanescent box modes and biased εeff by 2–6 %.
 - **Stopping.** End on field energy, not port voltage: −50 dB of energy is only −25 dB of field, which
   truncated the ring-down.
+- **Dispersion and sources.** With Debye poles, the source's share of each step's E change must reach the
+  pole currents too. Injecting the source after the current update left the port edges' polarisation
+  short of it, and the two-port came out non-passive (up to 15 % gain at 0.1 GHz).
 
 ### Port checks
 
@@ -273,6 +372,24 @@ longer maintained.
 The script builds the copper layers, one emissive plane per layer showing log |J| over 40 dB, and the field
 magnitude as an OpenVDB volume (resampled to the finest cell, log over 50 dB). It uses only Blender's own
 numpy and openvdb. Scene units are millimetres in Gerber orientation, with z up.
+
+### Far-field patterns in Blender
+
+```sh
+Blender -b --python tools/blender_farfield.py -- cosim/farfield_<variant>_<f>GHz.json --board board_top.png \
+    --outline X0 Y0 X1 Y1 --thickness 0.8 --centre X Y Z [--top DB --range 20] [--view rf] \
+    [--render out.png] [--save out.blend]
+python3 tools/render_farfield_panels.py PANELS.json OUT_PREFIX
+```
+
+`blender_farfield.py` takes a pattern written by `fieldsolve cosim` (`"farfield": true`). It draws the
+board as a slab with a picture of its top copper, and the pattern as a surface around the radiating point.
+Radius and colour both encode EIRP in dB over `--range` below `--top`, and a wireframe marks the scale.
+Textures are packed into the saved `.blend`. `render_farfield_panels.py` renders several boards side by side,
+one row per frequency, with a shared `--top` per row so the panels compare directly. It adds captions
+(radiated and conducted power, peak EIRP) and a colour bar. `PANELS.json` lists each panel's cosim
+directory, label, board picture, outline, thickness and centre. Set `FIELDSOLVE_FONT` to a font file for
+the captions.
 
 ### Time-domain current frames and TDR
 
@@ -351,8 +468,11 @@ The code is in `src/bin/fieldsolve/`.
 | `export.rs` | VTK, raw volumes, complex vector fields, surface currents, copper OBJ |
 | `lines.rs` | field-line tracing |
 | `connect.rs` | mesh connectivity check (shorts between nets) |
-| `cosim.rs` | Touchstone reader, part models, port termination, ideal ladder, renormalisation |
+| `cosim.rs` | Touchstone reader, part models, port termination, ideal ladder, renormalisation, radiated vs conducted |
+| `nf2ff.rs` | near-to-far-field transform: box plan, face currents, patterns, power, polar plots |
+| `disp.rs` | wideband dielectric: Debye pole fit to a flat tan δ, plane copper loss, update constants |
 | `tools/blender_frames.py` | time-domain current animation |
+| `tools/blender_farfield.py`, `tools/render_farfield_panels.py` | far-field patterns over the board, panel comparisons |
 | `cases.rs` | analytic validation cases |
 | `tools/openems_scene.py` | openEMS replay of a scene |
 | `tools/blender_fields.py` | Blender import |
@@ -369,12 +489,17 @@ The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free
 - **Capacitor models.** Series R-L-C elements, so a real capacitor (ESR, ESL, C) can replace the short.
   That gives the PDN impedance curve |Z(f)| directly instead of only the loop L.
 - **Conductor loss.** A surface-impedance (skin-effect) model for copper, for RF insertion loss and the
-  resistive part of loop impedance. Copper is lossless now.
-- **Antennas.** A near-to-far-field transform (radiation pattern, efficiency) for chip and trace antennas.
+  resistive part of loop impedance. Traces are lossless now; `"loss": {"copper": true}` only adds the
+  plane-pair loss as an equivalent tan δ.
+- **Antennas.** The near-to-far-field transform is in place and validated on dipoles. Next: chip and trace
+  antennas on a board, and an enclosure.
 - **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins); the thirds rule
   applied in the rasteriser (shrink copper by 1/3 cell at edges) instead of relying on random edge
-  positions.
-- **Performance.** Fuse the CPML corrections into the main kernels and keep fields in half-precision
-  storage where safe; most time on large runs is memory traffic.
+  positions. The thirds rule matters for RF: against Nordic's measured network, the model's frequencies
+  run 10-15 % low ([1bp-rf-findings.md](1bp-rf-findings.md)).
+- **Performance.** The CPML corrections are fused into the main Metal kernels, and materials are a 16-bit
+  index into a coefficient table: 1769 → about 2100 Mcell/s on 5.8 M cells (M3 Max, `fieldsolve bench`).
+  `FIELDSOLVE_FUSED=0` selects the separate kernels; the wideband dielectric needs the fused ones.
+  Half-precision field storage is still open; most time on large runs is memory traffic.
 - **Router input.** Read gridroute/topor `layout.json` directly, so a routed candidate can be checked
   without a KiCad round trip.

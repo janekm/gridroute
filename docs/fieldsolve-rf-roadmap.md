@@ -63,12 +63,12 @@ Outputs per frontend:
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| A1 | **Near-to-far-field transform**: record the tangential E/H running DFT on a closed box just inside the PML (surface only, on Metal), then compute the far field. Outputs: 3-D pattern, directivity, gain, realised gain, radiated power, radiation efficiency, total efficiency, polarisation/axial ratio. Writes pattern files for plotting and for Blender (a coloured 3-D pattern mesh). | Antenna performance means pattern and efficiency, not just S11 | M–L |
+| A1 | **Near-to-far-field transform**: record the tangential E/H running DFT on a closed box just inside the PML (surface only, on Metal), then compute the far field. Outputs: 3-D pattern, directivity, gain, realised gain, radiated power, radiation efficiency, total efficiency, polarisation/axial ratio. Writes pattern files for plotting and for Blender (a coloured 3-D pattern mesh). *Done (Nov 2026), `nf2ff.rs`:* gathered surface DFT on CPU and Metal, Huygens-box transform; directivity, gain, realised gain, radiated power, radiation efficiency, a box Poynting-flux check; polar-cut SVGs; per-port patterns, so `cosim` can combine them with part terminations (radiated vs conducted power); `"extent": "board"` for whole-board domains. Blender pattern surfaces over the board (`tools/blender_farfield.py`). *Still to do:* polarisation/axial ratio output. | Antenna performance means pattern and efficiency, not just S11 | M–L |
 | A2 | **3-D objects**: STL (and STEP via a converter) and primitives (box, cylinder, sphere) as metal or dielectric. Voxelised with fill-fraction ε averaging, so curved housings and pipes detune correctly without a fine mesh. Mesh hints come from object bounds. | Enclosure, pipe, battery, display, shield cans, the u.FL body, other boards | M |
 | A3 | **Material library**: FR4 grades, solder mask, ABS/PC/PA housings (εr 2.6–3.2, tan δ 0.005–0.02), glass, water and wet soil, metals (σ) | Enclosure and pipe studies are only as good as these numbers | S |
-| A4 | **Lossy and dispersive materials**: σ (done), plus Debye/Lorentz dispersion for water (εr ≈ 77 − j10 at 2.4 GHz, rising loss with frequency) and optionally a human-tissue phantom | A water-filled pipe, or a hand | M |
-| A5 | **Larger domains**: per-edge material indices instead of four f32 coefficient arrays (48 → ~26 B/cell), CPML fused into the main kernels, f16 storage where safe | Free-space domains are 10–30 M cells; enclosures and pipes are bigger | M |
-| A6 | **Antenna validation set**: half-wave dipole (D = 1.64, R ≈ 73 Ω), a probe-fed patch, and a vendor reference antenna with published efficiency (Nordic/Espressif reference designs), all cross-checked against openEMS's nf2ff on identical scenes | Trust in pattern and efficiency numbers | S–M |
+| A4 | **Lossy and dispersive materials**: σ (done), plus Debye/Lorentz dispersion for water (εr ≈ 77 − j10 at 2.4 GHz, rising loss with frequency) and optionally a human-tissue phantom. *Partly done (Nov 2026):* multi-pole Debye ADE on CPU and Metal, used for wideband FR4 (`"loss": {"model": "wideband"}`, `disp.rs`); cavity Q within 11 % of 1/tan δ. *Still to do:* a water material (one Debye pole with its own ε_s, ε_∞, τ) and Lorentz poles. | A water-filled pipe, or a hand | M |
+| A5 | **Larger domains**: per-edge material indices instead of four f32 coefficient arrays (48 → ~26 B/cell), CPML fused into the main kernels, f16 storage where safe. *Partly done (Nov 2026):* fused CPML kernels with a u16 material index into a (ca, cb) table, 1769 → ~2100 Mcell/s (`fieldsolve bench`). *Still to do:* f16 storage. | Free-space domains are 10–30 M cells; enclosures and pipes are bigger | M |
+| A6 | **Antenna validation set**: half-wave dipole (D = 1.64, R ≈ 73 Ω), a probe-fed patch, and a vendor reference antenna with published efficiency (Nordic/Espressif reference designs), all cross-checked against openEMS's nf2ff on identical scenes. *Partly done (Nov 2026):* `fieldsolve farfield-check` runs free-space half-wave and short dipoles against theory. *Still to do:* patch, vendor antenna, openEMS nf2ff cross-check. | Trust in pattern and efficiency numbers | S–M |
 
 ### Scenarios
 
@@ -175,10 +175,12 @@ Chip-side impedance looking towards J1, with J1 at 50 Ω:
 - **The third-harmonic rejection is limited by the layout.** C18's self-resonance near 7.4 GHz would
   give −95 dB as a bare part. On the board it gives −39 dB: the pad and via inductance move the series
   resonance, and the two ends of the ladder couple directly.
-- **Port-calibration floor.** Every port loses a constant 1–7 % of power, the same from 100 MHz to
-  8 GHz: 6.7 % at the floating L4 port, 1.8 % at CHIP. This is a port-extraction error, not physics. It
-  shows as about 0.37 dB of "loss" on bare copper at 300 MHz. The largest eigenvalue of S^H S is 1.016,
-  so the matrix is slightly non-passive. Fixing this is a follow-up.
+- **Port-calibration floor (fixed since).** Every port lost a constant 1–7 % of power, the same from
+  100 MHz to 8 GHz: 6.7 % at the floating L4 port, 1.8 % at CHIP. It showed as about 0.37 dB of "loss"
+  on bare copper. The cause was the in-plane ports: their outermost edges, on the bar's boundary, could
+  have no metal at one end. Ports now span 80 % of the bar, and every run checks the low-band power
+  balance per port. **The loss figures in this table and the re-tune below predate that fix and include
+  the floor;** the later runs in [1bp-rf-findings.md](1bp-rf-findings.md) do not.
 - **First attempt, kept as a warning.** The chip port first ran vertically from H23 to In1, the
   `VCC2V4` plane, and the decoupling caps were not modelled. The floating plane rang as a patch:
   absorption notches at 2.32, 2.95 and 7.55 GHz, and S21 −1.4 dB on bare copper. `fieldsolve run` now
@@ -224,10 +226,54 @@ stay.**
 - The third harmonic drops from about −37 dB to about −55 dB in this model. This is where Nordic says
   the four-part network matters, at 5 dBm or more.
 - The H3 figure rests on the EM model's coupling between the two ends of the ladder. Check it with a
-  spectrum analyser before relying on it for approval margins.
-- The calibration floor (about 0.37 dB) still sits in every loss figure. Port-model accuracy and the
+  spectrum analyser before relying on it for approval margins. The later comparison with Nordic's layout
+  shows how fragile H3 figures are in this model: near a trap resonance they move 4-5 dB per 100 MHz,
+  and the model's frequencies run 10-15 % low.
+- **Nordic's reference plane is uncertain.** Their trace header reads "Cal Offs": the chip-side plane
+  was set with a VNA offset (port extension), not physically, and S21 shows about 400 ps of fixture
+  delay. Moving the plane ±10 ps (about 2 mm of trace) moves the 2.44 GHz target from 46 − j43 to
+  30 − j28 Ω, |Γ| 0.15 against nominal. So the in-band choice between the fitted and proposed values
+  sits inside that uncertainty: the +10 ps target is close to the fitted design. The H3 result does
+  not depend on the target.
+- **The chip-side impedance at H3 is set by C21, not by design.** The Murata 1.0 pF part is
+  series-resonant at 7.3 GHz (1.0 + j0.3 Ω), so the chip sees the ANT-ball-to-C21-ground copper:
+  +j88 Ω, an apparent 1.9 nH, rising with frequency like a short line. The parts after C21 do not
+  matter there. Nordic's 317 + j113 Ω at 7.34 GHz is close to an open circuit (|Γ| 0.76) and swings
+  to 27 + j82 Ω or 40 − j102 Ω with a ±10 ps plane shift. It is not evidence that their chip sees a
+  very different harmonic load.
+- **1BP grounds C21 differently from Nordic's guidance.** Nordic grounds the shunt capacitor nearest
+  ANT only through VSS_PA (F23) into the chip ground, as part of the harmonic filter. 1BP floods
+  C21.1 straight into the top pour, on the side of the feed away from F23. So the harmonic current
+  returns to F23 through the board ground, around the ANT neck or through the planes.
+  - With the measured Murata parts, a 1.0 pF capacitor plus 0.6 nH of ground path is series-resonant
+    at exactly 4.88 GHz, and 0.8 pF plus 0.8 nH at 4.99 GHz: a 2nd-harmonic trap at the pin.
+  - In the EM model the whole loop (ANT trace + C21 + return to F23) is 1.3 nH at 2.44 GHz and
+    1.5 nH at 4.88 GHz. Splitting it into trace and ground return needs another port.
+  - A conducted figure at J1 cannot show harmonic current spreading in the ground pour. Radiated
+    spurious needs the far-field work (A-items).
+  - Done since: variants with C21 grounded only to F23, and Nordic's own C3 routing transplanted from
+    their Gerbers. See below.
+- The calibration floor (about 0.37 dB, since fixed) still sits in every loss figure of this section. Port-model accuracy and the
   0.05 mm mesh limit the absolute numbers. The ranking between candidates, which share the same EM run,
   is more reliable than the absolute values.
+
+### 1BP against Nordic's reference layout (Nov 2026)
+
+Full write-up: [1bp-rf-findings.md](1bp-rf-findings.md). Whole-board runs with far field, wideband FR4 and
+the same fitted parts, on four layouts: Nordic's reference (configuration 7, from their Gerbers), 1BP as
+built, 1BP with a hand-made C21 ground tie to F23, and 1BP with Nordic's C3 routing transplanted.
+
+- **H2: 1BP as built is about 20 dB worse than Nordic's reference,** radiated and at J1. Nordic's C21
+  routing (ground pad isolated, return trace to VSS_PA alongside the ANT trace) recovers 12-15 dB of that.
+  The result holds for any assumption about the chip's harmonic output.
+- **H3 is not trustworthy for the tight-loop layouts.** Their trap sits near 7.3 GHz on a 4-5 dB per
+  100 MHz slope, and the model's frequency scale is 10-15 % low. Real H3 is probably 25-30 dB lower than
+  modelled there, in line with Nordic's measured −48 to −51 dBc.
+- **Validation:** configuration 1 simulated against Nordic's measured network matches its shape, but the
+  cutoff sits 10-15 % low. The in-band match cannot be judged from the model until that is understood
+  (thirds rule, F4; a 0.025 mm run).
+- **For the next revision:** copy Nordic's C21 routing. Then measure conducted H2/H3 at J1 and the network
+  from the ANT pad with a VNA.
 
 ## 4. Inputs we need
 

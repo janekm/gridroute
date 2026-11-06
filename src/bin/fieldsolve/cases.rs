@@ -76,7 +76,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
     let port = Lumped { name: "P1".into(), axis: 2, lo: [0.0, -w / 2.0, 0.0], hi: [0.0, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let fmax = 3e9;
     let pml = [8, 8, 8, 8, 0, 8];
-    let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95 });
+    let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95, wideband: None });
     for q in 0..3 {
         let xq = xa + q as f64 * d;
         p.add_vprobe(&format!("v{q}"), 2, [xq, 0.0, h], 0.0);
@@ -84,7 +84,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
         p.add_iprobe(&format!("i{q}"), 0, xq, [0.0, -w / 2.0 - 0.3, h - 0.1], [0.0, w / 2.0 + 0.3, h + 0.1]);
     }
     let exc = gauss_excite(0.0, fmax, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc, max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc, max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(200e6, 2.0e9, 19);
     let sp = |k: usize, toff: f64| crate::post::dft(&r.probes[k].iter().map(|&v| v as f64).collect::<Vec<f64>>(), p.dt, toff, &freqs);
     let (v1, i1, v2, _i2, v3, i3) = (sp(0, 0.0), sp(1, -0.5), sp(2, 0.0), sp(3, -0.5), sp(4, 0.0), sp(5, -0.5));
@@ -129,9 +129,9 @@ pub fn patch_capacitance(run: &Runner, scale: f64) -> CaseResult {
         copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [a / 2.0, a / 2.0, 0.0], hi: [a / 2.0, a / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95 });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95, wideband: None });
     let exc = gauss_excite(0.0, 4e9, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(50e6, 1000e6, 20);
     let (v, i) = port_spectra(&r.v[0], &exc, 50.0, p.dt, &freqs);
     // well below the first patch resonance (~7 GHz) the feed is a series L-C: Im Z = w L - 1 / (w C);
@@ -178,9 +178,9 @@ pub fn cavity(run: &Runner, scale: f64) -> CaseResult {
         copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [3.0, 3.0, 0.0], hi: [3.0, 3.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95 });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95, wideband: None });
     let exc = gauss_excite(0.0, 4e9, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 400_000, end_db: -90.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 400_000, end_db: -90.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(1.0e9, 3.5e9, 1001);
     let (v, i) = port_spectra(&r.v[0], &exc, 50.0, p.dt, &freqs);
     let zm: Vec<f64> = v.iter().zip(&i).map(|(&v, &i)| (v / i).abs()).collect();
@@ -216,9 +216,9 @@ pub fn pec_box(run: &Runner, scale: f64) -> CaseResult {
     let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
     let lay = Layout::default();
     let port = Lumped { name: "P1".into(), axis: 2, lo: [7.0, 6.0, 4.0], hi: [7.0, 6.0, 6.0], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95 });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95, wideband: None });
     let exc = gauss_excite(0.0, 20e9, p.dt);
-    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -60.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0 });
+    let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -60.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(5e9, 16e9, 5501);
     let (v, i) = port_spectra(&r.v[0], &exc, 50.0, p.dt, &freqs);
     let zm: Vec<f64> = v.iter().zip(&i).map(|(&v, &i)| (v / i).abs()).collect();
@@ -283,11 +283,12 @@ pub fn port_loop_setup(cell: f64, footprint: bool, swap: bool) -> crate::sim::Se
         grid,
         layout,
         lumped,
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95 },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95, wideband: None },
         freqs: linspace(10e6, 3e9, 300),
         fmax: 3e9,
         end_db: -70.0,
         max_steps: 400_000,
+        port_stop: false,
     }
 }
 
@@ -338,10 +339,129 @@ pub fn gap_setup(slot: bool, cell: f64, fmax: f64) -> crate::sim::Setup {
         grid,
         layout,
         lumped: vec![port("P1", 0.0), port("P2", len)],
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95 },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None },
         freqs: linspace(0.0, fmax, 1001),
         fmax,
         end_db: -60.0,
         max_steps: 200_000,
+        port_stop: false,
     }
+}
+
+/// Centre-fed thin-wire dipole along z in free space (length `len` mm, one-cell feed gap, `cell` mm
+/// cells near the wire, graded outwards), with a 50-ohm port. For the far-field checks: a lossless
+/// dipole radiates all the power its port accepts; D = 1.5 when short, about 1.64 at resonance.
+pub fn dipole_setup(len: f64, cell: f64, fmax: f64, air: f64) -> crate::sim::Setup {
+    use crate::model::Barrel;
+    let g = cell;
+    let pml_w = 8.0 * (C0 / fmax / 15.0 * 1e3).min(4.0);
+    let hmax = (C0 / fmax / 15.0 * 1e3).min(4.0);
+    let fz = vec![-len / 2.0, -g / 2.0, g / 2.0, len / 2.0, 0.0];
+    let x = lines_1d(-air - pml_w, air + pml_w, &[0.0], &[Refine { a: -3.0 * cell, b: 3.0 * cell, h: cell }], 1.25, hmax, &[]);
+    let y = x.clone();
+    let z = lines_1d(-len / 2.0 - air - pml_w, len / 2.0 + air + pml_w, &fz, &[Refine { a: -len / 2.0 - 3.0 * cell, b: len / 2.0 + 3.0 * cell, h: cell }], 1.25, hmax, &[]);
+    let grid = Grid { x: mm(x), y: mm(y), z: mm(z) };
+    let wire = |z0: f64, z1: f64| Barrel { c: P2::new(0.0, 0.0), r: 0.01, z0, z1 };
+    let layout = Layout { sheets: vec![], slabs: vec![], barrels: vec![wire(-len / 2.0, -g / 2.0), wire(g / 2.0, len / 2.0)], outline: vec![], copper_window: None };
+    let port = Lumped { name: "FEED".into(), axis: 2, lo: [0.0, 0.0, -g / 2.0], hi: [0.0, 0.0, g / 2.0], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
+    crate::sim::Setup {
+        grid,
+        layout,
+        lumped: vec![port],
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None },
+        freqs: linspace(fmax / 50.0, fmax, 300),
+        fmax,
+        end_db: -60.0,
+        max_steps: 100_000,
+        port_stop: false,
+    }
+}
+
+/// Directivity (linear) of a thin dipole of length `len` (m) at `f` with a sinusoidal current:
+/// F(theta) = [(cos(kL/2 cos theta) - cos(kL/2)) / sin theta]^2, D = 2 F_max / int F sin theta dtheta.
+pub fn dipole_directivity(len: f64, f: f64) -> f64 {
+    let k = 2.0 * PI * f / C0;
+    let h = k * len / 2.0;
+    let ff = |t: f64| {
+        let s = t.sin();
+        if s.abs() < 1e-9 {
+            0.0
+        } else {
+            ((h * t.cos()).cos() - h.cos()).powi(2) / (s * s)
+        }
+    };
+    let n = 20000;
+    let mut int = 0.0;
+    let mut fmax: f64 = 0.0;
+    for q in 0..n {
+        let t = (q as f64 + 0.5) * PI / n as f64;
+        let v = ff(t);
+        fmax = fmax.max(v);
+        int += v * t.sin() * PI / n as f64;
+    }
+    2.0 * fmax / int
+}
+
+/// One far-field check row: (case, f, directivity dBi, theory dBi, radiation efficiency, box/far ratio).
+pub type FarCheck = (String, f64, f64, f64, f64, f64);
+
+/// Run a free-space dipole with the far-field box and compare with theory.
+pub fn dipole_check(be: &Runner, name: &str, len: f64, cell: f64, fmax: f64, air: f64, ff: &[f64]) -> Vec<FarCheck> {
+    let st = dipole_setup(len, cell, fmax, air);
+    let ro = crate::sim::RunOpts { farfield: Some(crate::nf2ff::FarOpts { freqs: ff.to_vec(), step_deg: 5.0, gap: 3, tol: 0.01 }), ..Default::default() };
+    let dir = std::env::temp_dir().join(format!("fieldsolve-dipole-{name}-{}", std::process::id()));
+    let res = crate::sim::run_setup(&st, &dir, be, &ro).unwrap_or_else(|e| panic!("{e}"));
+    res["farfield"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let f = r["f"].as_f64().unwrap();
+            let d = r["directivity_dbi"].as_f64().unwrap();
+            let th = 10.0 * dipole_directivity(len * 1e-3, f).log10();
+            let eff = r["radiation_efficiency"].as_f64().unwrap();
+            let boxr = r["check_run_p_box"].as_f64().unwrap() / r["check_run_p_far"].as_f64().unwrap();
+            (name.to_string(), f, d, th, eff, boxr)
+        })
+        .collect()
+}
+
+/// PEC box 30 x 20 x 10 mm filled with eps_r 4, tan(delta) `tand`, weakly probed (10 kohm port):
+/// Q of TM110 / TM210 / TM120 from the half-power width of Re Z. With lossless walls Q = 1 / tan(delta)
+/// at each mode's frequency, so the wideband model should give a flat Q and the constant conductivity
+/// (matched at 1 GHz) a Q rising with frequency. Returns (f0, Q) per mode.
+pub fn lossy_cavity(be: &Runner, wideband: bool, tand: f64) -> Vec<(f64, f64)> {
+    let (a, b, c) = (30.0, 20.0, 10.0);
+    let h = 0.5;
+    let x = lines_1d(0.0, a, &[7.0], &[], 1.2, h, &[]);
+    let y = lines_1d(0.0, b, &[6.0], &[], 1.2, h, &[]);
+    let z = lines_1d(0.0, c, &[], &[], 1.2, h, &[]);
+    let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
+    let lay = Layout { sheets: vec![], slabs: vec![Slab { z0: 0.0, z1: c, eps: 4.0, tand }], barrels: vec![], outline: vec![], copper_window: None };
+    let port = Lumped { name: "P".into(), axis: 2, lo: [7.0, 6.0, 0.0], hi: [7.0, 6.0, c], plus_at_hi: true, r: 1e4, c: 0.0, port: true };
+    let wb = wideband.then(|| crate::disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: wb });
+    let exc = gauss_excite(6e9, 4e9, p.dt);
+    let r = be(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -80.0, check_every: 1000, dft_every: 1, ..Default::default() });
+    let freqs = linspace(3e9, 9e9, 3001);
+    let (v, i) = port_spectra(&r.v[0], &exc, 1e4, p.dt, &freqs);
+    let re: Vec<f64> = v.iter().zip(&i).map(|(&v, &i)| (v / i).re).collect();
+    let mut out = Vec::new();
+    for (lo, hi) in [(3.5e9, 5.4e9), (5.4e9, 7.0e9), (7.0e9, 8.8e9)] {
+        let rng: Vec<usize> = (0..freqs.len()).filter(|&k| freqs[k] >= lo && freqs[k] <= hi).collect();
+        let &kmax = rng.iter().max_by(|&&p, &&q| re[p].partial_cmp(&re[q]).unwrap()).unwrap();
+        let half = re[kmax] / 2.0;
+        // linear interpolation of the half-power crossings either side
+        let cross = |dir: isize| -> f64 {
+            let mut k = kmax as isize;
+            while k + dir >= 0 && ((k + dir) as usize) < freqs.len() && re[(k + dir) as usize] > half {
+                k += dir;
+            }
+            let (k0, k1) = (k as usize, (k + dir) as usize);
+            freqs[k0] + (freqs[k1] - freqs[k0]) * (re[k0] - half) / (re[k0] - re[k1])
+        };
+        let (f1, f2) = (cross(-1), cross(1));
+        out.push((freqs[kmax], freqs[kmax] / (f2 - f1)));
+    }
+    out
 }

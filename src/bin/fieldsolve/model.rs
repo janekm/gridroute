@@ -201,6 +201,28 @@ pub struct Problem {
     /// Field probes recorded every step (E terms at n dt, H terms at (n - 1/2) dt).
     pub probes: Vec<ProbeRt>,
     pub grid: Grid,
+    /// Debye polarisation currents of wideband dielectrics (see `disp.rs`), if any.
+    pub disp: Option<Disp>,
+}
+
+/// Dispersive edges live in the mesh-plane range `k0..=k1`; per component the compact index is
+/// q = ((k - k0) * ny + j) * nx + i, and per edge `np` poles.
+#[derive(Clone, Debug)]
+pub struct Disp {
+    pub k0: usize,
+    pub k1: usize,
+    pub np: usize,
+    /// per pole: k_p and (1 + k_p) / 2
+    pub kp: Vec<f32>,
+    pub hk: Vec<f32>,
+    /// per component, compact: b_p of each edge at [q * np + p] (0 where there is no dielectric)
+    pub b: [Vec<f32>; 3],
+}
+
+impl Disp {
+    pub fn nd(&self, nx: usize, ny: usize) -> usize {
+        nx * ny * (self.k1 - self.k0 + 1)
+    }
 }
 
 impl Problem {
@@ -218,11 +240,13 @@ pub struct BuildOpts {
     /// Highest frequency of interest (sets the CPML alpha).
     pub fmax: f64,
     pub cfl: f64,
+    /// Wideband (Debye) dielectric loss instead of the constant conductivity at `f_loss`.
+    pub wideband: Option<crate::disp::Wideband>,
 }
 
 impl Default for BuildOpts {
     fn default() -> Self {
-        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95 }
+        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95, wideband: None }
     }
 }
 
@@ -582,23 +606,54 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         }
         v
     };
-    let slab_of_k: Vec<Option<Slab>> = (0..nz.saturating_sub(1))
+    let slab_of_k: Vec<Option<usize>> = (0..nz.saturating_sub(1))
         .map(|k| {
             let zc = 0.5e3 * (g.z[k] + g.z[k + 1]);
-            lay.slabs.iter().find(|s| zc >= s.z0.min(s.z1) && zc <= s.z0.max(s.z1)).copied()
+            lay.slabs.iter().position(|s| zc >= s.z0.min(s.z1) && zc <= s.z0.max(s.z1))
         })
         .collect();
     let w_loss = 2.0 * std::f64::consts::PI * o.f_loss;
-    // (eps_r, sigma) of cell (i,j,k); out-of-range cells are air
-    let cell = |i: isize, j: isize, k: isize| -> (f64, f64) {
+    // wideband loss: per slab (eps_inf, deps per pole); the copper-loss gap is the slab's thickness
+    let poles: Vec<f64> = o.wideband.as_ref().map(|w| w.poles()).unwrap_or_default();
+    let npole = poles.len();
+    let fits: Vec<Option<(f64, Vec<f64>)>> = lay
+        .slabs
+        .iter()
+        .map(|s| {
+            let w = o.wideband.as_ref()?;
+            if s.tand <= 0.0 && !w.copper {
+                return None;
+            }
+            let (einf, deps, _) = crate::disp::fit(s.eps, s.tand, (s.z1 - s.z0).abs(), w);
+            Some((einf, deps))
+        })
+        .collect();
+    // (eps_r or eps_inf, sigma, slab index for the poles) of cell (i,j,k); out-of-range cells are air
+    let cell = |i: isize, j: isize, k: isize| -> (f64, f64, Option<usize>) {
         if i < 0 || j < 0 || k < 0 || i >= nx as isize - 1 || j >= ny as isize - 1 || k >= nz as isize - 1 {
-            return (1.0, 0.0);
+            return (1.0, 0.0, None);
         }
         match slab_of_k[k as usize] {
-            Some(s) if inside[j as usize * nx + i as usize] => (s.eps, w_loss * EPS0 * s.eps * s.tand),
-            _ => (1.0, 0.0),
+            Some(si) if inside[j as usize * nx + i as usize] => {
+                let s = &lay.slabs[si];
+                match &fits[si] {
+                    Some((einf, _)) => (*einf, 0.0, Some(si)),
+                    None => (s.eps, w_loss * EPS0 * s.eps * s.tand, None),
+                }
+            }
+            _ => (1.0, 0.0, None),
         }
     };
+    // plane range of edges that touch a dispersive cell
+    let (kd0, kd1) = {
+        let ks: Vec<usize> = (0..nz.saturating_sub(1)).filter(|&k| slab_of_k[k].is_some_and(|si| fits[si].is_some())).collect();
+        match (ks.first(), ks.last()) {
+            (Some(&a), Some(&b)) => (a, (b + 1).min(nz - 1)),
+            _ => (1, 0),
+        }
+    };
+    let nd = if kd1 >= kd0 { nx * ny * (kd1 - kd0 + 1) } else { 0 };
+    let mut dep: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0f32; nd * npole]);
     let cl = |a: usize, i: isize| -> f64 { if i < 0 { 0.0 } else { d(a, i as usize) } };
 
     // per-edge effective eps and sigma: area-weighted mean of the four cells around the edge
@@ -615,6 +670,8 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
                     let pos = [ii, jj, kk];
                     let mut ws = 0.0;
                     let (mut e, mut s) = (0.0, 0.0);
+                    let mut dp = [0.0f64; 8];
+                    let mut any = false;
                     for db in [-1isize, 0] {
                         for dc in [-1isize, 0] {
                             let mut q = pos;
@@ -624,15 +681,28 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
                             if w <= 0.0 {
                                 continue;
                             }
-                            let (ce, cs) = cell(q[0], q[1], q[2]);
+                            let (ce, cs, si) = cell(q[0], q[1], q[2]);
                             ws += w;
                             e += w * ce;
                             s += w * cs;
+                            if let Some(si) = si {
+                                let deps = &fits[si].as_ref().unwrap().1;
+                                for p in 0..npole {
+                                    dp[p] += w * deps[p];
+                                }
+                                any = true;
+                            }
                         }
                     }
                     if ws > 0.0 {
                         eps[a][id] = (e / ws) as f32;
                         sig[a][id] = (s / ws) as f32;
+                        if any && k >= kd0 && k <= kd1 {
+                            let q = ((k - kd0) * ny + j) * nx + i;
+                            for p in 0..npole {
+                                dep[a][q * npole + p] = (dp[p] / ws) as f32;
+                            }
+                        }
                     }
                 }
             }
@@ -703,13 +773,28 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
     // E update coefficients
     let mut ca: [Vec<f32>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
     let mut cb: [Vec<f32>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    let pc = crate::disp::pole_consts(&poles, dt);
+    // sum of b_p of an edge (Debye poles add B/2 to both sides of the E update)
+    let bsum = |a: usize, id: usize| -> f64 {
+        if npole == 0 || nd == 0 {
+            return 0.0;
+        }
+        let k = id / (nx * ny);
+        if k < kd0 || k > kd1 {
+            return 0.0;
+        }
+        let q = id - kd0 * nx * ny;
+        (0..npole).map(|p| pc[p].2 * dep[a][q * npole + p] as f64).sum()
+    };
+    let coef = |e: f64, s: f64, bb: f64| -> (f32, f32) {
+        let d = e / dt + 0.5 * s + 0.5 * bb;
+        (((e / dt - 0.5 * s + 0.5 * bb) / d) as f32, (1.0 / d) as f32)
+    };
     for a in 0..3 {
         for id in 0..n {
-            let e = eps[a][id] as f64 * EPS0;
-            let s = sig[a][id] as f64;
-            let q = s * dt / (2.0 * e);
-            ca[a][id] = ((1.0 - q) / (1.0 + q)) as f32;
-            cb[a][id] = ((dt / e) / (1.0 + q)) as f32;
+            let (x, y) = coef(eps[a][id] as f64 * EPS0, sig[a][id] as f64, bsum(a, id));
+            ca[a][id] = x;
+            cb[a][id] = y;
         }
     }
     // edges that do not exist or lie on the outer wall (tangential E = 0) and metal edges
@@ -761,11 +846,9 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
     }
     // lumped elements win over copper they overlap (a port drawn across a pad gap that the mesh closed)
     for &(a, id) in &loaded {
-        let e = eps[a][id] as f64 * EPS0;
-        let s = sig[a][id] as f64;
-        let q = s * dt / (2.0 * e);
-        ca[a][id] = ((1.0 - q) / (1.0 + q)) as f32;
-        cb[a][id] = ((dt / e) / (1.0 + q)) as f32;
+        let (x, y) = coef(eps[a][id] as f64 * EPS0, sig[a][id] as f64, bsum(a, id));
+        ca[a][id] = x;
+        cb[a][id] = y;
     }
     for &(a, id) in &shorts {
         ca[a][id] = 0.0;
@@ -782,5 +865,14 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         cpml_axis(&g.y, o.pml[2], o.pml[3], dt, o.fmax),
         cpml_axis(&g.z, o.pml[4], o.pml[5], dt, o.fmax),
     ];
-    Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone() }
+    let disp = (npole > 0 && nd > 0).then(|| Disp {
+        k0: kd0,
+        k1: kd1,
+        np: npole,
+        kp: pc.iter().map(|c| c.0 as f32).collect(),
+        hk: pc.iter().map(|c| c.1 as f32).collect(),
+        // b_p per edge; metal edges (cb = 0) keep b but are skipped by the updates
+        b: std::array::from_fn(|a| (0..nd * npole).map(|qp| pc[qp % npole].2 as f32 * dep[a][qp]).collect()),
+    });
+    Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone(), disp }
 }

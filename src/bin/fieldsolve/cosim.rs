@@ -233,6 +233,27 @@ pub fn terminate(s: &[Vec<Cx>], e: &[usize], t: &[(usize, Cx)]) -> Vec<Vec<Cx>> 
         .collect()
 }
 
+/// Incident waves on every port when the kept ports `e` are driven with `ae` and the ports in `t` are
+/// terminated (reflection Γ): b_t = (I - S_tt Γ)^-1 S_te a_e and a_t = Γ b_t.
+pub fn waves(s: &[Vec<Cx>], e: &[usize], ae: &[Cx], t: &[(usize, Cx)]) -> Vec<Cx> {
+    let mut a = vec![Cx::default(); s.len()];
+    for (k, &i) in e.iter().enumerate() {
+        a[i] = ae[k];
+    }
+    let nt = t.len();
+    if nt == 0 {
+        return a;
+    }
+    let m: Vec<Vec<Cx>> = (0..nt).map(|x| (0..nt).map(|y| (if x == y { Cx::new(1.0, 0.0) } else { Cx::default() }) - s[t[x].0][t[y].0] * t[y].1).collect()).collect();
+    let mi = inv(&m).expect("singular termination");
+    let ste_ae: Vec<Cx> = t.iter().map(|&(x, _)| e.iter().enumerate().fold(Cx::default(), |acc, (k, &j)| acc + s[x][j] * ae[k])).collect();
+    for (x, &(tx, g)) in t.iter().enumerate() {
+        let bt = (0..nt).fold(Cx::default(), |acc, y| acc + mi[x][y] * ste_ae[y]);
+        a[tx] = g * bt;
+    }
+    a
+}
+
 /// Renormalise S (reference z0 on all ports) to power waves with reference impedances `zr` (complex).
 pub fn renormalise(s: &[Vec<Cx>], z0: f64, zr: &[Cx]) -> Vec<Vec<Cx>> {
     let n = s.len();
@@ -310,7 +331,7 @@ pub fn plot_svg(path: &Path, freqs: &[f64], curves: &[(&str, &str, Vec<f64>, Vec
         let _ = write!(o, r##"<line x1="{x}" x2="{x}" y1="{mt}" y2="{}" stroke="#bbb" stroke-dasharray="3,3"/>"##, h - mb);
     }
     let _ = write!(o, r#"<text x="{}" y="{}" text-anchor="middle">frequency [GHz]</text><text x="14" y="{}" transform="rotate(-90 14 {})" text-anchor="middle">dB</text>"#, (ml + w - mr) / 2.0, h - 8.0, h / 2.0, h / 2.0);
-    for (name, col, s11, s21) in curves {
+    for (_name, col, s11, s21) in curves {
         for (dash, ys) in [("", s21), ("5,3", s11)] {
             let pts: Vec<String> = freqs.iter().zip(ys.iter()).map(|(&f, &d)| format!("{:.1},{:.1}", px(f), py(d))).collect();
             let _ = write!(o, r#"<polyline fill="none" stroke="{col}" stroke-width="1.6" stroke-dasharray="{dash}" points="{}"/>"#, pts.join(" "));
@@ -387,6 +408,8 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         None => None,
     };
     let gam_t = |z: Cx, fi: usize| target.as_ref().map(|t| ((z - t[fi]) / (z + t[fi].conj())).abs());
+    // "farfield": true -> per-port patterns from farfield.json next to the EM file
+    let far = if cfg["farfield"].as_bool().unwrap_or(false) { Some(crate::nf2ff::read_farfield(&em_path.with_file_name("farfield.json"))?) } else { None };
     let colours = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"];
     let mut curves = Vec::new();
     let mut out_json = serde_json::Map::new();
@@ -467,7 +490,57 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
             }
             rows.push(row);
         }
-        out_json.insert(vname.clone(), json!({"touchstone": format!("{safe}.s{}p", keep.len()), "report": rows}));
+        let mut vjson = json!({"touchstone": format!("{safe}.s{}p", keep.len()), "report": rows});
+        // radiated vs conducted: drive the first kept port with 1 W incident, the parts set the waves on
+        // their ports, the other kept ports are matched; the per-port patterns add with those waves
+        if let Some((ffreq, fnames, fpats)) = &far {
+            let mut frows = Vec::new();
+            for (q, &f) in ffreq.iter().enumerate() {
+                let fi = at(f);
+                let sf: Vec<Vec<Cx>> = (0..em.s.len()).map(|i| (0..em.s.len()).map(|j| em.s[i][j][fi]).collect()).collect();
+                let t: Vec<(usize, Cx)> = parts.iter().map(|(k, p)| (*k, p.gamma(f, em.z0))).collect();
+                let mut ae = vec![Cx::default(); keep.len()];
+                ae[0] = Cx::new(1.0, 0.0);
+                let a = waves(&sf, &keep, &ae, &t);
+                let b: Vec<Cx> = (0..sf.len()).map(|i| (0..sf.len()).fold(Cx::default(), |acc, j| acc + sf[i][j] * a[j])).collect();
+                let mut terms = Vec::new();
+                for (k, n) in names.iter().enumerate() {
+                    let fk = fnames.iter().position(|x| x == n).ok_or_else(|| format!("farfield.json has no port {n}"))?;
+                    let pat = fpats[fk].get(q).and_then(|x| x.as_ref()).ok_or_else(|| format!("farfield.json: port {n} has no pattern at {f:.4e} Hz (run with \"excite\": \"all\")"))?;
+                    terms.push((pat, a[k]));
+                }
+                let pat = crate::nf2ff::Pattern::combine(&terms);
+                let p_rad = pat.p_rad();
+                let (umax, th, ph) = pat.u_max();
+                let p_out: f64 = keep[1..].iter().map(|&k| b[k].abs().powi(2)).sum();
+                let p_in = 1.0 - b[keep[0]].abs().powi(2);
+                let d = |x: f64| 10.0 * x.max(1e-30).log10();
+                println!(
+                    "{:<24} {:>8.3}  P_in {:7.2} dB  to {} {:7.2} dB  radiated {:7.2} dB  radiated - conducted {:+7.2} dB  EIRP max - conducted {:+7.2} dBi (theta {:.0} phi {:.0})",
+                    format!("{vname} far field"), f * 1e-9, d(p_in), names[keep[keep.len() - 1]], d(p_out), d(p_rad), d(p_rad) - d(p_out), d(4.0 * PI * umax) - d(p_out), th.to_degrees(), ph.to_degrees()
+                );
+                // the combined pattern, for plotting (e.g. tools/blender_farfield.py): 4 pi U per 1 W incident
+                // at the driven port = EIRP per watt, on the theta/phi grid
+                let u = pat.u();
+                let ftag = format!("farfield_{safe}_{:.3}GHz.json", f * 1e-9);
+                std::fs::write(
+                    out.join(&ftag),
+                    serde_json::to_string(&json!({
+                        "variant": vname, "f": f, "driven": names[keep[0]],
+                        "theta_deg": pat.theta.iter().map(|t| t.to_degrees()).collect::<Vec<_>>(),
+                        "phi_deg": pat.phi.iter().map(|t| t.to_degrees()).collect::<Vec<_>>(),
+                        "eirp_per_w_db": u.iter().map(|&x| d(4.0 * PI * x)).collect::<Vec<_>>(),
+                        "p_rad_db": d(p_rad), "p_conducted_db": d(p_out),
+                    }))
+                    .unwrap(),
+                )
+                .map_err(|e| e.to_string())?;
+                frows.push(json!({"f": f, "pattern": ftag, "p_in_db": d(p_in), "p_conducted_db": d(p_out), "p_rad_db": d(p_rad), "rad_minus_conducted_db": d(p_rad) - d(p_out),
+                                  "eirp_max_minus_conducted_dbi": d(4.0 * PI * umax) - d(p_out), "max_dir_deg": [th.to_degrees(), ph.to_degrees()]}));
+            }
+            vjson["farfield"] = json!(frows);
+        }
+        out_json.insert(vname.clone(), vjson);
         if keep.len() == 2 {
             curves.push((format!("{vname} + layout"), col, red[0][0].iter().map(|&x| db(x)).collect::<Vec<_>>(), red[1][0].iter().map(|&x| db(x)).collect::<Vec<_>>()));
             if !ideal.is_empty() && plot_ideal {
@@ -504,6 +577,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn port_waves_agree_with_terminated_s() {
+        // 3-port junction, port 2 loaded: the reflected wave on kept port 0 from `waves` must equal the
+        // terminated S applied to the same drive
+        let s = vec![vec![Cx::new(-1.0 / 3.0, 0.0), Cx::new(2.0 / 3.0, 0.0), Cx::new(2.0 / 3.0, 0.0)], vec![Cx::new(2.0 / 3.0, 0.0), Cx::new(-1.0 / 3.0, 0.0), Cx::new(2.0 / 3.0, 0.0)], vec![Cx::new(2.0 / 3.0, 0.0), Cx::new(2.0 / 3.0, 0.0), Cx::new(-1.0 / 3.0, 0.0)]];
+        let t = [(2usize, Cx::new(0.3, -0.4))];
+        let e = [0usize, 1];
+        let a = waves(&s, &e, &[Cx::new(1.0, 0.0), Cx::default()], &t);
+        let b0 = (0..3).fold(Cx::default(), |acc, j| acc + s[0][j] * a[j]);
+        let st = terminate(&s, &e, &t);
+        assert!((b0 - st[0][0]).abs() < 1e-12);
+        let b2 = (0..3).fold(Cx::default(), |acc, j| acc + s[2][j] * a[j]);
+        assert!((a[2] - t[0].1 * b2).abs() < 1e-12, "a_t = Γ b_t");
     }
 
     #[test]

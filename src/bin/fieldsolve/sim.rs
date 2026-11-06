@@ -13,7 +13,9 @@
 //!   "elements": [ {"kind": "short", "pos": "C5.1", "neg": "C5.2", "layer": "F.Cu"},
 //!                 {"kind": "R", "r": 50, "at": [10, 12], "from": "F.Cu", "to": "In1.Cu"} ],
 //!   "excite": "all" | ["VDD"], "l_band": [10e6, 100e6],
-//!   "fields": {"freqs": [2.4e9]} }
+//!   "fields": {"freqs": [2.4e9]},
+//!   "farfield": {"freqs": [2.44e9], "step_deg": 5, "gap": 3},
+//!   "extent": "board", "decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}] }
 //! ```
 //! A pad reference is `REF.PIN` (from the Gerber X2 `.P` attributes); a point is `[x, y]`.
 
@@ -83,7 +85,7 @@ impl Ctx {
         let mut net = None;
         for q in &l.prims {
             if q.shape.bbox().contains(p) && q.shape.contains(p) {
-                net = if q.dark { q.net.clone() } else { None };
+                net = if q.dark { Some(q.net.clone().unwrap_or_else(|| "copper (no net)".into())) } else { None };
             }
         }
         net
@@ -147,6 +149,9 @@ pub struct Setup {
     pub fmax: f64,
     pub end_db: f64,
     pub max_steps: usize,
+    /// stop when the port signals have decayed by end_db (spec "stop": "ports", the default for board
+    /// runs; "energy" waits for the total field energy)
+    pub port_stop: bool,
 }
 
 /// Build layout, mesh and lumped elements from the spec.
@@ -196,8 +201,19 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         }
         None => board_bb,
     };
-    // the PML sits beyond the air margin; it is npml cells of hmax-ish size
-    let dom = roi.grow(air);
+    // the PML sits beyond the air margin; it is npml cells of hmax-ish size.
+    // "extent": "board" takes the whole board (plus `air`) into the domain for far-field runs: the roi
+    // stays the fine-meshed region, cells grade up to max_cell outside it, and copper is rasterised
+    // everywhere (on coarse cells small gaps merge: fine for planes, not for detail away from the roi)
+    let extent_board = sp.get("extent").and_then(|v| v.as_str()) == Some("board");
+    let dom = if extent_board {
+        let mut b = board_bb;
+        b.union(&roi);
+        b.grow(air)
+    } else {
+        roi.grow(air)
+    };
+    let fine = if extent_board { roi } else { dom };
 
     // ports and elements -> lumped boxes, bridges on sheets, fixed mesh lines
     let mut sheets: Vec<Sheet> = Vec::new();
@@ -225,6 +241,51 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     }
     for (k, p) in sp.get("elements").and_then(|v| v.as_array()).cloned().unwrap_or_default().into_iter().enumerate() {
         pend.push(Pending { name: format!("el{k}"), el: p, port: false });
+    }
+    // "decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}]: every two-pad part outside the
+    // roi with one pad on `net` and the other on a GND net becomes a vertical short from `from` to `to` at
+    // that pad, tying a power plane to ground the way its capacitors do at RF (parts inside the roi are
+    // left to explicit elements)
+    for d in sp.get("decouple").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let net = d.get("net").and_then(|v| v.as_str()).ok_or("decouple entry needs \"net\"")?.to_string();
+        let from = d.get("from").and_then(|v| v.as_str()).ok_or("decouple entry needs \"from\"")?.to_string();
+        let to = d.get("to").and_then(|v| v.as_str()).ok_or("decouple entry needs \"to\"")?.to_string();
+        let mut parts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, (String, BBox)>> = Default::default();
+        for l in &cx.board.layers {
+            for q in &l.prims {
+                if let (true, Some((r, pin)), Some(n)) = (q.dark, &q.pad, &q.net) {
+                    let e = parts.entry(r.clone()).or_default().entry(pin.clone()).or_insert((n.clone(), BBox::empty()));
+                    e.1.union(&q.shape.bbox());
+                }
+            }
+        }
+        let mut added = 0;
+        for (r, pins) in &parts {
+            if pins.len() != 2 {
+                continue;
+            }
+            let v: Vec<&(String, BBox)> = pins.values().collect();
+            let gnd = |s: &str| s.to_ascii_uppercase().contains("GND");
+            let hit = if v[0].0 == net && gnd(&v[1].0) { Some(v[0].1) } else if v[1].0 == net && gnd(&v[0].0) { Some(v[1].1) } else { None };
+            let Some(bb) = hit else { continue };
+            let c = P2::new(0.5 * (bb.x0 + bb.x1), 0.5 * (bb.y0 + bb.y1));
+            if roi.contains(c) {
+                continue;
+            }
+            let y = if cx.kicad { -c.y } else { c.y };
+            // "esr": a capacitor's series resistance (ohm) instead of a perfect short
+            let el = match d.get("esr").and_then(|v| v.as_f64()) {
+                Some(esr) if esr > 0.0 => json!({"kind": "R", "r": esr, "at": [c.x, y], "from": from, "to": to, "size": "point"}),
+                _ => json!({"kind": "short", "at": [c.x, y], "from": from, "to": to, "size": "point"}),
+            };
+            pend.push(Pending { name: format!("decouple {r}"), el, port: false });
+            added += 1;
+        }
+        let what = match d.get("esr").and_then(|v| v.as_f64()) {
+            Some(e) if e > 0.0 => format!("{e} ohm resistors"),
+            _ => "shorts".to_string(),
+        };
+        eprintln!("fieldsolve: decouple {net}: {added} capacitors outside the roi as {from} -> {to} {what}");
     }
     // first pass: geometry of each element, so its lines can be fixed before meshing
     enum Geo {
@@ -292,7 +353,9 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let zhi = slabs.iter().map(|s| s.z1).fold(board_t, f64::max);
     let cell_z = num(&sp, "cell_z", cell.min(slabs.iter().map(|s| s.z1 - s.z0).fold(f64::INFINITY, f64::min) / 2.0));
     let min_layer = num(&sp, "min_cells_layer", 2.0) as usize;
-    let pml_w = npml as f64 * hmax.min(1.0).max(cell);
+    // the absorbing layer's cells are graded up to hmax: with a whole-board domain give it its full width
+    // beyond the air margin, so the far-field box keeps the requested distance from the structure
+    let pml_w = if extent_board { npml as f64 * hmax.max(cell) } else { npml as f64 * hmax.min(1.0).max(cell) };
     // fixed lines closer than 3/4 of a cell would make a sliver cell that sets the time step for the whole
     // run (e.g. a port footprint edge 0.014 mm from a part's bridge edge); keep the earlier one
     let merge = |v: &[f64]| -> Vec<f64> {
@@ -306,8 +369,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         out
     };
     let (fx, fy) = (merge(&fx), merge(&fy));
-    let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &[Refine { a: dom.x0, b: dom.x1, h: cell }], 1.3, hmax, &[]);
-    let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &[Refine { a: dom.y0, b: dom.y1, h: cell }], 1.3, hmax, &[]);
+    let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &[Refine { a: fine.x0, b: fine.x1, h: cell }], 1.3, hmax, &[]);
+    let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &[Refine { a: fine.y0, b: fine.y1, h: cell }], 1.3, hmax, &[]);
     let mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
     let gz = lines_1d(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &[Refine { a: zlo, b: zhi, h: cell_z }], 1.3, hmax, &mc);
     // keep only fixed lines that fall inside the domain
@@ -363,13 +426,32 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 let (g0, g1) = (lines[i], lines[i + 1]);
                 sheet.prims.push(bar(pa.min(pb), g0));
                 sheet.prims.push(bar(g1, pa.max(pb)));
+                // clear the gap column over the bar's full width and a cell beyond: copper around the pads
+                // (a ground pour reaching into the gap) must not bridge it outside the element's edges, which
+                // cover only the middle 80 % (below). Only edges whose midpoint lies in the gap are cleared.
+                {
+                    let (u0, u1) = (g0 + 1e-6, g1 - 1e-6);
+                    let (v0, v1) = (oc - w / 2.0 - cell, oc + w / 2.0 + cell);
+                    let pts = if *axis == 0 {
+                        vec![P2::new(u0, v0), P2::new(u1, v0), P2::new(u1, v1), P2::new(u0, v1)]
+                    } else {
+                        vec![P2::new(v0, u0), P2::new(v1, u0), P2::new(v1, u1), P2::new(v0, u1)]
+                    };
+                    sheet.prims.push(Prim { shape: Shape::Polygon(pts), dark: false, net: None, pad: None });
+                }
                 let mut lo = [0.0; 3];
                 let mut hi = [0.0; 3];
                 lo[*axis] = g0;
                 hi[*axis] = g1;
                 let o = 1 - *axis;
-                lo[o] = oc - w / 2.0;
-                hi[o] = oc + w / 2.0;
+                // the element's edges sit inside the bar: 80 % of its width, as for vertical ports. Mesh
+                // lines fall on the bar's (and pad's) edges, and copper edges lying on a polygon boundary
+                // may or may not be metal in the raster; an element edge with no metal at one end carries
+                // its share of the source and the voltage probe without being part of the circuit, which
+                // shows up as a frequency-flat error in the port's resistance (seen as 2-14 % "loss")
+                let wp = 0.8 * w;
+                lo[o] = oc - wp / 2.0;
+                hi[o] = oc + wp / 2.0;
                 lo[2] = *z;
                 hi[2] = *z;
                 lumped.push(Lumped { name: pd.name.clone(), axis: *axis, lo, hi, plus_at_hi: pa > pb, r: if kind == "short" { 0.0 } else { r }, c, port: pd.port });
@@ -393,18 +475,32 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             barrels.push(Barrel { c: e, r: h.d / 2.0, z0: za.min(zb), z1: za.max(zb) });
         }
     }
-    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: Some(dom) };
+    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) } };
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
     Ok(Setup {
         grid,
         layout,
         lumped,
-        opts: BuildOpts { pml: [npml; 6], f_loss: num(&sp, "f_loss", 1e9), fmax, cfl: 0.95 },
+        opts: BuildOpts {
+            pml: [npml; 6],
+            f_loss: num(&sp, "f_loss", 1e9),
+            fmax,
+            cfl: 0.95,
+            // "loss": {"model": "wideband", "f_lo": .., "f_hi": .., "f_ref": 1e9, "copper": true}: flat
+            // tan(delta) over the band (Debye poles), plus the plane-pair copper loss if asked
+            wideband: sp.get("loss").filter(|l| l.get("model").and_then(|m| m.as_str()) == Some("wideband")).map(|l| crate::disp::Wideband {
+                f_lo: num(l, "f_lo", fmin.max(0.1e9)),
+                f_hi: num(l, "f_hi", fmax),
+                f_ref: num(l, "f_ref", 1e9),
+                copper: l.get("copper").and_then(|c| c.as_bool()).unwrap_or(false),
+            }),
+        },
         freqs: linspace(fmin, fmax, nf),
         fmax,
         end_db: num(&sp, "end_db", -70.0),
         max_steps: num(&sp, "max_steps", 400_000.0) as usize,
+        port_stop: sp.get("stop").and_then(|v| v.as_str()).unwrap_or("ports") == "ports",
     })
 }
 
@@ -462,6 +558,8 @@ pub struct RunOpts {
     pub snap_layers: Vec<String>,
     pub snap_ps: f64,
     pub snap_until_ps: f64,
+    /// Near-to-far-field box and frequencies (`"farfield"` in the spec).
+    pub farfield: Option<crate::nf2ff::FarOpts>,
 }
 
 impl RunOpts {
@@ -475,6 +573,7 @@ impl RunOpts {
             snap_layers: spec.pointer("/frames/layers").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
             snap_ps: spec.pointer("/frames/every_ps").and_then(|v| v.as_f64()).unwrap_or(5.0),
             snap_until_ps: spec.pointer("/frames/until_ps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            farfield: crate::nf2ff::FarOpts::from_spec(spec),
         }
     }
 }
@@ -536,8 +635,11 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     }
     let bridges = crate::connect::check(&st.grid, &st.layout);
     let bridge_lines = crate::connect::describe(&bridges, ro.kicad);
-    for l in &bridge_lines {
+    for l in bridge_lines.iter().take(12) {
         eprintln!("fieldsolve: WARNING: mesh short: {l}");
+    }
+    if bridge_lines.len() > 12 {
+        eprintln!("fieldsolve: WARNING: ... {} more mesh shorts (all in result.json)", bridge_lines.len() - 12);
     }
     let names: Vec<String> = p.ports.iter().map(|x| x.name.clone()).collect();
     let excite: Vec<usize> = if ro.excite_all {
@@ -557,6 +659,24 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     std::fs::write(out.join("scene.json"), serde_json::to_string(&scene_json(&st, excite.first().copied())).unwrap()).map_err(|e| e.to_string())?;
     let freqs = &st.freqs;
     let z0 = 50.0;
+    let mut far = match &ro.farfield {
+        Some(fo) => {
+            let plan = crate::nf2ff::auto_plan(&p, st.opts.pml, fo.gap)?;
+            let bad = crate::nf2ff::non_free_edges(&p, &plan);
+            let ax = [&p.grid.x, &p.grid.y, &p.grid.z];
+            let mm = |a: usize, i: usize| ax[a][i] * 1e3;
+            eprintln!(
+                "fieldsolve: far-field box x {:.1}..{:.1}, y {:.1}..{:.1}, z {:.1}..{:.1} mm, {} face samples",
+                mm(0, plan.lo[0]), mm(0, plan.hi[0]), mm(1, plan.lo[1]), mm(1, plan.hi[1]), mm(2, plan.lo[2]), mm(2, plan.hi[2]),
+                plan.gather.iter().map(|g| g.len()).sum::<usize>()
+            );
+            if bad > 0 {
+                eprintln!("fieldsolve: WARNING: far-field box: {bad} tangential E edges on its faces are not free space (the structure crosses the box); the far field is not valid");
+            }
+            Some(crate::nf2ff::Collector::new(fo.clone(), plan, np))
+        }
+        None => None,
+    };
     let mut s_mat: Vec<Vec<Vec<Cx>>> = vec![vec![vec![Cx::default(); freqs.len()]; np]; np];
     let mut zself: Vec<Option<Vec<Cx>>> = vec![None; np];
     let mut vall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
@@ -574,9 +694,26 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             snap_every: if q == 0 { snap_every } else { 0 },
             snap_k: snap_k.clone(),
             snap_until: if ro.snap_until_ps > 0.0 { (ro.snap_until_ps * 1e-12 / p.dt) as usize } else { 0 },
+            gather_freqs: far.as_ref().map(|c| c.opts.freqs.clone()).unwrap_or_default(),
+            gather: far.as_ref().map(|c| c.plan.gather.clone()).unwrap_or_default(),
+            port_stop: st.port_stop,
+            // far-field runs: the box flux at every far-field frequency must also have settled
+            gather_metric: far.as_ref().map(|c| {
+                let (plan, grid) = (c.plan.clone(), p.grid.clone());
+                crate::fdtd::GatherMetric(std::sync::Arc::new(move |acc: &[[Vec<f32>; 6]]| acc.iter().map(|d| crate::nf2ff::box_flux(&plan, &grid, d)).collect()))
+            }),
+            gather_tol: far.as_ref().map(|c| c.opts.tol).unwrap_or(0.01),
+            gather_lag: 5,
         };
         let r = backend(&p, &spec);
         eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
+        if let Some((rate, q)) = crate::fdtd::energy_decay(&r.energy, p.dt, st.fmax / 3.0) {
+            eprintln!(
+                "fieldsolve:   late-time field energy {:+.2} dB/ns{}",
+                rate,
+                if rate >= 0.0 { " (GROWING: numerical instability, not ringing)".to_string() } else { format!(" (Q {:.0} if at {:.2} GHz)", q, st.fmax / 3e9) }
+            );
+        }
         let mut vs = Vec::new();
         let mut is = Vec::new();
         for k in 0..np {
@@ -590,6 +727,19 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             s_mat[k][j] = col[k].clone();
         }
         zself[j] = Some(vs[j].iter().zip(&is[j]).map(|(&v, &i)| v / i).collect());
+        if let Some(c) = far.as_mut() {
+            let ff = c.opts.freqs.clone();
+            let (mut fv, mut fi) = (Vec::new(), Vec::new());
+            for k in 0..np {
+                let src: &[f32] = if k == j { &exc } else { &[] };
+                let (v, i) = port_spectra(&r.v[k], src, p.ports[k].r, p.dt, &ff);
+                fv.push(v);
+                fi.push(i);
+            }
+            let t1 = std::time::Instant::now();
+            c.add_run(j, &p.grid, &r.gathered, fv, fi);
+            eprintln!("fieldsolve: far-field transform for {}: {:.1} s", names[j], t1.elapsed().as_secs_f64());
+        }
         vall[j] = vs;
         iall[j] = is;
         if let Some(fd) = &r.fields {
@@ -602,8 +752,20 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
         runs.push(json!({"port": names[j], "steps": r.steps, "seconds": r.seconds, "backend": r.backend}));
     }
     let mut zmat_out = Value::Null;
+    let mut balance_out = Value::Null;
     if excite.len() == np {
         s_mat = crate::post::s_matrix(&vall, &iall, z0);
+        // power balance per port at the low end of the band, where radiation and dielectric loss are
+        // negligible: 1 - sum_k |S_kj|^2 should be ~0; a flat few-percent value means a port's edges are
+        // not all part of the circuit (or a port sits across something it should not)
+        let nlow = (freqs.len() / 10).max(1);
+        let bal: Vec<f64> = (0..np).map(|j| (0..nlow).map(|f| 1.0 - (0..np).map(|k| s_mat[k][j][f].abs().powi(2)).sum::<f64>()).sum::<f64>() / nlow as f64).collect();
+        for j in 0..np {
+            if bal[j].abs() > 0.02 {
+                eprintln!("fieldsolve: WARNING: port {}: power balance {:+.1} % over {:.3e}..{:.3e} Hz (should be ~0): check the port's placement", names[j], 100.0 * bal[j], freqs[0], freqs[nlow - 1]);
+            }
+        }
+        balance_out = json!(names.iter().zip(&bal).map(|(n, b)| json!({"port": n, "low_band_loss": b})).collect::<Vec<_>>());
         write_touchstone(&out.join(format!("sparams.s{np}p")), freqs, &s_mat, z0).map_err(|e| e.to_string())?;
         // impedance matrix per frequency: z[i][j] = {re: [...], im: [...]}
         let zs: Vec<Option<Vec<Vec<Cx>>>> = (0..freqs.len()).map(|f| z_from_s(&(0..np).map(|i| (0..np).map(|j| s_mat[i][j][f]).collect()).collect::<Vec<_>>(), z0)).collect();
@@ -631,9 +793,13 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
         eprintln!("fieldsolve: {}: R = {:.4} ohm, L = {:.4} nH over {:.3e}..{:.3e} Hz", names[j], r_fit, l_fit * 1e9, f0, f1);
         ports_out.push(o);
     }
+    let far_summary = match &far {
+        Some(c) => c.finish(&names, z0, out)?,
+        None => Value::Null,
+    };
     let res = json!({
         "grid": [p.nx, p.ny, p.nz], "cells": p.n(), "dt": p.dt, "runs": runs, "ports": ports_out,
-        "port_names": names, "z_matrix": zmat_out, "mesh_shorts": bridge_lines,
+        "port_names": names, "z_matrix": zmat_out, "mesh_shorts": bridge_lines, "farfield": far_summary, "port_power_balance": balance_out,
     });
     std::fs::write(out.join("result.json"), serde_json::to_string_pretty(&res).unwrap()).map_err(|e| e.to_string())?;
     Ok(res)
@@ -699,4 +865,47 @@ pub fn write_tdr(out: &Path, curves: &[(bool, Vec<f64>, Vec<f64>, Vec<f64>, f64)
     svg += "</svg>";
     std::fs::write(out.join("tdr.svg"), svg)?;
     std::fs::write(out.join("tdr.json"), serde_json::to_string(&js).unwrap())
+}
+
+/// ASCII raster of the model on the mesh plane nearest `z` (mm) inside the window `a`..`b` (mm, internal
+/// coordinates). Per node: '#' x and y metal edges leave the node, '-' only x, '|' only y, 'P' a lumped
+/// element edge (port, resistor, short), '.' none. Rows run top to bottom in the board's view.
+pub fn raster_ascii(p: &Problem, st: &Setup, z: f64, a: P2, b: P2, kicad: bool) -> String {
+    use std::fmt::Write as _;
+    let mm = |v: &[f64]| v.iter().map(|x| x * 1e3).collect::<Vec<_>>();
+    let (xs, ys, zs) = (mm(&p.grid.x), mm(&p.grid.y), mm(&p.grid.z));
+    let k = crate::mesh::snap(&zs, z);
+    let (x0, x1, y0, y1) = (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y));
+    let is: Vec<usize> = (0..p.nx).filter(|&i| xs[i] >= x0 && xs[i] <= x1).collect();
+    let mut js: Vec<usize> = (0..p.ny).filter(|&j| ys[j] >= y0 && ys[j] <= y1).collect();
+    // top row first: the largest internal y (KiCad's internal y is its negated y, so also its top)
+    js.reverse();
+    let lumped: std::collections::HashSet<(u8, u32)> = p.ports.iter().flat_map(|q| q.src.iter().map(|s| (s.0, s.1))).collect();
+    let mut short: std::collections::HashSet<(u8, u32)> = Default::default();
+    for l in &st.lumped {
+        if l.r == 0.0 && !l.port {
+            // shorts are metal edges already; mark them through their box
+            for (i, j) in is.iter().flat_map(|&i| js.iter().map(move |&j| (i, j))) {
+                let (xm, ym) = (xs[i], ys[j]);
+                if xm >= l.lo[0] - 1e-9 && xm <= l.hi[0] + 1e-9 && ym >= l.lo[1] - 1e-9 && ym <= l.hi[1] + 1e-9 {
+                    short.insert((l.axis as u8, ((k * p.ny + j) * p.nx + i) as u32));
+                }
+            }
+        }
+    }
+    let mut o = String::new();
+    let _ = writeln!(o, "plane z = {:.3} mm (k = {k}); x {:.3}..{:.3}, {} nodes per row", zs[k], xs[is[0]], xs[*is.last().unwrap()], is.len());
+    for &j in &js {
+        let yk = if kicad { -ys[j] } else { ys[j] };
+        let _ = write!(o, "{yk:9.3} ");
+        for &i in &is {
+            let id = ((k * p.ny + j) * p.nx + i) as u32;
+            let mx = p.cb[0][id as usize] == 0.0 && p.ca[0][id as usize] == 0.0;
+            let my = p.cb[1][id as usize] == 0.0 && p.ca[1][id as usize] == 0.0;
+            let lp = lumped.contains(&(0, id)) || lumped.contains(&(1, id)) || short.contains(&(0, id)) || short.contains(&(1, id));
+            o.push(if lp { 'P' } else if mx && my { '#' } else if mx { '-' } else if my { '|' } else { '.' });
+        }
+        o.push('\n');
+    }
+    o
 }

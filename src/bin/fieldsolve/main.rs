@@ -8,6 +8,8 @@ mod geom;
 mod gerber;
 mod mesh;
 mod model;
+mod nf2ff;
+mod disp;
 mod post;
 mod export;
 mod sim;
@@ -44,6 +46,59 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     match cmd {
+        "debye-port-check" => {
+            // two-port microstrip (gap case without the slot) with the wideband dielectric: S must be passive
+            let be = backend(&args);
+            for (name, wb) in [("constant sigma", None), ("wideband", Some(disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false }))] {
+                let mut st = cases::gap_setup(false, 0.4, 6e9);
+                for s in st.layout.slabs.iter_mut() {
+                    s.tand = 0.015;
+                }
+                st.opts.wideband = wb;
+                st.freqs = post::linspace(0.1e9, 6e9, 60);
+                if let Some(e) = arg(&args, "--end-db").and_then(|s| s.parse::<f64>().ok()) {
+                    st.end_db = e;
+                    st.max_steps = 400_000;
+                }
+                let ro = sim::RunOpts { excite_all: true, ..Default::default() };
+                let dir = std::env::temp_dir().join(format!("fieldsolve-debye-{}", name.replace(' ', "_")));
+                let r = sim::run_setup(&st, &dir, &*be, &ro).unwrap();
+                let txt = std::fs::read_to_string(dir.join("sparams.s2p")).unwrap();
+                print!("{name:<16}");
+                for line in txt.lines().filter(|l| !l.starts_with('!') && !l.starts_with('#')).step_by(10) {
+                    let v: Vec<f64> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
+                    let (s11, s21) = (post::Cx::new(v[1], v[2]), post::Cx::new(v[3], v[4]));
+                    print!(" {:.2}GHz:{:+.3}", v[0] * 1e-9, 1.0 - s11.abs().powi(2) - s21.abs().powi(2));
+                }
+                println!("   steps {:?}", r["runs"].as_array().unwrap().iter().map(|x| x["steps"].as_u64().unwrap()).collect::<Vec<_>>());
+            }
+        }
+        "loss-check" => {
+            // dielectric-filled PEC cavity: modal Q against 1 / tan(delta), constant conductivity vs wideband
+            let be = backend(&args);
+            for tand in [0.0, 0.02] {
+                for wb in [false, true] {
+                    if tand == 0.0 && wb {
+                        continue;
+                    }
+                    let r = cases::lossy_cavity(&*be, wb, tand);
+                    let name = if tand == 0.0 { "lossless (port loading only)" } else if wb { "tan 0.02, wideband (Debye)" } else { "tan 0.02, constant sigma @ 1 GHz" };
+                    let row: Vec<String> = r.iter().map(|(f, q)| format!("{:.2} GHz Q {:6.1}", f * 1e-9, q)).collect();
+                    println!("{name:<34} {}", row.join("   "));
+                }
+            }
+            println!("target for tan 0.02: Q = 1 / tan = 50 at every mode");
+        }
+        "farfield-check" => {
+            // free-space dipoles: directivity against theory, radiated power against port power
+            let be = backend(&args);
+            println!("{:<12} {:>8} {:>10} {:>10} {:>9} {:>10}", "case", "f [GHz]", "D [dBi]", "theory", "rad. eff", "box/far");
+            let mut rows = cases::dipole_check(&*be, "half-wave", 48.0, 1.0, 6e9, 30.0, &[2.6e9, 2.8e9, 3.0e9, 3.2e9]);
+            rows.extend(cases::dipole_check(&*be, "short", 10.0, 0.5, 6e9, 30.0, &[1.0e9, 1.5e9]));
+            for (n, f, d, th, eff, b) in rows {
+                println!("{:<12} {:>8.3} {:>10.2} {:>10.2} {:>8.1}% {:>10.3}", n, f * 1e-9, d, th, eff * 100.0, b);
+            }
+        }
         "selftest" => {
             let scale: f64 = arg(&args, "--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0);
             let which = arg(&args, "--case").unwrap_or_else(|| "all".into());
@@ -97,6 +152,66 @@ fn main() {
                     }
                 }
             }
+        }
+        "bench" => {
+            // time the Metal kernels on a spec's real problem: fixed step count, no early stop
+            let Some(spec) = args.get(2) else {
+                eprintln!("usage: fieldsolve bench SPEC.json [steps]");
+                std::process::exit(2);
+            };
+            let steps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3000);
+            let (mut cx, _) = sim::load(std::path::Path::new(spec)).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let p = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let exc = fdtd::gauss_excite(0.0, st.fmax, p.dt);
+            let rs = fdtd::RunSpec { excite: Some(0), exc, max_steps: steps, end_db: -1000.0, check_every: 1000, dft_every: 1, ..Default::default() };
+            println!("{} x {} x {} = {:.2} M cells, {} steps", p.nx, p.ny, p.nz, p.n() as f64 * 1e-6, steps);
+            for (fused, tg) in [("0", "32x4x1"), ("1", "32x4x1"), ("1", "64x2x1"), ("1", "32x2x2"), ("1", "16x8x1"), ("1", "128x1x1"), ("1", "32x8x1")] {
+                std::env::set_var("FIELDSOLVE_FUSED", fused);
+                std::env::set_var("FIELDSOLVE_TG", tg);
+                match metal_fdtd::run_metal(&p, &rs) {
+                    Ok(r) => println!("fused {fused} tg {tg:>8}: {:7.1} s  {:6.0} Mcell/s", r.seconds, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6),
+                    Err(e) => println!("fused {fused} tg {tg}: {e}"),
+                }
+            }
+        }
+        "prims" => {
+            // dump a Gerber file's primitives in drawing order as JSON (mm; dark = additive, else clear)
+            let Some(f) = args.get(2) else {
+                eprintln!("usage: fieldsolve prims FILE.gbr > prims.json");
+                std::process::exit(2);
+            };
+            let text = std::fs::read_to_string(f).unwrap_or_else(|e| { eprintln!("{f}: {e}"); std::process::exit(1) });
+            let prims = gerber::parse_gerber(&text).unwrap_or_else(|e| { eprintln!("{f}: {e}"); std::process::exit(1) });
+            let out: Vec<serde_json::Value> = prims
+                .iter()
+                .map(|p| {
+                    let shape = match &p.shape {
+                        geom::Shape::Polygon(v) => serde_json::json!({"polygon": v.iter().map(|q| [q.x, q.y]).collect::<Vec<_>>()}),
+                        geom::Shape::Circle { c, r } => serde_json::json!({"circle": [c.x, c.y, *r]}),
+                        geom::Shape::Capsule { a, b, r } => serde_json::json!({"capsule": [a.x, a.y, b.x, b.y, *r]}),
+                    };
+                    serde_json::json!({"dark": p.dark, "net": p.net, "shape": shape})
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        "raster" => {
+            // ASCII view of the rasterised model on one copper layer: metal edges and lumped edges
+            let (Some(spec), Some(layer)) = (args.get(2), args.get(3)) else {
+                eprintln!("usage: fieldsolve raster SPEC.json LAYER x0 y0 x1 y1   (mm, the spec's coordinates)");
+                std::process::exit(2);
+            };
+            let w: Vec<f64> = args[4..8.min(args.len())].iter().filter_map(|s| s.parse().ok()).collect();
+            if w.len() != 4 {
+                eprintln!("raster: need x0 y0 x1 y1");
+                std::process::exit(2);
+            }
+            let (mut cx, _) = sim::load(std::path::Path::new(spec)).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let p = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let z = st.layout.sheets.iter().find(|s| &s.name == layer).map(|s| s.z).unwrap_or_else(|| { eprintln!("no layer {layer}"); std::process::exit(1) });
+            print!("{}", sim::raster_ascii(&p, &st, z, cx.pt(w[0], w[1]), cx.pt(w[2], w[3]), cx.kicad));
         }
         "run" => {
             let Some(spec) = args.get(2) else {
@@ -179,6 +294,10 @@ mod tests {
 
     /// A small lossy plane pair with a port and a short: exercises dielectric, metal, PML and lumped edges.
     fn small_problem() -> model::Problem {
+        small_problem_with(None)
+    }
+
+    fn small_problem_with(wideband: Option<disp::Wideband>) -> model::Problem {
         use geom::{Prim, Shape, P2};
         let rect = |x0: f64, y0: f64, x1: f64, y1: f64| Prim {
             shape: Shape::Polygon(vec![P2::new(x0, y0), P2::new(x1, y0), P2::new(x1, y1), P2::new(x0, y1)]),
@@ -196,18 +315,62 @@ mod tests {
             copper_window: None,
         };
         let port = model::Lumped { name: "P1".into(), axis: 2, lo: [1.0, 1.0, 0.0], hi: [1.0, 1.0, 0.4], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-        model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95 })
+        model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband })
     }
 
     #[test]
     fn cpu_and_gpu_agree() {
         let p = small_problem();
         let exc = fdtd::gauss_excite(0.0, 10e9, p.dt);
-        let spec = fdtd::RunSpec { excite: Some(0), exc, max_steps: 3000, end_db: -300.0, check_every: 1000, dft_freqs: vec![3e9], dft_every: 4, snap_every: 0, snap_k: vec![], snap_until: 0 };
+        // the far-field box faces as a gather list, at the volume-DFT frequency and one more
+        let plan = nf2ff::auto_plan(&p, [6; 6], 2).unwrap();
+        let spec = fdtd::RunSpec {
+            excite: Some(0), exc, max_steps: 3000, end_db: -300.0, check_every: 1000, dft_freqs: vec![3e9], dft_every: 4, snap_every: 0, snap_k: vec![], snap_until: 0,
+            gather_freqs: vec![3e9, 5e9], gather: plan.gather.clone(), ..Default::default()
+        };
         let a = fdtd::run_cpu(&p, &spec);
+        // the gathered DFT equals the volume DFT at the same samples
+        for c in 0..6 {
+            let vol = &a.fields.as_ref().unwrap().data[0][c];
+            let pk = vol.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-30);
+            for (t, &id) in plan.gather[c].iter().enumerate() {
+                for q in 0..2 {
+                    let (g, v) = (a.gathered[0][c][2 * t + q], vol[2 * id as usize + q]);
+                    assert!((g - v).abs() <= 1e-5 * pk, "component {c}: gathered {g} vs volume {v}");
+                }
+            }
+        }
         let b = auto()(&p, &spec);
         if b.backend == "cpu" {
             eprintln!("Metal unavailable: nothing to compare");
+            return;
+        }
+        let peak = a.v[0].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let diff = a.v[0].iter().zip(&b.v[0]).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff <= 1e-4 * peak, "port voltage differs: {diff} vs peak {peak}");
+        let (fa, fb) = (&a.fields.unwrap().data[0][2], &b.fields.unwrap().data[0][2]);
+        let fpk = fa.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let fdiff = fa.iter().zip(fb).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(fdiff <= 1e-3 * fpk, "field DFT differs: {fdiff} vs peak {fpk}");
+        for fi in 0..2 {
+            for c in 0..6 {
+                let (ga, gb) = (&a.gathered[fi][c], &b.gathered[fi][c]);
+                let pk = ga.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-30);
+                let d = ga.iter().zip(gb).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+                assert!(d <= 1e-3 * pk, "gathered DFT f{fi} c{c} differs: {d} vs peak {pk}");
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_and_gpu_agree_with_debye_dielectric() {
+        let p = small_problem_with(Some(disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: true }));
+        assert!(p.disp.is_some(), "the lossy slab should be dispersive");
+        let exc = fdtd::gauss_excite(0.0, 10e9, p.dt);
+        let spec = fdtd::RunSpec { excite: Some(0), exc, max_steps: 3000, end_db: -300.0, check_every: 1000, dft_freqs: vec![3e9], dft_every: 4, ..Default::default() };
+        let a = fdtd::run_cpu(&p, &spec);
+        let b = auto()(&p, &spec);
+        if b.backend == "cpu" {
             return;
         }
         let peak = a.v[0].iter().fold(0.0f32, |m, x| m.max(x.abs()));
