@@ -129,7 +129,7 @@ smallest cell.
 ### Evidence from this codebase
 
 - **Edge corrections vs refinement.** On the microstrip (h = 1.6 mm, edges at seven positions in a cell),
-  with both corrections, 4 cells across the substrate give εeff within 0.65 % and C within 2.2 % rms. Without
+  with both corrections, 4 cells across the substrate give εeff within 0.73 % and C within 2.3 % rms. Without
   them, 4 cells are 18 % out in εeff, and even 16 cells are 4.9 % out. See
   [fieldsolve.md](fieldsolve.md#sub-cell-copper-edges) for the tables.
 - **Where an octree would save.** `fieldsolve octree-count spec.json` estimates the cells of a

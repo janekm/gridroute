@@ -334,6 +334,37 @@ fn main() {
                 }
             }
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        "edge-bench" => {
+            // A/B step rate with and without the edge corrections, alternating so that other GPU load affects
+            // both alike: edge-bench SPEC [steps] [rounds]
+            let spec = &args[2];
+            let steps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
+            let rounds: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let (mut cx, _) = sim::load(std::path::Path::new(spec)).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let mut st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let t0 = std::time::Instant::now();
+            st.opts.edge = None;
+            let pa = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let ta = t0.elapsed().as_secs_f64();
+            st.opts.edge = Some(edge::EdgeOpts::default());
+            let t1 = std::time::Instant::now();
+            let pb = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let tb = t1.elapsed().as_secs_f64();
+            println!("build: plain {ta:.1} s, edges {tb:.1} s; {} H corrections", pb.hcorr.as_ref().map(|h| h.ids.len()).unwrap_or(0));
+            for r in 0..rounds {
+                for (name, p) in [("plain", &pa), ("edges", &pb)] {
+                    // a fresh session each time: the material table and buffers are part of what is compared
+                    let session = metal_fdtd::Session::new().unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+                    let exc = fdtd::gauss_excite(0.0, st.fmax, p.dt);
+                    let rs = fdtd::RunSpec { excite: Some(0), exc, max_steps: steps, end_db: -1000.0, check_every: 1000, dft_every: 1, ..Default::default() };
+                    match session.run(p, &rs) {
+                        Ok(res) => println!("round {r} {name}: {:6.0} Mcell/s ({:.1} s, {:.0} MB on the GPU)", p.n() as f64 * res.steps as f64 / res.seconds * 1e-6, res.seconds, session.cached_bytes() as f64 * 1e-6),
+                        Err(e) => println!("round {r} {name}: {e}"),
+                    }
+                }
+            }
+        }
         "prims" => {
             // dump a Gerber file's primitives in drawing order as JSON (mm; dark = additive, else clear)
             let Some(f) = args.get(2) else {

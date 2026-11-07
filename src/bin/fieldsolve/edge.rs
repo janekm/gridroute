@@ -677,7 +677,7 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
                     }
                 }
             }
-            deg == 1 || (deg > 1 && o.open_corners)
+            deg >= 1
         })
         .collect();
     // connectivity without the fringe nodes' edges
@@ -741,6 +741,7 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
         u32::MAX
     };
     let mut keep = vec![false; nx * ny];
+    let mut corner = vec![false; nx * ny];
     let mut kept = 0;
     for n in 0..nx * ny {
         if !fringe[n] {
@@ -757,6 +758,20 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
                     nb[c] = o as u32;
                     c += 1;
                 }
+            }
+        }
+        // a staircase corner (two or more metal edges whose far nodes are one piece of copper) is the current
+        // path along an oblique edge: keep it unless asked to open corners. Two pieces of copper bridged by
+        // the raster across a sub-cell gap are not a corner: that bridge opens.
+        if c >= 2 && !o.open_corners {
+            let l0 = node_lab(nb[0] as usize);
+            if (1..c).all(|t| node_lab(nb[t] as usize) == l0) {
+                // stays metal, but is not a "kept staircase" node: corrections around it still apply
+                corner[n] = true;
+                for t in 0..c {
+                    uf.union(n as u32, nb[t]);
+                }
+                continue;
             }
         }
         // split: two neighbours in different raster components that the copper joins
@@ -786,8 +801,8 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
         for x in [true, false] {
             if cand(x, q) {
                 let (a, b) = other(x, q);
-                let open_a = fringe[a] && !keep[a];
-                let open_b = b < nx * ny && fringe[b] && !keep[b];
+                let open_a = fringe[a] && !keep[a] && !corner[a];
+                let open_b = b < nx * ny && fringe[b] && !keep[b] && !corner[b];
                 if open_a || open_b {
                     if x {
                         ox[q] = true;

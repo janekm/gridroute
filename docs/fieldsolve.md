@@ -467,9 +467,12 @@ to a copper edge those factors come from an assumed local field instead of a uni
   - **Pendant stubs are opened.** The midpoint rule makes every edge that is more than half covered metal.
     Where a strip edge lies in the outer half of a cell this leaves a comb of metal stubs reaching the next
     mesh line, which carry no current along it. It made a strip act up to 18 % high in εeff (below). A
-    metal edge that touches a node outside the copper, with nothing else attached there, becomes open
-    (with its conformal factor) when that cannot change connectivity: a union-find check keeps the stubs of a
-    thin diagonal trace whose ends would otherwise only meet through corner nodes.
+    metal edge whose outer node lies outside the copper and has no other metal edge, via, port or element
+    becomes open, with its conformal factor. Staircase corners (outer nodes with two metal edges) stay
+    metal: on an oblique edge they are the current path along the boundary, and opening them raised a 45°
+    line's inductance by 8 %. A connectivity check (union-find over the raster, against a flood of the
+    supersampled copper) keeps an edge only if the copper itself joins the pieces it connects. Bridges the
+    midpoint rule made across a sub-cell gap open, and a thin diagonal trace stays in one piece.
   - **Slivers are closed.** A face with less than `min_open` open area and three metal sides gets the
     fourth side as metal too. The three sides already join its nodes, so no nets merge.
 - **Singular** (static-field incorporation, Shorthouse and Railton, IEEE MTT 40(5), 1992). Near a straight
@@ -477,7 +480,10 @@ to a copper edge those factors come from an assumed local field instead of a uni
   covered area; a misfit over 5 % such as a corner falls back to conformal) the field is taken as the
   static field of a conducting half-plane, φ + iψ = √(u + iw). For each E edge and H face within one cell of
   the edge on the open side the factor is κ = (field flux through the face) · L / (A · line integral), the
-  ratio of the singular field's face and edge averages (1 for a uniform field). Line integrals are potential
+  ratio of the singular field's face and edge averages (1 for a uniform field). The half-plane field
+  ignores the ground: the factors have full weight only where the nearest copper of another layer (or a
+  PEC wall) is at least 4 in-plane cells away (`plane_cells`), fading to none at 2. On 75 µm prepreg at
+  0.05 mm cells that leaves conformal alone, which there did as well as both together. Line integrals are potential
   differences. Fluxes integrate a potential analytically along one face direction and by Gauss quadrature
   along the other. Corrected: in-plane E and the sheet-plane H faces, the vertical E edges just above and
   below, and the H half a cell above and below. Components sampled over the metal keep the conformal
@@ -500,23 +506,23 @@ Errors against Hammerstad-Jensen over seven insets (0.05, 0.2, 0.35, 0.5, 0.65, 
 
 | cell (cells across h) | | none | conformal | both |
 |---|---|---|---|---|
-| 0.4 mm (4) | εeff | 18.1 / 12.1 % | 1.5 / 1.1 % | 0.65 / 0.55 % |
-| | Z0 | 5.9 / 3.6 % | 7.0 / 4.4 % | 3.7 / 1.9 % |
-| | C per length | 15.4 / 9.1 % | 8.3 / 5.3 % | 4.1 / 2.2 % |
-| 0.2 mm (8) | εeff | 8.8 / 5.9 % | 0.95 / 0.76 % | 0.55 / 0.46 % |
-| | Z0 | 2.7 / 1.5 % | 3.7 / 2.3 % | 2.1 / 1.1 % |
-| | C per length | 4.5 / 2.8 % | 4.4 / 2.8 % | 2.4 / 1.3 % |
-| 0.1 mm (16) | εeff | 4.9 / 3.3 % | 0.68 / 0.59 % | 0.47 / 0.45 % |
-| | Z0 | 4.4 / 2.8 % | 2.0 / 1.3 % | 1.1 / 0.62 % |
-| | C per length | 7.1 / 4.6 % | 2.4 / 1.7 % | 1.3 / 0.82 % |
+| 0.4 mm (4) | εeff | 18.1 / 12.1 % | 1.5 / 1.1 % | 0.73 / 0.59 % |
+| | Z0 | 5.9 / 3.6 % | 7.0 / 4.4 % | 3.7 / 2.0 % |
+| | C per length | 15.4 / 9.1 % | 8.3 / 5.3 % | 4.2 / 2.3 % |
+| 0.2 mm (8) | εeff | 8.8 / 5.9 % | 0.95 / 0.76 % | 0.57 / 0.50 % |
+| | Z0 | 2.7 / 1.5 % | 3.7 / 2.3 % | 2.0 / 1.1 % |
+| | C per length | 4.5 / 2.8 % | 4.4 / 2.8 % | 2.3 / 1.3 % |
+| 0.1 mm (16) | εeff | 4.9 / 3.3 % | 0.68 / 0.59 % | 0.48 / 0.45 % |
+| | Z0 | 4.4 / 2.8 % | 2.0 / 1.3 % | 1.0 / 0.56 % |
+| | C per length | 7.1 / 4.6 % | 2.4 / 1.7 % | 1.2 / 0.77 % |
 
 - **The staircase's error is mostly the stubs.** Without corrections, insets up to 0.35 are within 0.6 % in
   εeff at every cell size (that is the thirds rule). From 0.5 on, the stubs add 9-18 % at 4 cells and 4.8 %
   even at 16. The board raster has edges at every inset.
 - **Conformal** removes the stub error (εeff within 1.5 %), but it is biased: C is 1-8 % high, falling with
   the cell. That is the uniform-field assumption underestimating how the field crowds at the edge.
-- **Both** halve the remaining error and converge cleanly, about first order, from 4.1 % (max) at 4 cells to
-  1.3 % at 16. The constant +0.45 % in εeff is common to all settings at fine cells (the probe method and
+- **Both** halve the remaining error and converge cleanly, about first order, from 4.2 % (max, C) at 4
+  cells to 1.2 % at 16. The constant +0.45 % in εeff is common to all settings at fine cells (the probe method and
   Hammerstad-Jensen's own accuracy).
 - The worst remaining cases are insets 0.65-0.8, where the open part of the boundary cell is small and its
   components are sampled over the metal (conformal factors). A field model including the ground plane
@@ -724,9 +730,11 @@ The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free
   instead of the bar inductance correction.
 - **Antennas.** The near-to-far-field transform is in place and validated on dipoles. Next: chip and trace
   antennas on a board, and an enclosure.
-- **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins); the thirds rule
-  applied in the rasteriser (shrink copper by 1/3 cell at edges) instead of relying on random edge
-  positions. (Against Nordic's measured network, modelled on the nRF52840 DK layout with the 2018 DK's thin-film
+- **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins). Sub-cell copper
+  edges are in place (`"edges"`); still open there: an edge field model that includes the nearby ground
+  plane (the half-plane field fades out within 4 cells of other copper), partial-current edges for oblique
+  traces, and a two-edge (slot) field for gaps narrower than the fit disc. Where to put resolution, and
+  why not a dynamic or unstructured mesh: [fieldsolve-resolution.md](fieldsolve-resolution.md). (Against Nordic's measured network, modelled on the nRF52840 DK layout with the 2018 DK's thin-film
   inductor, the model's in-band S21 is about 1 dB low and its roll-off 5-9 % low. openEMS on the same
   raster agrees with fieldsolve, the mesh is converged in band and the stack-up barely matters, so the
   cause is not the solver or the cell size: see [1bp-rf-findings.md](1bp-rf-findings.md).)
