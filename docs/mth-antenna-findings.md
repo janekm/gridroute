@@ -15,18 +15,46 @@ RF path, as populated:
 - **The IPEX connector U24** hangs off R69, which isn't fitted, so it isn't in the RF path.
 - **Parts:** the capacitors are Fenghua 0402CG and the inductors Murata LQG15HS.
 
+> **Correction (7 Nov 2026).** The EM run behind the first version of this note meshed the antenna's open
+> end coarsely. Its fine-mesh region started at x 145 mm, but the radiator arm runs from x 141.9 to 144.35,
+> so the open end fell in graded cells of 0.35-0.5 mm. A coarse open end acts electrically longer, so the
+> resonance came out too low.
+>
+> Re-run with the fine region from x 141.5 (one port at C20, in the fast-mode work), the antenna resonates
+> near 2.43 GHz, not below 2.40 GHz. The old ROI reproduced the 7-port run to within about 1 Ω, so the ROI
+> alone explains the difference. The antenna and ladder results below have been corrected; superseded
+> values are marked.
+>
+> The corrected values are still provisional:
+>
+> - **No new 7-port EM run yet.** The ladder numbers come from the old 7-port result with the
+>   better-resolved antenna swapped in at the feed. See [Retune](#retune) for the method and its error.
+> - **The mesh is not converged at the open end.** Going from about 0.4 mm cells to 0.1 mm to 0.05 mm
+>   moved the antenna's worst-case score from −2.09 to −1.32 to −0.91 dB, and the trend is still moving.
+>
+> A full 7-port re-run, with the open end resolved and a convergence check, is planned once the mesh
+> refinement work lands.
+
 ## Summary
 
-- **The antenna is good.** In free space it resonates just below 2.40 GHz, as intended for a design that
-  will be trimmed, and radiates 82-88 % of the power it accepts across the band.
-- **The ladder isn't matched to it.** The configuration-7 values were designed for a 50 Ω connector. On
-  the PIFA (28 + j16 Ω at 2.44 GHz), the chip sees 94 − j21 Ω instead of its 35 − j35 Ω design load. The
-  ladder dissipates 1.0-2.0 dB on top of the antenna's own loss. The worst in-band case is −4.6 dB, at
-  2.48 GHz.
-- **The cheapest fix: L5 → 0 Ω and C20 = 0.5 pF.** The worst in-band case improves from −4.6 to about
-  −2.1 dB, and band centre from −3.1 to −1.4 dB, with H2/H3 unchanged. Full retunes gain only about 0.5 dB
-  more.
-- **H2 suppression is weak.** The radiated H2 is −25.5 dB per watt into the chip pin, against −29.7 dB for
+- **The antenna is good.** In free space it resonates near 2.43 GHz, mid-band, and radiates about 87-91 %
+  of the power it accepts. (Superseded: "just below 2.40 GHz, 82-88 %".) The enclosure, solder mask and
+  battery will all pull the resonance down, so there is less length in hand for trimming than first
+  thought.
+- **The ladder isn't matched to it, but by less than first reported.** The configuration-7 values were
+  designed for a 50 Ω connector. On the PIFA (about 44 + j2 Ω at 2.44 GHz), the chip sees about 60 − j36 Ω
+  instead of its 35 − j35 Ω design load. The worst in-band case is about −2.5 to −3.1 dB, at 2.48 GHz.
+  (Superseded: 94 − j21 Ω, −4.6 dB.)
+- **The earlier fix, L5 → 0 Ω and C20 = 0.5 pF, is no longer the right one.** On the corrected antenna it
+  still helps at 2.48 GHz, but it pulls the chip impedance down to about 22-25 Ω. That makes it worse than
+  as built at 2.40 and 2.44 GHz, and its worst case is only −1.8 to −2.2 dB.
+- **Provisional cheapest fix: C59 and C60 → 0.6 pF, with L4, L5, R70 and C20 unchanged.** This is a
+  two-part value change with no new footprint. The chip sees about 61 − j37 / 43 − j36 / 30 − j28 Ω across
+  the band, close to its design load. The worst case improves from about −2.5 to −3.1 dB to about −1.0 to
+  −1.4 dB, and it beats the old fix at every frequency. Check it against the 7-port re-run before changing
+  the BOM.
+- **H2 suppression is weak.** The radiated H2 is −25.5 dB per watt into the chip pin (from the coarse
+  open-end run, not yet re-evaluated), against −29.7 dB for
   1BP as built and −49.3 dB for Nordic's reference layout. C59's ground pad is flooded into the top pour,
   the same deviation found on 1BP ([1bp-rf-findings.md](1bp-rf-findings.md)). The same fix should apply:
   an isolated return to VSS_PA. That fix hasn't been simulated here.
@@ -38,8 +66,9 @@ RF path, as populated:
 
 ## Model
 
-- **The whole board** in free space, from the KiCad conversion's X2 Gerbers. 0.05 mm cells over the RF
-  section and the antenna, graded outside, with far field from a Huygens box in 15 mm of air.
+- **The whole board** in free space, from the KiCad conversion's X2 Gerbers. 0.05 mm cells over the ROI
+  [145, 70, 159.6, 87.5], graded outside. That ROI misses the radiator's open end, x 141.9-144.35 (see
+  the correction at the top), with far field from a Huygens box in 15 mm of air.
 - **Stack-up:** one 0.73 mm FR4 core (εr 4.5, tan δ 0.015, wideband Debye fit) between 35 µm copper.
   The order notes give the finished thickness but not the laminate, so εr is assumed. Copper loss is
   included.
@@ -60,9 +89,15 @@ Seen at the feed (the C20 pads), with R70 open:
 
 | | 2.40 GHz | 2.44 GHz | 2.48 GHz |
 |---|---|---|---|
-| impedance | 37.5 + j5 Ω | 28.5 + j16 Ω | 21.9 + j26 Ω |
-| S11 (50 Ω) | −16.3 dB | −9.5 dB | −6.0 dB |
-| radiation efficiency | 88 % | 85 % | 82 % |
+| impedance | 59.8 − j8.8 Ω | 44.3 + j2.3 Ω | 33.4 + j13.2 Ω |
+| S11 (50 Ω) | −18.5 dB | −23.8 dB | −12.0 dB |
+| radiation efficiency | 91 % | 89 % | 87 % |
+| *superseded (open end coarse):* impedance | *37.5 + j5 Ω* | *28.5 + j16 Ω* | *21.9 + j26 Ω* |
+| *superseded:* S11 (50 Ω) | *−16.3 dB* | *−9.5 dB* | *−6.0 dB* |
+| *superseded:* radiation efficiency | *88 %* | *85 %* | *82 %* |
+
+The corrected values are from a one-port run at C20 (R70, CHIP and the ladder open), with the fine region
+from x 141.5. It is otherwise identical to the 7-port run.
 
 ## As built, seen from the chip pin
 
@@ -72,12 +107,16 @@ antenna loss).
 
 | | 2.40 GHz | 2.44 GHz | 2.48 GHz |
 |---|---|---|---|
-| chip sees | 68.5 − j19 Ω | 94 − j21 Ω | 111 − j67 Ω |
-| \|Γ\| against the design load | 0.31 | 0.46 | 0.58 |
-| radiated / accepted | 70 % (−1.5 dB) | 62 % (−2.1 dB) | 52 % (−2.9 dB) |
-| score | −2.0 dB | −3.1 dB | −4.6 dB |
+| chip sees | 55 − j45 Ω | 60 − j36 Ω | 75 − j41 Ω |
+| \|Γ\| against the design load | 0.21 | 0.26 | 0.40 |
+| score | −1.1 dB | −1.5 to −1.7 dB | −2.5 to −3.1 dB |
+| *superseded:* chip sees | *68.5 − j19 Ω* | *94 − j21 Ω* | *111 − j67 Ω* |
+| *superseded:* score | *−2.0 dB* | *−3.1 dB* | *−4.6 dB* |
 
-Treating R70 as a real 0 Ω jumper (about 0.4 nH) instead of an ideal short costs another 0.3-0.5 dB.
+The ranges are the two antenna-swap estimates described under [Retune](#retune).
+
+Treating R70 as a real 0 Ω jumper (about 0.4 nH) instead of an ideal short cost another 0.3-0.5 dB in the
+superseded model. This hasn't been re-evaluated.
 
 ## Radiation pattern
 
@@ -98,7 +137,51 @@ about half a wavelength long, so its ground currents radiate like a dipole along
 
 Radiated harmonics, per watt into the chip pin (50 Ω): **H2 −25.5 dB, H3 −21.6 dB.**
 
+The pattern, gain and harmonic figures in this section are from the run with the coarse open end. The
+dipole-like board mode should not change much, but the numbers will move a little.
+
 ## Retune
+
+### Corrected (provisional)
+
+There is no 7-port EM run with the open end resolved yet. Instead, the old 7-port result (whose ladder
+region is meshed finely) was re-scored with the better-resolved antenna swapped in at the feed. The swap
+uses the change in antenna impedance between the old-ROI and widened-ROI one-port runs, and scales the
+antenna's radiated/accepted share the same way.
+
+There are two ways to make the swap, and neither is exact, because the antenna and ladder copper couple:
+
+- **series swap at the R70 port:** checked against the old far-field scores, it reads 0.3-0.5 dB
+  optimistic;
+- **shunt-admittance swap at the C20 node:** it reads 0-0.6 dB pessimistic.
+
+The two agree within 0.1 dB at 2.40 and 2.44 GHz and differ by up to 0.6 dB at 2.48 GHz. Both give the chip
+impedance exactly on the old model. The table gives series / shunt.
+
+| | chip sees, 2.40 / 2.44 / 2.48 GHz | 2.40 GHz | 2.44 GHz | 2.48 GHz |
+|---|---|---|---|---|
+| as built | 55 − j45 / 60 − j36 / 75 − j41 Ω | −1.1 / −1.1 dB | −1.5 / −1.7 | −2.5 / −3.1 |
+| **C59, C60 → 0.6 pF** | 61 − j37 / 43 − j36 / 30 − j28 Ω | −0.7 / −0.6 | −0.8 / −0.8 | −1.0 / −1.4 |
+| C59, C60 → 0.5 pF | 71 − j46 / 50 − j50 / 33 − j43 Ω | −0.9 / −0.8 | −1.0 / −1.0 | −0.9 / −1.3 |
+| C59 0.6 pF, C60 0.5 pF | 55 − j44 / 38 − j44 / 26 − j37 Ω | −0.6 / −0.6 | −0.8 / −0.8 | −1.0 / −1.4 |
+| 0.5p / 2.7n / 0.5p / 2.0n (four parts) | 56 − j24 / 45 − j37 / 29 − j38 Ω | −0.6 / −0.4 | −0.7 / −0.7 | −0.9 / −1.2 |
+| R70 → 1.8 pF series | 35 − j52 / 32 − j40 / 36 − j29 Ω | −1.3 / −1.2 | −1.3 / −1.2 | −1.5 / −1.8 |
+| L5 → 0 Ω | 34 − j59 / 29 − j48 / 30 − j37 Ω | −1.5 / −1.5 | −1.3 / −1.3 | −1.2 / −1.5 |
+| old fix: L5 → 0 Ω, C20 = 0.5 pF | 23 − j60 / 22 − j50 / 25 − j42 Ω | −2.2 / −1.8 | −1.8 / −1.5 | −1.5 / −1.5 |
+
+- **Why the fix changed:** the resolved antenna is close to 50 Ω and nearly real in band, not inductive.
+  The configuration-7 ladder transforms it too high, about 60 Ω real. Lighter shunt capacitors bring the
+  real part down to the design load's 35 Ω. Removing L5 now overshoots.
+- **Search:** a coordinate descent over the same part libraries (series swap) found worst cases of about
+  −0.8 to −0.9 dB, but only by changing three or four parts. Given the swap's error at 2.48 GHz, that is
+  not clearly better than the two-capacitor change.
+- **Harmonics:** not re-evaluated. The H2/H3 effect of lighter shunt capacitors needs the 7-port re-run
+  with far field.
+
+### Superseded: retune on the coarse open end
+
+The rest of this section is the original retune. It was fitted to the coarse antenna (resonance below
+2.40 GHz) and is kept for reference only.
 
 Every ladder position was varied over real part values:
 
@@ -130,6 +213,8 @@ two-part change from as built: about 25,000 candidates, taking seconds.
 ## Caveats
 
 - **Free-space values only.** No enclosure, solder mask or battery; the antenna will also be trimmed.
+- **The open end's mesh isn't converged** (see the correction at the top), and the corrected ladder
+  numbers use an antenna swap rather than a 7-port run.
 - **The Fenghua capacitors are modelled with Murata data.**
 - **The chip's optimum load** is taken as Nordic's measured target. How far off it is in band is
   examined in [1bp-rf-findings.md](1bp-rf-findings.md).
@@ -139,7 +224,8 @@ two-part change from as built: about 25,000 candidates, taking seconds.
 ## Reproducing
 
 - **EM:** a `fieldsolve run` spec with `"gerbers"` the KiCad conversion's `fabrication/gerbers`,
-  `"coords": "kicad"`, `"extent": "board"`, ROI `[145, 70, 159.6, 87.5]`, cell 0.05, air 15 mm,
+  `"coords": "kicad"`, `"extent": "board"`, ROI `[141.5, 70, 159.6, 87.5]` (the first run used x0 = 145,
+  which leaves the antenna's open end coarse), cell 0.05, air 15 mm,
   `"dielectrics": [{"t": 0.73, "er": 4.5, "tand": 0.015}]`, and wideband loss with copper. Ports
   `CHIP` U12.H23→U12.F23, `C59` .2→.1, `L4` .1→.2, `C60` .2→.1, `L5` .1→.2, `R70` .2→.1, `C20` .1→.2.
   Decoupling shorts on C5-C8, C12, C15, C16, C23, C24, C29, C30, C40. Far field at 2.40/2.44/2.48/4.88/

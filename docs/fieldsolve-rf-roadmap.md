@@ -80,6 +80,10 @@ Outputs per frontend:
   *First board done (Nov 2026):* MTH R7A's PCB PIFA in free space, whole board, with polar cuts
   (`tools/polar_farfield.py`), 3-D patterns, and a ladder retune over real part values driven by `cosim`
   (`tools/ladder_retune.py`). Write-up: [mth-antenna-findings.md](mth-antenna-findings.md).
+  Lesson from it: the fine ROI must cover every piece of antenna copper. The first run's ROI missed the
+  radiator's open end, which lowered the resonance by about 1.5 % and changed the recommended ladder fix.
+  Until static refinement places fine cells by net automatically, check the ROI against the antenna's
+  extent.
 - **In an enclosure.** Add the housing STL (A2/A3), battery and display as metal, screws, and the other PCB.
   The usual effects are a resonance shift of 2–8 % downward, efficiency loss from housing tan δ and nearby
   metal, and pattern changes. Deliverables are S11, total efficiency and pattern with and without the
