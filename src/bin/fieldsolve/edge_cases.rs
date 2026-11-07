@@ -101,7 +101,9 @@ pub fn line(run: &Runner, w0: f64, h: f64, er: f64, hc: f64, nz: usize, inset: f
     let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None, edge });
     for (q, (at, xq, ylo, yhi)) in probes.iter().enumerate() {
         p.add_vprobe(&format!("v{q}"), 2, *at, 0.0);
-        p.add_iprobe(&format!("i{q}"), 0, *xq, [0.0, *ylo, h - 0.1], [0.0, *yhi, h + 0.1]);
+        // the loop passes between the strip and the ground (not through it) on thin substrates
+        let below = (0.5 * h).min(0.1);
+        p.add_iprobe(&format!("i{q}"), 0, *xq, [0.0, *ylo, h - below], [0.0, *yhi, h + 0.1]);
     }
     let dsep = if angle45 { (probes[1].1 - probes[0].1) * 2f64.sqrt() } else { d };
     let exc = gauss_excite(0.0, fmax, p.dt);

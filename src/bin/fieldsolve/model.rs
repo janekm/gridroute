@@ -991,7 +991,7 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         );
         if eo.dt_check && (!fx.e.is_empty() || !fx.h.is_empty()) {
             let t0 = std::time::Instant::now();
-            let mu = crate::edge::stability(&p, 150);
+            let mu = crate::edge::stability(&p, eo.dt_iters);
             let lim = 4.0 * o.cfl * o.cfl;
             eprintln!("fieldsolve: edges: dt^2 lambda_max {:.4} (limit {:.4} at cfl {}), {:.1} s", mu, lim, o.cfl, t0.elapsed().as_secs_f64());
             if mu > lim {

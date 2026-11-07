@@ -38,6 +38,7 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   node for holes thinner than a cell. Copper is only rasterised inside the fine-meshed copper window (ROI
   plus `air`). Outside it, whatever crosses the window's edge continues straight out to the grid boundary,
   so a cropped plane or track runs into the absorbing layer instead of ending inside the domain.
+  With `"edges"` the copper edges are sub-cell instead (see [Sub-cell copper edges](#sub-cell-copper-edges)).
 - **Net-aware raster.** Every metal edge remembers the Gerber net (X2 `.N`) of the copper that painted
   it. Wherever two nets' edges would share a mesh node (a gap of about a cell or less), the minority net's
   edges at that node are dropped. Wherever a via barrel's nodes touch another net's copper (an antipad too
@@ -120,6 +121,9 @@ target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see
 target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
 target/release/fieldsolve connect spec.json [reps]  # time the mesh connectivity check, print the shorts it finds
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
+target/release/fieldsolve edge-check line|line45|gap [w,h,er] [cells] [insets|gaps] [variants]  # sub-cell edges
+target/release/fieldsolve amr-check [h_mm] [steps] [absorb_mm]  # 2-D dynamic-resolution prototype
+target/release/fieldsolve octree-count spec.json   # cells an octree would need on this board's mesh
 target/release/fieldsolve prims board.GTL > prims.json        # a Gerber's primitives (shape, polarity, net)
 ```
 
@@ -157,6 +161,9 @@ Ports and elements come in two forms:
   between the pads would otherwise short the element). With edges on the full width, the outermost ones
   could have no metal at one end: they carried source and probe without being in the circuit, which read
   as a flat 2-14 % "loss" in the port.
+
+`"edges": true` (or an object, see [Sub-cell copper edges](#sub-cell-copper-edges)) turns on the
+conformal and edge-singularity corrections of the copper edges.
 
 `kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
@@ -437,6 +444,91 @@ openEMS took 37-44 min per excitation on the M3 Max CPU (380 Mcell/s); fieldsolv
 `openEMS-Project` with `update_openEMS.sh ~/opt/openEMS --python --disable-GUI`. The Homebrew formula is no
 longer maintained.
 
+### Sub-cell copper edges
+
+With the midpoint rule a copper edge snaps to the mesh, and the zero-thickness strip's edge field (which
+varies as r^-1/2) is sampled as if it were uniform over a cell. `"edges"` corrects both (`edge.rs`):
+
+```json
+"edges": true
+"edges": {"conformal": true, "singular": true, "ss": 8, "min_open": 0.15, "reach": 1.0, "dt_check": true}
+```
+
+Both corrections are written in the integral (FIT) form of the Yee scheme. Faraday's and Ampère's laws are
+exact for edge voltages and face fluxes; the discretisation sits only in the constitutive factors that
+turn an edge voltage into a dual-face flux (ε A'/L) and a dual-edge current into a face flux (μ A/L'). Next
+to a copper edge those factors come from an assumed local field instead of a uniform one:
+
+- **Conformal** (Dey and Mittra, IEEE MGWL 7(9), 1997). The field is uniform on the open part of an edge or
+  face and zero on the metal. A partly covered in-plane E edge gets permittivity ε·L/l_open, and a
+  partly covered face of the sheet plane gets its H update divided by A_open/A. Edge fractions are sampled
+  32 times per cell and faces 8×8 (or from the two crossed edges, exactly, where a straight edge crosses a
+  face). Two raster fixes come with it:
+  - **Pendant stubs are opened.** The midpoint rule makes every edge that is more than half covered metal.
+    Where a strip edge lies in the outer half of a cell this leaves a comb of metal stubs reaching the next
+    mesh line, which carry no current along it. It made a strip act up to 18 % high in εeff (below). A
+    metal edge that touches a node outside the copper, with nothing else attached there, becomes open
+    (with its conformal factor) when that cannot change connectivity: a union-find check keeps the stubs of a
+    thin diagonal trace whose ends would otherwise only meet through corner nodes.
+  - **Slivers are closed.** A face with less than `min_open` open area and three metal sides gets the
+    fourth side as metal too. The three sides already join its nodes, so no nets merge.
+- **Singular** (static-field incorporation, Shorthouse and Railton, IEEE MTT 40(5), 1992). Near a straight
+  copper edge (fitted locally from the supersampled copper: normal from the centroids, position from the
+  covered area; a misfit over 5 % such as a corner falls back to conformal) the field is taken as the
+  static field of a conducting half-plane, φ + iψ = √(u + iw). For each E edge and H face within one cell of
+  the edge on the open side the factor is κ = (field flux through the face) · L / (A · line integral), the
+  ratio of the singular field's face and edge averages (1 for a uniform field). Line integrals are potential
+  differences. Fluxes integrate a potential analytically along one face direction and by Gauss quadrature
+  along the other. Corrected: in-plane E and the sheet-plane H faces, the vertical E edges just above and
+  below, and the H half a cell above and below. Components sampled over the metal keep the conformal
+  factors: there the half-plane field (which ignores the ground plane) made the line 5-10 % off.
+- **Backends.** The E factors go into the edge's permittivity, conductivity and Debye weights, quantised in
+  0.4 % steps so that the Metal material table stays small. The H factors are a sparse list (`HCorr`)
+  applied right after the H update, on the CPU and in a small Metal kernel (`hcorr`). CPU and Metal agree
+  to 1e-4 of the port voltage peak (`cpu_and_gpu_agree_with_edge_corrections`).
+- **Stability.** Dividing an H update by a small open fraction stiffens the scheme. Open fractions are
+  floored at `min_open` and singular factors clamped to [0.25, 4]. `dt_check` estimates the largest
+  eigenvalue of the corrected update operator by power iteration (150 iterations of the CPU kernels,
+  without loss or CPML). It lowers the time step if dt²λ exceeds 4·cfl², the margin of the plain mesh. A
+  lossless PEC box with corrections keeps its energy over 60 000 steps
+  (`edge_corrections_stay_stable_in_a_closed_box`). The same box with floors of 0.01 blows up without the
+  check (`edge_growth_detects_an_unstable_setting`, ignored).
+
+**Microstrip** (w ≈ 3 mm, h = 1.6 mm, εr 4.3; the width is adjusted so that both edges lie at a chosen
+inset, the distance from the edge to the nearest mesh line inside the metal, as a fraction of the cell).
+Errors against Hammerstad-Jensen over seven insets (0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95), as max / rms:
+
+| cell (cells across h) | | none | conformal | both |
+|---|---|---|---|---|
+| 0.4 mm (4) | εeff | 18.1 / 12.1 % | 1.5 / 1.1 % | 0.65 / 0.55 % |
+| | Z0 | 5.9 / 3.6 % | 7.0 / 4.4 % | 3.7 / 1.9 % |
+| | C per length | 15.4 / 9.1 % | 8.3 / 5.3 % | 4.1 / 2.2 % |
+| 0.2 mm (8) | εeff | 8.8 / 5.9 % | 0.95 / 0.76 % | 0.55 / 0.46 % |
+| | Z0 | 2.7 / 1.5 % | 3.7 / 2.3 % | 2.1 / 1.1 % |
+| | C per length | 4.5 / 2.8 % | 4.4 / 2.8 % | 2.4 / 1.3 % |
+| 0.1 mm (16) | εeff | 4.9 / 3.3 % | 0.68 / 0.59 % | 0.47 / 0.45 % |
+| | Z0 | 4.4 / 2.8 % | 2.0 / 1.3 % | 1.1 / 0.62 % |
+| | C per length | 7.1 / 4.6 % | 2.4 / 1.7 % | 1.3 / 0.82 % |
+
+- **The staircase's error is mostly the stubs.** Without corrections, insets up to 0.35 are within 0.6 % in
+  εeff at every cell size (that is the thirds rule). From 0.5 on, the stubs add 9-18 % at 4 cells and 4.8 %
+  even at 16. The board raster has edges at every inset.
+- **Conformal** removes the stub error (εeff within 1.5 %), but it is biased: C is 1-8 % high, falling with
+  the cell. That is the uniform-field assumption underestimating how the field crowds at the edge.
+- **Both** halve the remaining error and converge cleanly, about first order, from 4.1 % (max) at 4 cells to
+  1.3 % at 16. The constant +0.45 % in εeff is common to all settings at fine cells (the probe method and
+  Hammerstad-Jensen's own accuracy).
+- The worst remaining cases are insets 0.65-0.8, where the open part of the boundary cell is small and its
+  components are sampled over the metal (conformal factors). A field model including the ground plane
+  (the Maxwell plate edge, a conformal map) would be the next step.
+- `"singular"` without `"conformal"` (corrections on the staircase) is erratic: the stubs it leaves
+  contradict the edge line it assumes (εeff −0.4 to +25 % over insets at 0.4 mm, Z0 up to +13 % at
+  0.1 mm). Use both.
+- On the plain mesh, an edge exactly on a mesh line is ambiguous for the midpoint rule: the polygon's
+  scanline counts the lower edge as copper and the upper one not. The tables avoid exact insets of 0.
+
+EDGE_EXTRA_TABLES
+
 ## Fields and Blender
 
 `fields/` holds, per snapshot frequency:
@@ -608,6 +700,9 @@ The code is in `src/bin/fieldsolve/`.
 | `nf2ff.rs` | near-to-far-field transform: box plan, face currents, patterns, power, polar plots |
 | `disp.rs` | wideband dielectric: Debye pole fit to a flat tan δ, plane copper loss, update constants |
 | `cond.rs` | conductor loss: copper surface impedance (skin effect, thickness, roughness), Foster fit, sheet edges |
+| `edge.rs` | sub-cell copper edges: coverage, local edge fit, conformal fractions, half-plane static-field factors, stability check |
+| `edge_cases.rs`, `edge_tests.rs` | microstrip / 45° line / gap cases for the edge corrections; their tests |
+| `amr2d.rs` | 2-D dynamic-resolution prototype (quadtree LC network) and the octree cell estimate, see [fieldsolve-resolution.md](fieldsolve-resolution.md) |
 | `tools/blender_frames.py` | time-domain current animation |
 | `tools/blender_farfield.py`, `tools/render_farfield_panels.py` | far-field patterns over the board, panel comparisons |
 | `cases.rs` | analytic validation cases |

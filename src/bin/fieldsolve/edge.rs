@@ -60,18 +60,22 @@ pub struct EdgeOpts {
     pub over_metal: bool,
     /// the same for H faces only (experiments)
     pub over_metal_h: bool,
+    /// singular factors at full weight only where the nearest copper of another layer is at least this many
+    /// in-plane cells away (none at half of it): the half-plane field ignores that conductor
+    pub plane_cells: f64,
     /// radius (cells) of the disc used to fit the local edge line, and the misclassified share accepted
     pub fit_r: f64,
     pub fit_tol: f64,
     /// check the corrected operator's stability (power iteration) and lower dt if needed
     pub dt_check: bool,
+    pub dt_iters: usize,
     /// log step of the permittivity factors (keeps the Metal material table small)
     pub quant: f64,
 }
 
 impl Default for EdgeOpts {
     fn default() -> Self {
-        EdgeOpts { conformal: true, singular: true, ss: 8, min_open: 0.15, kmin: 0.25, kmax: 4.0, reach: 1.0, taper: 0.0, over_metal: false, over_metal_h: false, fit_r: 1.25, fit_tol: 0.05, dt_check: true, quant: 0.004 }
+        EdgeOpts { conformal: true, singular: true, ss: 8, min_open: 0.15, kmin: 0.25, kmax: 4.0, reach: 1.0, taper: 0.0, over_metal: false, over_metal_h: false, plane_cells: 4.0, fit_r: 1.25, fit_tol: 0.05, dt_check: true, dt_iters: 150, quant: 0.004 }
     }
 }
 
@@ -88,6 +92,7 @@ impl EdgeOpts {
             o.conformal = b("conformal", o.conformal);
             o.singular = b("singular", o.singular);
             o.dt_check = b("dt_check", o.dt_check);
+            o.dt_iters = f("dt_iters", o.dt_iters as f64) as usize;
             o.ss = f("ss", o.ss as f64).max(2.0) as usize;
             o.min_open = f("min_open", o.min_open);
             o.kmin = f("kmin", o.kmin);
@@ -96,6 +101,7 @@ impl EdgeOpts {
             o.taper = f("taper", o.taper);
             o.over_metal = b("over_metal", o.over_metal);
             o.over_metal_h = b("over_metal_h", o.over_metal_h);
+            o.plane_cells = f("plane_cells", o.plane_cells);
             o.fit_r = f("fit_r", o.fit_r);
             o.fit_tol = f("fit_tol", o.fit_tol);
         }
@@ -778,6 +784,29 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
         let z0 = zmm[k];
         let mut pt = if o.conformal { plane_true(g, lay, si, k, o.ss) } else { plane_stair(g, m, o.ss) };
         let att = attached(g, lay, lumped, k);
+        // vertical distance (mm) from each node to the nearest copper of another sheet: the half-plane field
+        // ignores that conductor, so the singular factors fade out when it is within a few cells
+        // a PEC wall (no absorber on that z side) is a plane everywhere
+        let mut wall = f64::INFINITY;
+        if pml[4] == 0 {
+            wall = wall.min(z0 - zmm[0]);
+        }
+        if pml[5] == 0 {
+            wall = wall.min(zmm[nz - 1] - z0);
+        }
+        let mut gap_z = vec![wall; nx * ny];
+        for m2 in masks.iter().filter(|m2| m2.k != k) {
+            let dzk = (zmm[m2.k] - z0).abs();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let q = j * nx + i;
+                    let on = m2.ex[q] || m2.ey[q] || (i > 0 && m2.ex[q - 1]) || (j > 0 && m2.ey[q - nx]);
+                    if on && dzk < gap_z[q] {
+                        gap_z[q] = dzk;
+                    }
+                }
+            }
+        }
         let (ox, oy, keep, kept) = if o.conformal { openable(g, m, &pt, &att, o) } else { (vec![false; nx * ny], vec![false; nx * ny], vec![false; nx * ny], 0) };
         fix.stats.kept_for_connectivity += kept;
         let stair_near = |i: usize, j: usize| -> bool {
@@ -875,7 +904,17 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
                     } else {
                         // weight of the singular factors: 1 within reach, then linear to 0
                         let t = if u <= o.reach { 1.0 } else { 1.0 - (u - o.reach) / o.taper };
-                        Some(Some((ln, t)))
+                        // fade with the nearest other copper below / above: full weight from `plane_cells`
+                        // in-plane cells away, none at half that
+                        let (ii, jj) = (crate::mesh::snap(&xmm, px).min(nx - 1), crate::mesh::snap(&ymm, py).min(ny - 1));
+                        let hz = gap_z[jj * nx + ii] / h;
+                        let pc = o.plane_cells;
+                        let tg = ((hz - 0.5 * pc) / (0.5 * pc)).clamp(0.0, 1.0);
+                        if t * tg <= 0.0 {
+                            Some(None)
+                        } else {
+                            Some(Some((ln, t * tg)))
+                        }
                     }
                 }
             }
@@ -1168,7 +1207,7 @@ pub fn stability(p: &crate::model::Problem, iters: usize) -> f64 {
     let norm = |e: &[Vec<f32>; 3]| -> f64 { e.iter().map(|v| v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()).sum::<f64>().sqrt() };
     let mut n0 = norm(&s.e);
     let mut mu = 0.0;
-    for _ in 0..iters {
+    for it in 0..iters {
         for c in 0..3 {
             s.e[c].iter_mut().for_each(|x| *x /= n0 as f32);
             s.h[c].iter_mut().for_each(|x| *x = 0.0);
@@ -1186,6 +1225,9 @@ pub fn stability(p: &crate::model::Problem, iters: usize) -> f64 {
         mu = n0;
         if n0 == 0.0 {
             break;
+        }
+        if std::env::var("FS_DEBUG").is_ok() && it % 25 == 0 {
+            eprintln!("  power iteration {it}: dt^2 lambda {mu:.4}");
         }
     }
     mu
@@ -1313,5 +1355,67 @@ mod probe_tests {
                 println!("  row {m:+}: Ey kappa' {ke:7.3} (DM {:6.3})  Hz kappa {kh:7.3} (DM {fo:5.3})  Ez kappa' {kz:7.3}  Hy kappa {ky:7.3}", if fo > 0.0 { 1.0 / fo } else { f64::NAN });
             }
         }
+    }
+}
+
+/// Diagnostic: run port `port` for `steps` on the CPU, then list the field components holding the most
+/// energy (E^2 and eta^2 H^2), with their position and whether the edge code corrected them.
+pub fn diag(p: &crate::model::Problem, port: usize, steps: usize, top: usize) {
+    use crate::fdtd::*;
+    let mut s = CpuState::new(p);
+    let exc = gauss_excite(0.0, 8e9, p.dt);
+    for n in 0..steps {
+        update_h(p, &mut s);
+        hcorr_update(p, &mut s);
+        pml_h(p, &mut s);
+        disp_save(p, &mut s);
+        update_e(p, &mut s);
+        pml_e(p, &mut s);
+        if n < exc.len() {
+            for &(c, id, g) in &p.ports[port].src {
+                s.e[c as usize][id as usize] += g * exc[n];
+            }
+        }
+        disp_update(p, &mut s);
+        cond_update(p, &mut s);
+        if n % 2000 == 0 {
+            eprintln!("step {n}: energy {:.3e}", energy(&s));
+        }
+    }
+    let eta2 = (crate::model::ETA0 * crate::model::ETA0) as f32;
+    let mut all: Vec<(f32, u8, usize)> = Vec::new();
+    for c in 0..3 {
+        for id in 0..p.n() {
+            let e = s.e[c][id] * s.e[c][id];
+            let h = s.h[c][id] * s.h[c][id] * eta2;
+            if e > 0.0 {
+                all.push((e, c as u8, id));
+            }
+            if h > 0.0 {
+                all.push((h, 3 + c as u8, id));
+            }
+        }
+    }
+    all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    let tot: f64 = all.iter().map(|x| x.0 as f64).sum();
+    let hc: Vec<u32> = p.hcorr.as_ref().map(|h| h.ids.clone()).unwrap_or_default();
+    let (nx, ny) = (p.nx, p.ny);
+    println!("total {tot:.3e}; top {top}:");
+    for &(v, c, id) in all.iter().take(top) {
+        let (i, j, k) = (id % nx, (id / nx) % ny, id / (nx * ny));
+        let g = &p.grid;
+        let corr = if c >= 3 { hc.binary_search(&(id as u32 | ((c as u32 - 3) << 30))).is_ok() } else { false };
+        let cb = if c < 3 { p.cb[c as usize][id] } else { 0.0 };
+        println!(
+            "  {:5.2} %  {}{}  ({i}, {j}, {k}) = ({:.3}, {:.3}, {:.3}) mm  {}{}",
+            100.0 * v as f64 / tot,
+            if c < 3 { "E" } else { "H" },
+            ["x", "y", "z"][c as usize % 3],
+            g.x[i] * 1e3,
+            g.y[j] * 1e3,
+            g.z[k] * 1e3,
+            if corr { "H corrected " } else { "" },
+            if c < 3 { format!("cb {cb:.3e}") } else { String::new() }
+        );
     }
 }

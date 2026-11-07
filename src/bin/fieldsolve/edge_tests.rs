@@ -43,9 +43,43 @@ fn edge_corrections_touch_the_rotated_strip() {
     assert!(opened > 10, "opened {opened}");
     let changed = (0..3).map(|a| (0..p.n()).filter(|&i| p0.cb[a][i] != 0.0 && (p.cb[a][i] / p0.cb[a][i] - 1.0).abs() > 1e-3).count()).sum::<usize>();
     assert!(changed > 50, "changed {changed}");
-    // nothing becomes metal that was not
-    let added = (0..3).map(|a| (0..p.n()).filter(|&i| p0.cb[a][i] != 0.0 && p.cb[a][i] == 0.0).count()).sum::<usize>();
-    assert_eq!(added, 0);
+    // metal is added only to close slivers: every metal in-plane edge joins nodes the plain raster already
+    // connected, so no two pieces of copper merge
+    let (nx, ny) = (p.nx, p.ny);
+    let k = mesh::snap(&p.grid.z, 0.4e-3);
+    let mut lab: Vec<u32> = (0..(nx * ny) as u32).collect();
+    fn find(l: &mut [u32], mut a: u32) -> u32 {
+        while l[a as usize] != a {
+            a = l[a as usize];
+        }
+        a
+    }
+    for j in 1..ny - 1 {
+        for i in 1..nx - 1 {
+            let id = (k * ny + j) * nx + i;
+            for (a, o) in [(0usize, 1usize), (1, nx)] {
+                if p0.cb[a][id] == 0.0 {
+                    let q = j * nx + i;
+                    let (ra, rb) = (find(&mut lab, q as u32), find(&mut lab, (q + o) as u32));
+                    lab[ra.max(rb) as usize] = ra.min(rb);
+                }
+            }
+        }
+    }
+    let mut added = 0;
+    for j in 1..ny - 1 {
+        for i in 1..nx - 1 {
+            let id = (k * ny + j) * nx + i;
+            for (a, o) in [(0usize, 1usize), (1, nx)] {
+                if p.cb[a][id] == 0.0 && p0.cb[a][id] != 0.0 {
+                    added += 1;
+                    let q = j * nx + i;
+                    assert_eq!(find(&mut lab, q as u32), find(&mut lab, (q + o) as u32), "added metal joins two pieces at ({i}, {j})");
+                }
+            }
+        }
+    }
+    eprintln!("{opened} opened, {added} closed, {changed} changed");
 }
 
 #[test]
@@ -173,4 +207,19 @@ fn microstrip_edges_off_the_mesh() {
     eprintln!("none: Z0 {:+.2} % eps {:+.2} %; both: Z0 {:+.2} % eps {:+.2} %", 100.0 * en.0, 100.0 * en.1, 100.0 * eb.0, 100.0 * eb.1);
     assert!(en.1 > 0.05, "the staircase should be visibly off ({:+.3})", en.1);
     assert!(eb.1.abs() < 0.01 && eb.0.abs() < 0.01, "corrected line off: Z0 {:+.3} eps {:+.3}", eb.0, eb.1);
+}
+
+#[test]
+#[ignore]
+fn late_time_decay_with_absorber() {
+    // diagnostic: late-time energy decay rate with and without corrections, CPML on all sides
+    for eo in [None, Some(EdgeOpts::default())] {
+        let p = problem(eo.clone(), None, 6);
+        let exc = fdtd::gauss_excite(0.0, 10e9, p.dt);
+        let spec = fdtd::RunSpec { excite: Some(0), exc, max_steps: 60_000, end_db: -300.0, check_every: 200, ..Default::default() };
+        let r = fdtd::run_cpu(&p, &spec);
+        let d = fdtd::energy_decay(&r.energy, p.dt, 3e9);
+        let tail: Vec<String> = r.energy.iter().rev().step_by(25).take(8).map(|e| format!("{}:{:.2e}", e.0, e.1)).collect();
+        eprintln!("edges {}: decay {:?}; energy {:?}", eo.is_some(), d, tail);
+    }
 }

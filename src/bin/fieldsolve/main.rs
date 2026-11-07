@@ -54,6 +54,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     match cmd {
+        "edge-diag" => {
+            // where the late-time energy sits: edge-diag SPEC [steps] [top]
+            let (mut cx, _) = sim::load(std::path::Path::new(&args[2])).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let p = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let steps = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(20000);
+            let top = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(30);
+            edge::diag(&p, 0, steps, top);
+        }
         "octree-count" => {
             // step-3 estimate: octree cells vs the rectilinear mesh for a spec's board. octree-count SPEC [r]
             let (mut cx, _) = sim::load(std::path::Path::new(&args[2])).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
