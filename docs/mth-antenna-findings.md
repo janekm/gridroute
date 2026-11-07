@@ -67,8 +67,13 @@ RF path, as populated:
     (`"mesh": {"no_slivers": true, "z_grade": 3.0}`).
   - 12.1 M cells; all seven excitations took 30 minutes on an M3 Max.
 - **Stack-up:** one 0.73 mm FR4 core (εr 4.5, tan δ 0.015, wideband Debye fit) between 35 µm copper.
-  The order notes give the finished thickness but not the laminate, so εr is assumed. Copper loss is
-  included.
+  The order notes give the finished thickness but not the laminate, so εr is assumed.
+- **Copper loss is not properly modelled here.** These runs used `"loss": {"copper": true}`, a plane-pair
+  stand-in that adds about δ_s/h to the core's tan δ and leaves the copper itself lossless. The
+  surface-impedance model (`"conductor": true`, now part of `"preset": "antenna"`) wasn't used. The
+  efficiencies below are therefore for lossless copper plus a little extra dielectric loss, probably a few
+  points optimistic. The ladder ranking shouldn't change. See
+  [fieldsolve-settings.md](fieldsolve-settings.md).
 - **Ports:** the chip pin (H23 to the F23 ground ball), each ladder part, R70 and the C20 pads. Twelve
   decoupling capacitors near the chip are modelled as shorts. `fieldsolve cosim` places measured parts
   on the ports: Murata GRM1555 for the Fenghua capacitors, which have no published data, and the exact
@@ -185,6 +190,8 @@ candidates in about a minute.
     overstate copper loss near the antenna. The absolute scores above may then be 0.3-0.5 dB
     pessimistic.
   - The ranking of the ladder options is the same on both meshes.
+- **Copper loss used the plane-pair stand-in, not the surface-impedance model** (see Model). Re-run with
+  `"preset": "antenna"` before quoting absolute efficiencies.
 - **The Fenghua capacitors are modelled with Murata data.**
 - **The chip's optimum load** is taken as Nordic's measured target. How far off it is in band is
   examined in [1bp-rf-findings.md](1bp-rf-findings.md).
@@ -214,8 +221,10 @@ replaces it, and it reached the same recommended direction.
   61a45cb); without them the run still works, but the results differ (see Caveats). The spec:
   - `"gerbers"` the KiCad conversion's `fabrication/gerbers`, `"coords": "kicad"`, `"extent": "board"`;
   - ROI `[141.5, 70, 159.6, 87.5]`, which must cover all antenna copper; cell 0.05; air 15 mm;
-  - `"edges": true`, `"mesh": {"no_slivers": true, "z_grade": 3.0}`;
-  - `"dielectrics": [{"t": 0.73, "er": 4.5, "tand": 0.015}]`, and wideband loss with copper;
+  - `"preset": "antenna"` (wideband loss, surface-impedance copper, edges, mesh refinement, whole
+    board). The runs above predate the preset and used `"edges"`, `"mesh"`, `"extent": "board"` and
+    `"loss": {"model": "wideband", "copper": true}`, the plane-pair stand-in;
+  - `"dielectrics": [{"t": 0.73, "er": 4.5, "tand": 0.015}]`;
   - ports `CHIP` U12.H23→U12.F23, `C59` .2→.1, `L4` .1→.2, `C60` .2→.1, `L5` .1→.2, `R70` .2→.1,
     `C20` .1→.2;
   - decoupling shorts on C5-C8, C12, C15, C16, C23, C24, C29, C30, C40;

@@ -5,6 +5,10 @@ output the router flow already produces (copper with X2 net/pad attributes, Exce
 stack-up), meshes a region of interest and computes port impedances, S-parameters, loop inductance and
 field snapshots. It runs on the CPU (rayon) or on Apple GPUs (Metal); both give the same numbers.
 
+> **Before writing a spec, read [fieldsolve-settings.md](fieldsolve-settings.md).** It covers which keys
+> to set for which job, the `"preset": "antenna"` / `"rf"` defaults, the warnings every run prints, and
+> the mistakes that have already cost results.
+
 Typical checks:
 
 - **Decoupling loop inductance.** Put a port at an IC power pin, short (or load) the decoupling capacitor,
@@ -57,8 +61,8 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   fitted by NNLS. εr is matched at `f_ref`. The fit is flat to about 1 % over the band (`disp.rs`). The poles
   run as auxiliary-current ADEs on the edges in dielectric, on the CPU and in the fused Metal kernels.
   `"copper": true` adds the plane-pair copper loss of each slab as an extra tan δ of about δ_s/h (skin depth
-  over slab thickness, rising as √f). That is a stand-in for conductor loss between planes only; use
-  `"conductor"` (below) instead.
+  over slab thickness, rising as √f). That is a stand-in for conductor loss between planes only. The copper
+  itself stays lossless, and the run prints a warning. Use `"conductor"` (below) instead.
 - **Conductor loss.** `"conductor": {"sigma": 5.8e7, "roughness_um": 1.0}` (or `true` for these defaults)
   gives every copper sheet edge a surface impedance instead of a perfect conductor (`cond.rs`). For a
   conductor of thickness t with current on one face, Z_s = k/σ · coth(kt), k = (1 + j)/δ: 1/(σt) at DC and

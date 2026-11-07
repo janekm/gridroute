@@ -52,6 +52,11 @@ CC0402BRNPO9BN1R2 (1.2 pF). Nordic's BOM names only values. The cases:
 Model settings, the same for every case:
 - 0.05 mm mesh along the RF path, graded outside it;
 - wideband FR4 (Debye fit, tan delta 0.015, flat over 0.3-10 GHz);
+- copper lossless, except the plane-pair stand-in `"loss": {"copper": true}`: about δ_s/h is added to the
+  dielectric's tan δ. The surface-impedance model (`"conductor"`) came later and was used only in the
+  config 1 checks below. The four layouts share the same model, so the H2 comparison between them stands.
+  Absolute efficiencies are a few points optimistic (see
+  [fieldsolve-settings.md](fieldsolve-settings.md));
 - far field from a Huygens box in 12-15 mm of air;
 - each part a measured model terminating its own EM port (`fieldsolve cosim`);
 - harmonics given per watt into the chip port.

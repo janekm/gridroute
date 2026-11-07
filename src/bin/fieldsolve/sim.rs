@@ -15,8 +15,12 @@
 //!   "excite": "all" | ["VDD"], "l_band": [10e6, 100e6],
 //!   "fields": {"freqs": [2.4e9]},
 //!   "farfield": {"freqs": [2.44e9], "step_deg": 5, "gap": 3},
-//!   "extent": "board", "decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}] }
+//!   "extent": "board", "decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}],
+//!   "preset": "antenna" | "rf", "loss": {"model": "wideband"}, "conductor": true, "edges": true,
+//!   "mesh": {"no_slivers": true, "z_grade": 3.0}, "refine": [...], "coarse_copper_ok": [[x0, y0, x1, y1]] }
 //! ```
+//! Which keys to use, and the traps: docs/fieldsolve-settings.md. Every run prints the resolved model and
+//! warnings (presets.rs) and records them in result.json "settings" / "checks".
 //! A pad reference is `REF.PIN` (from the Gerber X2 `.P` attributes); a point is `[x, y]`.
 
 use crate::fdtd::{gauss_excite, RunResult, RunSpec};
@@ -159,6 +163,8 @@ pub struct Setup {
     /// extra refinement boxes from the spec's `"refine"` (fidelity protection): (x0, y0, x1, y1 in the
     /// spec's coordinates, mm; cell mm; what)
     pub refined: Vec<([f64; 4], f64, String)>,
+    /// set-up warnings (presets.rs: settings that are known traps, narrow copper in coarse cells)
+    pub checks: Vec<String>,
 }
 
 /// Partial self-inductance (nH) of a thin flat strip, length l and width w in mm (Grover, t = 0):
@@ -492,6 +498,51 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     // keep only fixed lines that fall inside the domain
     gx.dedup();
     gy.dedup();
+    // known traps in the settings, and narrow copper left in coarse cells next to the fine region
+    let mut checks = crate::presets::spec_checks(&sp);
+    if extent_board {
+        // "coarse_copper_ok": [[x0, y0, x1, y1], ...] marks areas reviewed as not carrying RF current (spec
+        // coordinates); clusters inside one are not reported
+        let ok: Vec<BBox> = sp
+            .get("coarse_copper_ok")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        let r = r.as_array()?;
+                        let (p, q) = (cx.pt(r.first()?.as_f64()?, r.get(1)?.as_f64()?), cx.pt(r.get(2)?.as_f64()?, r.get(3)?.as_f64()?));
+                        Some(BBox { x0: p.x.min(q.x), y0: p.y.min(q.y), x1: p.x.max(q.x), y1: p.y.max(q.y) })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let found: Vec<_> = crate::presets::coarse_copper(&sheets, &gx, &gy, &roi, &dom, cell, 2.5 * cell, 1.0, 8.0)
+            .into_iter()
+            .filter(|c| !ok.iter().any(|o| o.x0 <= c.1.x0 && o.y0 <= c.1.y0 && o.x1 >= c.1.x1 && o.y1 >= c.1.y1))
+            .collect();
+        if !found.is_empty() {
+            let list: Vec<String> = found
+                .iter()
+                .take(6)
+                .map(|(l, b, a, h)| {
+                    let (p, q) = (cx.pt(b.x0, b.y0), cx.pt(b.x1, b.y1));
+                    format!("{l} x {:.2}-{:.2} y {:.2}-{:.2} ({a:.1} mm², cells up to {h:.2} mm)", p.x.min(q.x), p.x.max(q.x), p.y.min(q.y), p.y.max(q.y))
+                })
+                .collect();
+            checks.push(format!(
+                "narrow copper (traces, meanders, antenna arms) in cells coarser than {:.3} mm next to the fine region: {}{}. \
+                 If any of it carries RF current (antenna, feed, matching), extend \"roi\" to cover it or add a \"refine\" box; \
+                 list areas you have checked in \"coarse_copper_ok\".",
+                2.5 * cell,
+                list.join("; "),
+                if found.len() > 6 { format!("; and {} more", found.len() - 6) } else { String::new() }
+            ));
+        }
+    }
+    eprintln!("fieldsolve: {}", crate::presets::summary(&sp).1);
+    for c in &checks {
+        eprintln!("fieldsolve: WARNING: {c}");
+    }
     let grid = Grid { x: gx.iter().map(|v| v * 1e-3).collect(), y: gy.iter().map(|v| v * 1e-3).collect(), z: gz.iter().map(|v| v * 1e-3).collect() };
 
     // second pass: lumped boxes on the mesh; bridges as copper
@@ -717,6 +768,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         port_stop: sp.get("stop").and_then(|v| v.as_str()).unwrap_or("ports") != "energy",
         bars,
         refined,
+        checks,
     })
 }
 
@@ -830,6 +882,8 @@ pub type Backend<'a> = &'a dyn Fn(&Problem, &RunSpec) -> RunResult;
 /// What to run on a set-up: which ports to excite (names, or all), field snapshot frequencies, L-fit band.
 #[derive(Clone, Debug, Default)]
 pub struct RunOpts {
+    /// the resolved model (presets::summary), recorded in result.json "settings"
+    pub settings: Value,
     pub excite_all: bool,
     pub excite: Vec<String>,
     pub fields: Vec<f64>,
@@ -963,6 +1017,7 @@ impl ObjectiveOpts {
 impl RunOpts {
     pub fn from_spec(spec: &Value) -> RunOpts {
         RunOpts {
+            settings: crate::presets::summary(spec).0,
             excite_all: spec.get("excite").and_then(|v| v.as_str()) == Some("all"),
             excite: spec.get("excite").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
             fields: spec.pointer("/fields/freqs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default(),
@@ -1277,6 +1332,8 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
         "port_names": names, "port_bars": st.bars.iter().map(|b| json!({"name": b.0, "gap_mm": b.1, "width_mm": b.2, "l_gap_nh": b.3})).collect::<Vec<_>>(), "z_matrix": zmat_out, "mesh_shorts": bridge_lines, "farfield": far_summary, "port_power_balance": balance_out,
     });
     let mut res = res;
+    res["settings"] = ro.settings.clone();
+    res["checks"] = json!(st.checks);
     res["fidelity"] = crate::fidelity::finish_record(&ro.fidelity, &res);
     if let Some(f) = res["fidelity"].as_object() {
         eprintln!("fieldsolve: fidelity {} ({} cells, dt {:.3e} s, stops {:?}), objective worst {:.2} dB, stability {:?} dB",
@@ -1289,6 +1346,8 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
 pub fn load(spec_path: &Path) -> Result<(Ctx, PathBuf), String> {
     let txt = std::fs::read_to_string(spec_path).map_err(|e| format!("{}: {e}", spec_path.display()))?;
     let spec: Value = serde_json::from_str(&txt).map_err(|e| format!("{}: {e}", spec_path.display()))?;
+    // "preset": "rf" | "antenna" fills the recommended model settings the spec leaves out (presets.rs)
+    let spec = crate::presets::apply(spec)?;
     let base = spec_path.parent().unwrap_or(Path::new("."));
     let gdir = base.join(spec.get("gerbers").and_then(|v| v.as_str()).ok_or("spec needs \"gerbers\"")?);
     let out = base.join(spec.get("out").and_then(|v| v.as_str()).unwrap_or("fieldsolve-out"));

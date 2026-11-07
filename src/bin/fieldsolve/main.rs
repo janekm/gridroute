@@ -24,6 +24,7 @@ mod octree;
 mod tune;
 mod extrap;
 mod optimise;
+mod presets;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;
 
