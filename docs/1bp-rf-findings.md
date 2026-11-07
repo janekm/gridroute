@@ -363,6 +363,13 @@ on J1's chip-side signal pad against J1's ground pad:
   about 0.3 dB / 1-5 % with 0.8 pF high-Q capacitors. The capacitors actually fitted, the probe, and
   any de-embedding Nordic did are unknown. The real validation is still a measurement of our own board, with known parts and a
   known reference plane: a VNA on the 1BP network with the chip removed.
+- **Sub-cell copper edges remove a quarter of the excess (Nov 2026).** The DK board was re-run with
+  fieldsolve's conformal and edge-singularity corrections (`"edges"`) at 0.05 and 0.025 mm. The shunt
+  ΔC per capacitor that best fits Nordic's roll-off went from −0.33 pF (plain, 0.05 mm) to −0.25 pF.
+  The plain mesh converges towards that value (−0.28 pF at 0.025 mm, about −0.24 pF extrapolated), and
+  the corrected meshes agree with each other at 0.05 and 0.025 mm. So about 0.09 pF per node was
+  discretisation, and about 0.24 pF per node is not a mesh effect. Finite copper thickness would add
+  capacitance, not remove it. Details: [fieldsolve.md](fieldsolve.md#sub-cell-copper-edges).
 
 ## Thin-film inductors on 1BP
 

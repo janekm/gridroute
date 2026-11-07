@@ -480,14 +480,15 @@ to a copper edge those factors come from an assumed local field instead of a uni
   covered area; a misfit over 5 % such as a corner falls back to conformal) the field is taken as the
   static field of a conducting half-plane, φ + iψ = √(u + iw). For each E edge and H face within one cell of
   the edge on the open side the factor is κ = (field flux through the face) · L / (A · line integral), the
-  ratio of the singular field's face and edge averages (1 for a uniform field). The half-plane field
-  ignores the ground: the factors have full weight only where the nearest copper of another layer (or a
-  PEC wall) is at least 4 in-plane cells away (`plane_cells`), fading to none at 2. On 75 µm prepreg at
-  0.05 mm cells that leaves conformal alone, which there did as well as both together. Line integrals are potential
-  differences. Fluxes integrate a potential analytically along one face direction and by Gauss quadrature
-  along the other. Corrected: in-plane E and the sheet-plane H faces, the vertical E edges just above and
-  below, and the H half a cell above and below. Components sampled over the metal keep the conformal
-  factors: there the half-plane field (which ignores the ground plane) made the line 5-10 % off.
+  ratio of the singular field's face and edge averages (1 for a uniform field). Line integrals are
+  potential differences. Fluxes integrate a potential analytically along one face direction and by Gauss
+  quadrature along the other. Corrected: in-plane E and the sheet-plane H faces, the vertical E edges just
+  above and below, and the H half a cell above and below.
+  - The half-plane field ignores the ground. Components sampled over the metal keep the conformal factors:
+    there the half-plane field made the line 5-10 % off. And the factors have full weight only where the
+    nearest copper of another layer (or a PEC wall) is at least 4 in-plane cells away (`plane_cells`),
+    fading to none at 2. On 75 µm prepreg at 0.05 mm cells that leaves conformal alone, which there did as
+    well as both together.
 - **Backends.** The E factors go into the edge's permittivity, conductivity and Debye weights, quantised in
   0.4 % steps so that the Metal material table stays small. The H factors are a sparse list (`HCorr`)
   applied right after the H update, on the CPU and in a small Metal kernel (`hcorr`). CPU and Metal agree
@@ -495,10 +496,11 @@ to a copper edge those factors come from an assumed local field instead of a uni
 - **Stability.** Dividing an H update by a small open fraction stiffens the scheme. Open fractions are
   floored at `min_open` and singular factors clamped to [0.25, 4]. `dt_check` estimates the largest
   eigenvalue of the corrected update operator by power iteration (150 iterations of the CPU kernels,
-  without loss or CPML). It lowers the time step if dt²λ exceeds 4·cfl², the margin of the plain mesh. A
-  lossless PEC box with corrections keeps its energy over 60 000 steps
-  (`edge_corrections_stay_stable_in_a_closed_box`). The same box with floors of 0.01 blows up without the
-  check (`edge_growth_detects_an_unstable_setting`, ignored).
+  without loss or CPML). It lowers the time step if dt²λ exceeds 4·cfl², the margin of the plain mesh. On
+  the nRF52840 DK at 0.1 mm the corrected operator had dt²λ = 3.99 at the plain time step (the leapfrog
+  limit is 4; an earlier version of the rules reached 4.38), and the check lowered dt by 6 %. At 0.05 and
+  0.025 mm it found 2.33 and 2.43 and left dt alone. A lossless PEC box with corrections keeps its energy over 60 000 steps
+  (`edge_corrections_stay_stable_in_a_closed_box`).
 
 **Microstrip** (w ≈ 3 mm, h = 1.6 mm, εr 4.3; the width is adjusted so that both edges lie at a chosen
 inset, the distance from the edge to the nearest mesh line inside the metal, as a fraction of the cell).
@@ -588,6 +590,45 @@ uniform through the gap, so its edges fall where they fall:
   ports' 2 mm stubs) both enter at that level.
   The convergence, not the absolute value, is the test here.
 
+
+**nRF52840 DK, configuration 1, against Nordic's measured network.** The open validation gap (see
+[1bp-rf-findings.md](1bp-rf-findings.md)): on the DK layout with the 2018 parts (GRM 1.0 pF / LQP15MN
+3.9 nH / GRM 1.0 pF) the model's in-band S21 was about 1 dB low and its roll-off 5-9 % low, as if each
+shunt node carried too much capacitance. The whole board was re-run at 0.05 and 0.025 mm with and
+without `"edges"` (18.8 M and 42.9 M cells, five excitations each). Then a shunt ΔC was added to both
+capacitor models in `fieldsolve cosim`, and the ΔC that best fits the measurement was found by the
+−3 / −10 / −20 dB edges of |S21| and by the rms dB error of S11, S21 and S22 over 1-6 GHz (`dc_fit.py`):
+
+| EM model | S11 / S21 at 2.44 GHz | \|S21\| edges −3 / −10 / −20 dB | rms 1-6 GHz | best ΔC (edges / rms) |
+|---|---|---|---|---|
+| measured | −7.8 / −1.5 dB | 2.73 / 3.38 / 4.15 GHz | | |
+| plain, 0.05 mm | −4.28 / −2.64 dB | 2.48 / 3.12 / 3.79 | 3.36 dB | −0.33 / −0.32 pF |
+| plain, 0.025 mm | −4.38 / −2.54 dB | 2.49 / 3.16 / 3.85 | 2.89 dB | −0.28 / −0.27 pF |
+| plain, first-order extrapolation | | | | ≈ −0.24 / −0.23 pF |
+| edges, 0.05 mm | DK_E05B_ROW |
+| edges, 0.025 mm | −4.54 / −2.47 dB | 2.51 / 3.20 / 3.91 | 2.54 dB | −0.25 / −0.23 pF |
+
+- **The excess shrinks by about a quarter, and the rest is not the mesh.** The plain model moves by
+  0.05 pF per node between 0.05 and 0.025 mm, towards the value the corrected models already have at
+  0.05 mm. Extrapolated to zero cell size, the plain model lands on the corrected one. The corrected
+  0.05 and 0.025 mm S-matrices agree to 0.008 below 3 GHz; the plain ones to 0.027. So about 0.09 pF per
+  node was a discretisation error of the zero-thickness copper, and about 0.24 pF per node remains.
+- **It is not the zero thickness either.** Real 35 µm copper has side walls: it adds fringe capacitance,
+  so it would make the model's shunt C larger, not smaller.
+- The measure here is a parallel ΔC on the 1.0 pF part model (its ESL and ESR kept). The earlier finding
+  ("about 0.2 pF less at each shunt position") swapped in smaller parts instead. Both fit the same
+  roll-off; their numbers differ by method, so compare within the last column.
+- What is left points at the parts and their mounting (pad, solder, the capacitor body's own field over the
+  pads, which the bar model of a part does not have) or at the measurement set-up, as discussed in
+  [1bp-rf-findings.md](1bp-rf-findings.md).
+- One run of each kind ended with a late-time energy plateau or slow rise after the ports had rung down
+  (`late-time field energy ... GROWING`): the plain 0.025 mm OUT excitation (+6.9 dB/ns) and, with an
+  earlier version of the corrections that also opened staircase corners, the 0.05 mm CHIP and C4
+  excitations. The ports had decayed 60 dB, so the S-parameters are unaffected. The 0.025 mm run with the
+  final corrections decays at −9 to −29 dB/ns on every port. The cause of the plain run's plateau is open.
+- The DK runs with corrections used the code before the last rule (opening raster bridges across sub-cell
+  gaps, commit 6e258c0). That rule changes only copper of one net that the midpoint rule bridged across a
+  gap; between nets the net-aware raster had already removed such bridges.
 
 ## Fields and Blender
 

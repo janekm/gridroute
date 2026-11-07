@@ -132,6 +132,12 @@ smallest cell.
   with both corrections, 4 cells across the substrate give εeff within 0.73 % and C within 2.3 % rms. Without
   them, 4 cells are 18 % out in εeff, and even 16 cells are 4.9 % out. See
   [fieldsolve.md](fieldsolve.md#sub-cell-copper-edges) for the tables.
+- **Where the corrections stop helping.** A 0.3 mm trace on 75 µm prepreg at 0.05 mm cells (1.5 cells
+  across the substrate, as on the nRF52840 DK) keeps ±8 % in C after the corrections: the strip is only 6
+  cells wide and the field under it 1.5 cells high. There the answer is finer cells around that trace,
+  which is exactly what refinement by net (below) gives without refining the whole window. A 45° trace keeps
+  a staircased current path at 0.2 mm (εeff +5 %), which again asks for local refinement, not a different
+  solver.
 - **Where an octree would save.** `fieldsolve octree-count spec.json` estimates the cells of a
   geometry-driven octree on a board's mesh. In-plane, cell size grows as h₀ + (r − 1)·d with the distance d
   from the nearest copper edge. In z it grows with the distance from the nearest copper plane, never finer

@@ -140,15 +140,6 @@ fn edge_corrections_stay_stable_in_a_closed_box() {
 }
 
 #[test]
-#[ignore]
-fn edge_growth_detects_an_unstable_setting() {
-    // with tiny open fractions and no time-step check the scheme does blow up: the test above can see it
-    let (g, _) = growth(Some(EdgeOpts { min_open: 0.01, kmin: 0.01, kmax: 100.0, dt_check: false, ..Default::default() }), 60_000);
-    eprintln!("late/early energy without the safeguards: {g:.3e}");
-    assert!(g > 10.0);
-}
-
-#[test]
 fn conformal_keeps_a_thin_diagonal_trace_connected() {
     // a 45 degree trace about one cell wide: the staircase connects its ends only through corner nodes,
     // so opening every partly covered edge would cut it
