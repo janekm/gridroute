@@ -298,7 +298,18 @@ resonance (late-time Q 70-80): uncorrected at 2.25 GHz (81 % against 92 % around
 corrections at 2.40 GHz (77 %). Away from it the port and energy stops agree within 1-2 points; the
 energy stop only sharpens the dip. With `"conductor": true` (surface-impedance copper) instead of the
 stand-in, limited corrections and none agree within 1.5 points over 2.40-2.50 GHz (84.6 / 82.1 / 82.4 %
-and 84.8 / 83.5 / 81.0 % at 2.40 / 2.45 / 2.50), both with the dip at 2.25 GHz. The resonance lives on the
-coarse board mesh, so its frequency is uncertain by several percent either way: single-frequency
+and 84.8 / 83.5 / 81.0 % at 2.40 / 2.45 / 2.50), both with the dip at 2.25 GHz.
+
+The resonance is two signal tracks, not a pour gap. A field export at 2.40 GHz (the unlimited-edges run, on
+resonance) against 2.44 GHz puts the extra energy and the F.Cu surface current along P1_04 (a 0.15 mm
+track, 24.7 mm from U12 ball U24 at the nRF52840 to H5 pin 12) and the parallel SWDCLK 0.48 mm beside it
+(about 32 mm, U12 AA24 to H5 pin 6, with a short B.Cu jog), over the B.Cu plane. In the model both ends are
+open: U12 is not modelled, and H5's round pads add capacitance at the far end. For lengths of 25-32 mm a
+half-wave resonance near 2.3 GHz needs an effective permittivity of about 4, more than a bare 0.15 mm line
+on this FR4 (about 3), so the pad loading and the coupling between the two tracks probably pull it down. The tracks run along y
+in the band beside the ROI where x is 0.05 mm but y is 1.48 mm, so their ends, bends and pads snap by up to
+0.7 mm along the line; the unlimited fractions there changed that further. On the real board the GPIO and
+SWD pins load the ends with a few pF, so this resonance is a property of the model's open ends as much as of
+the layout. Its frequency is uncertain by several percent either way: single-frequency
 efficiencies near a band edge are better read from a dense frequency list, and a run whose field energy
 still decays slower than a few dB/ns at the stop has such a mode.
