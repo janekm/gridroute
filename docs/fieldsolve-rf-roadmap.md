@@ -77,6 +77,9 @@ Outputs per frontend:
   box, then PML. A rough size: 100 × 100 × 70 mm, 0.1 mm cells near the antenna graded to 3 mm, about
   10–15 M cells, 60–100 k steps, about 5–10 min on Metal. Matching-network optimisation needs no re-run
   (antenna port plus ports at the matching pads, F1/F2).
+  *First board done (Nov 2026):* MTH R7A's PCB PIFA in free space, whole board, with polar cuts
+  (`tools/polar_farfield.py`), 3-D patterns, and a ladder retune over real part values driven by `cosim`
+  (`tools/ladder_retune.py`). Write-up: [mth-antenna-findings.md](mth-antenna-findings.md).
 - **In an enclosure.** Add the housing STL (A2/A3), battery and display as metal, screws, and the other PCB.
   The usual effects are a resonance shift of 2–8 % downward, efficiency loss from housing tan δ and nearby
   metal, and pattern changes. Deliverables are S11, total efficiency and pattern with and without the
