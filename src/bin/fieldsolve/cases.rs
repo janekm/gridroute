@@ -288,7 +288,7 @@ pub fn port_loop_setup(cell: f64, footprint: bool, swap: bool) -> crate::sim::Se
         fmax: 3e9,
         end_db: -70.0,
         max_steps: 400_000,
-        port_stop: false, bars: vec![],
+        port_stop: false, bars: vec![], refined: vec![],
     }
 }
 
@@ -344,7 +344,7 @@ pub fn gap_setup(slot: bool, cell: f64, fmax: f64) -> crate::sim::Setup {
         fmax,
         end_db: -60.0,
         max_steps: 200_000,
-        port_stop: false, bars: vec![],
+        port_stop: false, bars: vec![], refined: vec![],
     }
 }
 
@@ -373,7 +373,7 @@ pub fn dipole_setup(len: f64, cell: f64, fmax: f64, air: f64) -> crate::sim::Set
         fmax,
         end_db: -60.0,
         max_steps: 100_000,
-        port_stop: false, bars: vec![],
+        port_stop: false, bars: vec![], refined: vec![],
     }
 }
 
