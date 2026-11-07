@@ -724,8 +724,10 @@ impl Gpu {
             freqs: spec.dft_freqs.clone(),
             data: dftb.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * n))).collect(),
         });
-        let gathered = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
-        Ok(RunResult { steps, v, probes: pv, fields, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: format!("metal ({})", dev.name()), stop: reason.into(), standard_stop: stop.standard.map(|(s, r)| (s, r.to_string())), objective: stop.ohist })
+        let mut gathered = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
+        let mut v = v;
+        stop.finish(reason, &mut v, &mut gathered);
+        Ok(RunResult { steps, v, probes: pv, fields, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: format!("metal ({})", dev.name()), stop: reason.into(), standard_stop: stop.standard.map(|(s, r)| (s, r.to_string())), objective: stop.ohist, objective_extrap: stop.xhist })
     }
 }
 

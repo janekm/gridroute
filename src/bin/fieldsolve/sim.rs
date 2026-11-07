@@ -778,6 +778,17 @@ pub fn raster_json(st: &Setup, p: &Problem) -> Value {
     json!({"metal": metal, "cells": cells})
 }
 
+/// Outline of a capsule (segment a-b of radius r): the cap around b on the far side from a, then the cap
+/// around a on the far side from b (13 points each).
+pub fn capsule_outline(a: P2, b: P2, r: f64) -> Vec<P2> {
+    let ang = (b.y - a.y).atan2(b.x - a.x);
+    let cap = |c: P2, from: f64| (0..=12).map(move |k| {
+        let t = from + k as f64 / 12.0 * std::f64::consts::PI;
+        P2::new(c.x + r * t.cos(), c.y + r * t.sin())
+    });
+    cap(b, ang - std::f64::consts::FRAC_PI_2).chain(cap(a, ang + std::f64::consts::FRAC_PI_2)).collect()
+}
+
 /// Scene file: exactly what was simulated, for an independent solver (tools/openems_scene.py).
 pub fn scene_json(st: &Setup, p: &Problem, exc_port: Option<usize>) -> Value {
     let poly = |p: &Prim| -> Vec<[f64; 2]> {
@@ -788,19 +799,7 @@ pub fn scene_json(st: &Setup, p: &Problem, exc_port: Option<usize>) -> Value {
                 let t = k as f64 / 32.0 * std::f64::consts::TAU;
                 P2::new(c.x + r * t.cos(), c.y + r * t.sin())
             }).collect(),
-            Shape::Capsule { a, b, r } => {
-                let ang = (b.y - a.y).atan2(b.x - a.x);
-                let mut v = Vec::new();
-                for k in 0..=12 {
-                    let t = ang + std::f64::consts::FRAC_PI_2 + k as f64 / 12.0 * std::f64::consts::PI;
-                    v.push(P2::new(b.x + r * t.cos(), b.y + r * t.sin()));
-                }
-                for k in 0..=12 {
-                    let t = ang - std::f64::consts::FRAC_PI_2 + k as f64 / 12.0 * std::f64::consts::PI;
-                    v.push(P2::new(a.x + r * t.cos(), a.y + r * t.sin()));
-                }
-                v
-            }
+            Shape::Capsule { a, b, r } => capsule_outline(*a, *b, *r),
         };
         pts.iter().map(|p| [p.x, p.y]).collect()
     };
@@ -859,6 +858,10 @@ pub struct ObjectiveOpts {
     pub tol_db: f64,
     pub window_periods: f64,
     pub min_settle_periods: f64,
+    /// Late-time extrapolation (`"extrapolate": true` or `{"snapshots": 10, "tol_db": 0.05,
+    /// "stable_checks": 4, "stop": true}`): the extrapolated objective is recorded at every check, and with
+    /// `stop` (the default) and the objective stop it can end the run early (see `extrap`).
+    pub extrapolate: Option<crate::extrap::Opts>,
 }
 
 impl ObjectiveOpts {
@@ -876,6 +879,22 @@ impl ObjectiveOpts {
             tol_db: num(o, "tol_db", 0.05),
             window_periods: num(o, "window_periods", 4.0),
             min_settle_periods: num(o, "min_settle_periods", 6.0),
+            extrapolate: match o.get("extrapolate") {
+                Some(Value::Bool(true)) => Some(crate::extrap::Opts { stop: true, ..Default::default() }),
+                Some(x @ Value::Object(_)) => {
+                    let d = crate::extrap::Opts::default();
+                    Some(crate::extrap::Opts {
+                        snapshots: num(x, "snapshots", d.snapshots as f64) as usize,
+                        window: num(x, "window", d.window as f64) as usize,
+                        order: num(x, "order", d.order as f64) as usize,
+                        tol_db: num(x, "tol_db", d.tol_db),
+                        stable_checks: num(x, "stable_checks", d.stable_checks as f64) as usize,
+                        stop: x.get("stop").and_then(|v| v.as_bool()).unwrap_or(true),
+                        ..d
+                    })
+                }
+                _ => None,
+            },
         })
     }
 
@@ -1091,6 +1110,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             objective_tol_db: ro.objective.as_ref().map(|o| o.tol_db).unwrap_or(0.0),
             objective_window: obj_window,
             min_steps: obj_min_steps,
+            extrap: ro.objective.as_ref().and_then(|o| o.extrapolate.clone()).map(|x| crate::extrap::Opts { dt: p.dt, decimate: dft_every, ..x }),
         };
         let r = backend(&p, &spec);
         eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s (set-up {:.2} s) on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.setup_seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
@@ -1154,6 +1174,10 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             run_json["objective_window_steps"] = json!(obj_window);
             run_json["objective_components"] = json!(comps);
             run_json["objective_history"] = json!(r.objective.iter().map(|(s, v)| json!([s, v.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>()])).collect::<Vec<_>>());
+            if o.extrapolate.is_some() {
+                run_json["objective_extrap_history"] = json!(r.objective_extrap.iter().map(|(s, v)| json!([s, v.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>()])).collect::<Vec<_>>());
+                run_json["extrapolated"] = json!(r.stop == "extrapolated");
+            }
             obj_hist[j] = Some((comps, r.objective.clone()));
         }
         runs.push(run_json);

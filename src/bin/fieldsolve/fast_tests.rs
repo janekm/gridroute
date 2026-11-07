@@ -195,3 +195,86 @@ fn optimise_solves_parameterised_specs_once() {
     assert_eq!(again["best"], r["best"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The scene export's capsule outline is convex: caps on the outer ends, area of a stadium (it once put
+/// both caps on the inner side, which bit half-discs out of every track end in drawings and in openEMS's
+/// polygon mode).
+#[test]
+fn capsule_outline_is_a_stadium() {
+    let (a, b, r) = (P2::new(1.0, 2.0), P2::new(4.0, 6.0), 0.25);
+    let v = sim::capsule_outline(a, b, r);
+    let area = 0.5 * (0..v.len()).map(|i| { let (p, q) = (v[i], v[(i + 1) % v.len()]); p.x * q.y - q.x * p.y }).sum::<f64>().abs();
+    let want = 5.0 * 2.0 * r + std::f64::consts::PI * r * r;
+    assert!((area - want).abs() < 0.01 * want, "area {area} vs {want}");
+    // every point lies on the capsule's boundary, and both ends reach out past a and b
+    let d = |p: P2| { let t = (((p.x - a.x) * 3.0 + (p.y - a.y) * 4.0) / 25.0).clamp(0.0, 1.0); ((p.x - a.x - 3.0 * t).powi(2) + (p.y - a.y - 4.0 * t).powi(2)).sqrt() };
+    assert!(v.iter().all(|&p| (d(p) - r).abs() < 1e-9));
+    let along = |p: P2| ((p.x - a.x) * 3.0 + (p.y - a.y) * 4.0) / 5.0;
+    assert!(v.iter().any(|&p| along(p) > 5.0 + 0.99 * r) && v.iter().any(|&p| along(p) < -0.99 * r));
+}
+
+/// A printed dipole 0.4 mm over a ground plane: a high-Q radiator that rings for many periods.
+fn ringing_dipole_spec(extra: serde_json::Value) -> (sim::Ctx, serde_json::Value) {
+    let pads = vec![rect(-0.6, -0.3, -0.1, 0.3, "A"), rect(0.1, -0.3, 0.6, 0.3, "B"), rect(-9.0, -0.3, -0.1, 0.3, "A"), rect(0.1, -0.3, 9.0, 0.3, "B")];
+    let mut spec = json!({"roi": [-10, -3, 10, 3], "cell": 0.3, "air": 6, "air_z": 6, "max_cell": 2.0, "pml": 6, "fmax": 8e9, "max_steps": 60000,
+                          "end_db": -80, "stop": "ports",
+                          "ports": [{"name": "P", "pos": "A.1", "neg": "B.1", "layer": "F.Cu"}],
+                          "farfield": {"freqs": [4.5e9, 5.0e9], "step_deg": 30},
+                          "objective": {"port": "P", "band": [4.5e9, 5.0e9]}});
+    for (k, v) in extra.as_object().unwrap() {
+        spec[k] = v.clone();
+    }
+    (ctx(pads, spec.clone()), spec)
+}
+
+fn run_ringing(extra: serde_json::Value, edit: impl Fn(&mut serde_json::Value), tag: &str, cpu: bool) -> serde_json::Value {
+    let (mut cx, mut spec) = ringing_dipole_spec(extra);
+    edit(&mut spec);
+    cx.spec = spec.clone();
+    let st = sim::setup(&mut cx).unwrap();
+    let mut ro = sim::RunOpts::from_spec(&spec);
+    ro.no_scene = true;
+    let dir = std::env::temp_dir().join(format!("fieldsolve-test-extrap-{tag}-{}", std::process::id()));
+    let be = crate::backend(&if cpu { vec!["--backend".to_string(), "cpu".to_string()] } else { vec![] });
+    let r = sim::run_setup(&st, &dir, &*be, &ro).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    r
+}
+
+/// Late-time extrapolation: on a high-Q radiator the run stops once the extrapolated objective is stable,
+/// at a fraction of the steps the port-decay rule needs, and the result (computed from the extrapolated
+/// port voltages and far-field accumulators) matches the long run's.
+#[test]
+fn extrapolated_stop_matches_a_long_run() {
+    // FIELDSOLVE_TEST_CPU=1 runs it on the CPU backend (slow, about 3 min)
+    let cpu = std::env::var("FIELDSOLVE_TEST_CPU").is_ok();
+    let long = run_ringing(json!({}), |_| {}, "long", cpu);
+    let fast = run_ringing(json!({"stop": "objective"}), |s| s["objective"]["extrapolate"] = json!(true), "fast", cpu);
+    let (rl, rf) = (&long["runs"][0], &fast["runs"][0]);
+    assert_eq!(rf["stop"], "extrapolated", "{}", rf["stop"]);
+    assert_eq!(rf["extrapolated"], true);
+    let (nl, nf) = (rl["steps"].as_u64().unwrap(), rf["steps"].as_u64().unwrap());
+    assert!(nf * 2 < nl, "extrapolated run took {nf} steps against {nl}");
+    for (a, b) in long["objective"]["per_f"].as_array().unwrap().iter().zip(fast["objective"]["per_f"].as_array().unwrap()) {
+        for k in ["total_db", "accepted_db", "s11_db"] {
+            let (x, y) = (a[k].as_f64().unwrap(), b[k].as_f64().unwrap());
+            eprintln!("{k} at {}: long {x:.4} vs extrapolated {y:.4} (steps {nl} vs {nf})", a["f"]);
+            assert!((x - y).abs() < 0.03, "{k} at {}: long {x:.4} vs extrapolated {y:.4} (steps {nl} vs {nf})", a["f"]);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn extrapolation_experiment() {
+    let r = run_ringing(json!({}), |s| s["objective"]["extrapolate"] = json!({"stop": false}), "exp", true);
+    let run = &r["runs"][0];
+    println!("cells {} steps {} stop {} comps {}", r["cells"], run["steps"], run["stop"], run["objective_components"]);
+    let raw = run["objective_history"].as_array().unwrap();
+    let ex = run["objective_extrap_history"].as_array().unwrap();
+    for h in raw.iter() {
+        let s = h[0].as_u64().unwrap();
+        let x = ex.iter().find(|e| e[0].as_u64() == Some(s)).map(|e| e[1].to_string()).unwrap_or_default();
+        println!("{s:6} raw {}  extrap {x}", h[1]);
+    }
+}

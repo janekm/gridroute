@@ -17,6 +17,7 @@ mod fidelity;
 mod sim;
 mod lines;
 mod tune;
+mod extrap;
 mod optimise;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;

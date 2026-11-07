@@ -52,6 +52,10 @@ pub struct RunSpec {
     pub objective_tol_db: f64,
     pub objective_window: usize,
     pub min_steps: usize,
+    /// Late-time extrapolation of the objective (`extrap`): recorded at every check after the source, and
+    /// with its `stop` (and `objective_stop`) the run ends once the extrapolated objective is stable; the
+    /// result then carries the extrapolated port voltages and gathered DFT.
+    pub extrap: Option<crate::extrap::Opts>,
 }
 
 /// Objective components from (steps so far, port voltages, gathered DFT).
@@ -111,6 +115,9 @@ pub struct StopState {
     pub ohist: Vec<(usize, Vec<f64>)>,
     /// With the objective stop: the first check at which the energy/port rules would have ended the run.
     pub standard: Option<(usize, &'static str)>,
+    /// Late-time extrapolation state and the extrapolated objective at each check where it was available.
+    pub x: crate::extrap::State,
+    pub xhist: Vec<(usize, Vec<f64>)>,
 }
 
 impl StopState {
@@ -133,6 +140,12 @@ impl StopState {
         let src_off = steps > spec.exc.len();
         if let Some(m) = &spec.objective {
             self.ohist.push((steps, (m.0)(steps, v, gathered)));
+            if let (Some(xo), Some(port)) = (&spec.extrap, spec.excite) {
+                if self.x.update(xo, steps, spec.exc.len(), port, v, gathered, &spec.gather_freqs, spec.dft_every) {
+                    let (vx, gx) = self.x.last.as_ref().unwrap();
+                    self.xhist.push((steps, (m.0)(steps, vx, gx)));
+                }
+            }
         }
         let standard = if gs && src_off && en <= self.peak * 10f64.powf(spec.end_db / 10.0) {
             Some("energy")
@@ -147,6 +160,17 @@ impl StopState {
             if self.standard.is_none() {
                 self.standard = standard.map(|r| (steps, r));
             }
+            // extrapolated: a full set of snapshots and the last few extrapolations agree
+            if let Some(xo) = spec.extrap.as_ref().filter(|x| x.stop) {
+                let n = self.xhist.len();
+                if src_off && self.x.snapshots() >= xo.snapshots && n >= xo.stable_checks && self.xhist.last().is_some_and(|h| h.0 == steps) {
+                    let w = &self.xhist[n - xo.stable_checks..];
+                    let spread = (0..w[0].1.len()).map(|c| w.iter().map(|h| h.1[c]).fold(f64::NEG_INFINITY, f64::max) - w.iter().map(|h| h.1[c]).fold(f64::INFINITY, f64::min)).fold(0.0, f64::max);
+                    if spread <= xo.tol_db {
+                        return Some("extrapolated");
+                    }
+                }
+            }
             // settled: every component within the tolerance over the whole window. The window must span
             // the slow parts of the approach: a geometric creep (the remaining change is below the
             // window's) and a beat against a slowly decaying resonance near the band (the window's spread
@@ -155,6 +179,19 @@ impl StopState {
             return settled.then_some("objective");
         }
         standard
+    }
+}
+
+impl StopState {
+    /// After a run stopped on the extrapolated objective: hand over the extrapolated port voltages and
+    /// gathered DFT, so that everything computed from the result uses them.
+    pub fn finish(&mut self, reason: &str, v: &mut Vec<Vec<f32>>, gathered: &mut Vec<[Vec<f32>; 6]>) {
+        if reason == "extrapolated" {
+            if let Some((vx, gx)) = self.x.last.take() {
+                *v = vx;
+                *gathered = gx;
+            }
+        }
     }
 }
 
@@ -242,6 +279,8 @@ pub struct RunResult {
     pub objective: Vec<(usize, Vec<f64>)>,
     /// With the objective stop: where the energy/port rules alone would have stopped (step, rule).
     pub standard_stop: Option<(usize, String)>,
+    /// With `RunSpec::extrap`: the extrapolated objective at each check where it was available.
+    pub objective_extrap: Vec<(usize, Vec<f64>)>,
 }
 
 /// Gaussian pulse as openEMS's `SetGaussExcite(f0, fc)`: centre `f0`, 20 dB half bandwidth `fc`.
@@ -678,7 +717,9 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
             }
         }
     }
-    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: "cpu".into(), stop: reason.into(), standard_stop: stop.standard.map(|(s, r)| (s, r.to_string())), objective: stop.ohist }
+    let (mut v, mut gathered) = (v, gathered);
+    stop.finish(reason, &mut v, &mut gathered);
+    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: "cpu".into(), stop: reason.into(), standard_stop: stop.standard.map(|(s, r)| (s, r.to_string())), objective: stop.ohist, objective_extrap: stop.xhist }
 }
 
 #[allow(unused)]
