@@ -17,7 +17,9 @@
 //!
 //! Every override is recorded (`"fidelity"` in result.json) together with the actual mesh, time step,
 //! excitation count, stop reasons and objective stability. Policy numbers can be overridden in the spec's
-//! `"fidelity"` object (`cell_scale`, `protect_margin`, `tol_db`, `window_periods`, `min_settle_periods`).
+//! `"fidelity"` object (`cell_scale`, `protect_margin`, `tol_db`, `window_periods`, `min_settle_periods`), and
+//! `"fidelity": {"set": {"screening": {"key": value}, ...}}` sets any spec key for one level: the hook for
+//! model corrections (edge singularity, conformal metal) that matter most on coarse cells.
 //! The measured accuracy of the default policies is in docs/fieldsolve-fast-mode.md.
 
 use serde_json::{json, Value};
@@ -128,6 +130,14 @@ pub fn resolve(spec: &Value, level: &str) -> Result<Value, String> {
         o["min_settle_periods"] = json!(pol.min_settle_periods);
         set(&mut s, &mut overrides, "objective", o, "stop rule parameters of the policy");
     }
+    // per-level spec switches, e.g. {"set": {"screening": {"conformal": true}}}: model corrections that help
+    // most on coarse cells (edge singularity, conformal metal) are switched on per level from the spec,
+    // without this module knowing their names; recorded like every other override
+    if let Some(m) = user.pointer(&format!("/set/{level}")).and_then(|v| v.as_object()) {
+        for (k, v) in m {
+            set(&mut s, &mut overrides, k, v.clone(), "per-level setting from the spec's fidelity.set");
+        }
+    }
     s["fidelity_record"] = json!({
         "level": level,
         "policy": {"cell_scale": pol.cell_scale, "protect_margin_mm": pol.protect_margin, "tol_db": pol.tol_db, "window_periods": pol.window_periods, "min_settle_periods": pol.min_settle_periods},
@@ -223,6 +233,14 @@ mod tests {
         assert_eq!(s["objective"]["tol_db"], json!(0.2));
         assert_eq!(s["fidelity_record"]["user_overrides"], json!(["cell_scale", "tol_db"]));
         assert!(resolve(&json!({"cell": 0.1}), "screening").is_err(), "no objective and no far field");
+        // per-level pass-through, recorded
+        let mut sp = spec();
+        sp["fidelity"]["set"] = json!({"screening": {"conformal": true}, "validated": {"conformal": false}});
+        let s = resolve(&sp, "screening").unwrap();
+        assert_eq!(s["conformal"], json!(true));
+        assert!(s["fidelity_record"]["overrides"].as_array().unwrap().iter().any(|o| o["key"] == "conformal" && o["to"] == json!(true)));
+        assert_eq!(resolve(&sp, "validated").unwrap()["conformal"], json!(false));
+        assert!(resolve(&sp, "refined").unwrap().get("conformal").is_none());
         assert!(resolve(&spec(), "quick").is_err());
     }
 

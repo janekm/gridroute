@@ -117,6 +117,9 @@ target/release/fieldsolve debye-port-check         # two-port microstrip with th
 target/release/fieldsolve copper-check             # copper cavity Q against h/delta (conductor loss)
 target/release/fieldsolve cond-fit [--rough-um 1]  # copper surface impedance: exact vs the fitted network
 target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see below)
+target/release/fieldsolve tune tune.json           # search part values on a saved EM result (no new EM run)
+target/release/fieldsolve run spec.json --fast     # screening fidelity; --fidelity refined|validated
+target/release/fieldsolve radmatrix run/farfield.json   # radiation matrix against combine + p_rad
 target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
 target/release/fieldsolve connect spec.json [reps]  # time the mesh connectivity check, print the shorts it finds
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
@@ -536,6 +539,13 @@ its default 0.1–100 units turns millimetre fog into blocks.
 
 ![H field lines and surface current, AMOLED U1.46 → C112 decoupling loop at 100 MHz (rendered before the mesh-short fix, so the current paths are only indicative)](img/fieldsolve_decap_hlines.jpg)
 
+## Fast iteration
+
+Component retuning reuses one EM extraction (`fieldsolve tune`); geometry candidates get coarse
+`--fast` runs with a measured error budget, `--fidelity refined` and `validated` for promising candidates.
+Both, with the benchmarks and the calibration on twelve MTH antenna geometries, are in
+[fieldsolve-fast-mode.md](fieldsolve-fast-mode.md).
+
 ## Performance
 
 The CPML corrections are fused into the main Metal kernels, and materials are a 16-bit index into a
@@ -605,6 +615,8 @@ The code is in `src/bin/fieldsolve/`.
 | `lines.rs` | field-line tracing |
 | `connect.rs` | mesh connectivity check (shorts between nets) |
 | `cosim.rs` | Touchstone reader, part models, port termination, ideal ladder, renormalisation, radiated vs conducted |
+| `tune.rs` | component search on a saved extraction: cached part reflections, radiation matrices, descent, exhaustive changes |
+| `fidelity.rs` | `--fast` / `--fidelity` policies: mesh coarsening with protected features, outputs, objective stop |
 | `nf2ff.rs` | near-to-far-field transform: box plan, face currents, patterns, power, polar plots |
 | `disp.rs` | wideband dielectric: Debye pole fit to a flat tan δ, plane copper loss, update constants |
 | `cond.rs` | conductor loss: copper surface impedance (skin effect, thickness, roughness), Foster fit, sheet edges |
