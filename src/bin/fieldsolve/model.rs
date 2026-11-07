@@ -984,10 +984,10 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
     if let (Some(fx), Some(eo)) = (&efix, &o.edge) {
         let st = &fx.stats;
         eprintln!(
-            "fieldsolve: edges ({}{}): {} E conformal, {} E singular, {} H conformal, {} H singular; {} metal edges opened, {} closed, {} staircase nodes kept for connectivity, {} fits rejected, {} shared dropped",
+            "fieldsolve: edges ({}{}): {} E conformal, {} E singular, {} H conformal, {} H singular; {} metal edges opened, {} closed, {} staircase nodes kept for connectivity, {} fits rejected, {} shared dropped; only where in-plane cells <= {:.3} mm",
             if eo.conformal { "conformal" } else { "" },
             if eo.singular { if eo.conformal { "+singular" } else { "singular" } } else { "" },
-            st.e_conformal, st.e_singular, st.h_conformal, st.h_singular, st.opened, st.closed, st.kept_for_connectivity, st.fit_rejected, st.dropped_shared
+            st.e_conformal, st.e_singular, st.h_conformal, st.h_singular, st.opened, st.closed, st.kept_for_connectivity, st.fit_rejected, st.dropped_shared, st.max_cell
         );
         if eo.dt_check && (!fx.e.is_empty() || !fx.h.is_empty()) {
             let t0 = std::time::Instant::now();

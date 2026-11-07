@@ -74,11 +74,18 @@ pub struct EdgeOpts {
     pub dt_iters: usize,
     /// log step of the permittivity factors (keeps the Metal material table small)
     pub quant: f64,
+    /// corrections only where the in-plane cells are at most this size (mm); `None`: `fine` times the
+    /// fine cell (the 10th percentile of the interior in-plane cell sizes). On graded cells the conformal
+    /// rule's uniform open-part field is far off: a sheet edge's field sits within about the open length of
+    /// the copper, not across a dual face many times larger, so the fractions there overstate the stored
+    /// energy (and the dielectric loss) of whatever crosses a copper boundary outside the fine region.
+    pub max_cell: Option<f64>,
+    pub fine: f64,
 }
 
 impl Default for EdgeOpts {
     fn default() -> Self {
-        EdgeOpts { conformal: true, singular: true, ss: 8, min_open: 0.15, open_corners: false, kmin: 0.25, kmax: 4.0, reach: 1.0, taper: 0.0, over_metal: false, over_metal_h: false, plane_cells: 4.0, fit_r: 1.25, fit_tol: 0.05, dt_check: true, dt_iters: 150, quant: 0.004 }
+        EdgeOpts { conformal: true, singular: true, ss: 8, min_open: 0.15, open_corners: false, kmin: 0.25, kmax: 4.0, reach: 1.0, taper: 0.0, over_metal: false, over_metal_h: false, plane_cells: 4.0, fit_r: 1.25, fit_tol: 0.05, dt_check: true, dt_iters: 150, quant: 0.004, max_cell: None, fine: 2.5 }
     }
 }
 
@@ -108,6 +115,8 @@ impl EdgeOpts {
             o.plane_cells = f("plane_cells", o.plane_cells);
             o.fit_r = f("fit_r", o.fit_r);
             o.fit_tol = f("fit_tol", o.fit_tol);
+            o.max_cell = v.get("max_cell").and_then(|x| x.as_f64()).or(o.max_cell);
+            o.fine = f("fine", o.fine);
         }
         (o.conformal || o.singular).then_some(o)
     }
@@ -141,6 +150,8 @@ pub struct EdgeStats {
     pub h_singular: usize,
     pub fit_rejected: usize,
     pub dropped_shared: usize,
+    /// the in-plane cell size (mm) above which no corrections are made
+    pub max_cell: f64,
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -831,6 +842,20 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
         (l[i] - lo, l[i] + hi)
     };
     let inside = |i: usize, j: usize, k: usize| i > pml[0] && i + pml[1] + 1 < nx && j > pml[2] && j + pml[3] + 1 < ny && k > pml[4] && k + pml[5] + 1 < nz;
+    // the fine region: nodes whose four in-plane cells are all at most `max_cell`
+    let max_cell = o.max_cell.unwrap_or_else(|| {
+        let p10 = |l: &[f64], lo: usize, hi: usize| -> f64 {
+            let mut v: Vec<f64> = (lo..hi.max(lo + 1)).map(|i| d(l, i)).filter(|&h| h > 0.0).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v.get(v.len() / 10).copied().unwrap_or(f64::INFINITY)
+        };
+        o.fine * p10(&xmm, pml[0], nx.saturating_sub(pml[1] + 1)).min(p10(&ymm, pml[2], ny.saturating_sub(pml[3] + 1)))
+    });
+    // an in-plane edge is corrected (fractions, opening, singular factors) only if its own length, its extent
+    // across a copper boundary it crosses, is within `max_cell`; faces and the other components only if the
+    // finer in-plane cell is (cells along a straight edge may be long)
+    let fine_edge = |a: usize, i: usize, j: usize| if a == 0 { d(&xmm, i) <= max_cell } else { d(&ymm, j) <= max_cell };
+    let fine_cell = |i: usize, j: usize| d(&xmm, i.min(nx - 2)).min(d(&ymm, j.min(ny - 2))) <= max_cell;
     let win: Option<BBox> = lay.copper_window;
     let in_win = |x: f64, y: f64| win.map_or(true, |w| w.contains(P2::new(x, y)));
     // E edges of a lumped element's own axis inside its box keep the element's material
@@ -878,6 +903,17 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
             }
         }
         let (ox, oy, keep, kept) = if o.conformal { openable(g, m, &pt, &att, o) } else { (vec![false; nx * ny], vec![false; nx * ny], vec![false; nx * ny], 0) };
+        let (mut ox, mut oy) = (ox, oy);
+        for q in 0..nx * ny {
+            // outside the fine region the midpoint staircase stays (putting metal back keeps connectivity)
+            let (i, j) = (q % nx, q / nx);
+            if !fine_edge(0, i, j) {
+                ox[q] = false;
+            }
+            if !fine_edge(1, i, j) {
+                oy[q] = false;
+            }
+        }
         fix.stats.kept_for_connectivity += kept;
         let stair_near = |i: usize, j: usize| -> bool {
             // any kept staircase node among (i..=i+1, j..=j+1)
@@ -890,7 +926,7 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
             for j in 0..ny.saturating_sub(1) {
                 for i in 0..nx.saturating_sub(1) {
                     let q = j * nx + i;
-                    if (pt.ff[q] as f64) >= o.min_open || keep[q] {
+                    if (pt.ff[q] as f64) >= o.min_open || keep[q] || !fine_cell(i, j) {
                         continue;
                     }
                     let mx = |q: usize| m.ex[q] && !ox[q];
@@ -998,12 +1034,15 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
                 if !bnd[j * nx + i] && !bnd[j * nx + i - 1] && !bnd[(j - 1) * nx + i] && !bnd[(j - 1) * nx + i - 1] {
                     continue;
                 }
+                if !fine_cell(i, j) && !fine_cell(i - 1, j) && !fine_cell(i, j - 1) && !fine_cell(i - 1, j - 1) {
+                    continue;
+                }
                 let h = hloc(i, j);
                 // in-plane edges
                 for a in 0..2usize {
                     let q = j * nx + i;
                     let (metal, fo, isz) = if a == 0 { (metal_x(q), pt.fx[q] as f64, i + 1 >= nx) } else { (metal_y(q), pt.fy[q] as f64, j + 1 >= ny) };
-                    if metal || isz || !inside(i, j, k) || stair_near(i.saturating_sub(1), j.saturating_sub(1)) || stair_near(i, j) {
+                    if metal || isz || !fine_edge(a, i, j) || !inside(i, j, k) || stair_near(i.saturating_sub(1), j.saturating_sub(1)) || stair_near(i, j) {
                         continue;
                     }
                     let (len, pa) = if a == 0 { (d(&xmm, i), [xmm[i], ymm[j], z0]) } else { (d(&ymm, j), [xmm[i], ymm[j], z0]) };
@@ -1077,7 +1116,7 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
                     }
                 }
                 // Ez above (k) and below (k - 1)
-                if !o.singular || stair_near(i.saturating_sub(1), j.saturating_sub(1)) || stair_near(i, j) || !in_win(xmm[i], ymm[j]) {
+                if !o.singular || !fine_cell(i, j) || stair_near(i.saturating_sub(1), j.saturating_sub(1)) || stair_near(i, j) || !in_win(xmm[i], ymm[j]) {
                     continue;
                 }
                 let Some(Some((ln, tw))) = line_at(xmm[i], ymm[j], h) else { continue };
@@ -1125,7 +1164,7 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
         // ---- H: Hz on the sheet; Hx, Hy half a cell above and below
         for j in 1..ny.saturating_sub(2) {
             for i in 1..nx.saturating_sub(2) {
-                if !bnd[j * nx + i] {
+                if !bnd[j * nx + i] || !fine_cell(i, j) {
                     continue;
                 }
                 let h = hloc(i, j);
@@ -1253,6 +1292,7 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
     fix.close.sort();
     fix.close.dedup();
     fix.stats.opened = fix.open.len();
+    fix.stats.max_cell = max_cell;
     fix.stats.closed = fix.close.len();
     fix.stats.dropped_shared = dropped + hd;
     fix.e = ecomp;

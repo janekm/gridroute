@@ -463,7 +463,8 @@ varies as r^-1/2) is sampled as if it were uniform over a cell. `"edges"` correc
 
 ```json
 "edges": true
-"edges": {"conformal": true, "singular": true, "ss": 8, "min_open": 0.15, "reach": 1.0, "dt_check": true}
+"edges": {"conformal": true, "singular": true, "ss": 8, "min_open": 0.15, "reach": 1.0, "dt_check": true, "fine": 2.5}
+"edges": {"max_cell": 0.12}
 ```
 
 Both corrections are written in the integral (FIT) form of the Yee scheme. Faraday's and Ampère's laws are
@@ -501,6 +502,21 @@ to a copper edge those factors come from an assumed local field instead of a uni
     nearest copper of another layer (or a PEC wall) is at least 4 in-plane cells away (`plane_cells`),
     fading to none at 2. On 75 µm prepreg at 0.05 mm cells that leaves conformal alone, which there did as
     well as both together.
+- **Only on the fine mesh.** An in-plane E edge gets fractions, opening or singular factors only if it is
+  at most `max_cell` long (the edge's own length is its extent across a copper boundary it crosses); faces,
+  slivers and the vertical and off-sheet components only if the finer of their two in-plane cells is. The
+  default is `fine` (2.5) times the fine cell, the 10th percentile of the interior in-plane cell sizes, so
+  that rare sliver cells do not set it. Graded cells keep the plain midpoint staircase, as without
+  `"edges"`. Cells that are long along a straight copper edge are still corrected: a strip meshed 0.1 mm
+  across and 0.5 mm along keeps every correction (`no_conformal_fractions_on_graded_cells`; the microstrip,
+  45° and gap cases below have the same corrections with and without the limit). Why: on the MTH R7A board
+  (`"extent": "board"`, 0.05 mm ROI, cells up to 1.48 mm around it) 98 % of the permittivity the
+  fractions added sat on 1.48 mm graded edges crossing ground-pour boundaries just outside the ROI, at
+  factors up to 1/min_open = 6.7. They moved a narrow lossy board resonance (Q ≈ 70–80) from 2.25 to
+  2.40 GHz and so cut the PIFA's radiation efficiency at 2.40 GHz from 89 to 77–83 %. The fractions were
+  never validated on such cells, and the resonance's frequency there is only as good as a 1.5 mm mesh.
+  With the limit the 0.05 mm board reads 89.9 % at 2.40 GHz (no edges 89.8 %, 0.035 mm 91.8 %), and with
+  `"conductor": true` corrected and uncorrected agree within 1.5 points over 2.40–2.50 GHz.
 - **Backends.** The E factors go into the edge's permittivity, conductivity and Debye weights, quantised in
   0.4 % steps so that the Metal material table stays small. The H factors are a sparse list (`HCorr`)
   applied right after the H update, on the CPU and in a small Metal kernel (`hcorr`). CPU and Metal agree
