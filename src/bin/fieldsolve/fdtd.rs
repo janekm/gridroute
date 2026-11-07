@@ -207,6 +207,31 @@ pub fn update_h(p: &Problem, s: &mut CpuState) {
     });
 }
 
+/// Sub-cell edge corrections of H (edge.rs): after the main H update, `H -= fac * k * curl E` on the listed
+/// components, i.e. their update is divided by kappa. E has not changed since the main update.
+pub fn hcorr_update(p: &Problem, s: &mut CpuState) {
+    let Some(hc) = &p.hcorr else { return };
+    let (nx, ny) = (p.nx, p.ny);
+    let (sy, sz) = (nx, nx * ny);
+    let k = (p.dt / MU0) as f32;
+    let [ex, ey, ez] = &s.e;
+    let [idx, idy, idz] = &p.inv_d;
+    let h = [Ptr(s.h[0].as_mut_ptr()), Ptr(s.h[1].as_mut_ptr()), Ptr(s.h[2].as_mut_ptr())];
+    hc.ids.par_iter().zip(hc.fac.par_iter()).for_each(|(&w, &f)| {
+        let (a, id) = ((w >> 30) as usize, (w & 0x3fff_ffff) as usize);
+        let (i, j, kk) = (id % nx, (id / nx) % ny, id / sz);
+        let curl = match a {
+            0 => (ez[id + sy] - ez[id]) * idy[j] - (ey[id + sz] - ey[id]) * idz[kk],
+            1 => (ex[id + sz] - ex[id]) * idz[kk] - (ez[id + 1] - ez[id]) * idx[i],
+            _ => (ey[id + 1] - ey[id]) * idx[i] - (ex[id + sy] - ex[id]) * idy[j],
+        };
+        // SAFETY: the ids are distinct (edge.rs deduplicates), so no two threads write one component
+        unsafe {
+            *h[a].at(id) -= f * (k * curl);
+        }
+    });
+}
+
 /// Main E update (boundary and metal edges have ca = cb = 0 and stay zero).
 pub fn update_e(p: &Problem, s: &mut CpuState) {
     let (nx, ny, nz) = (p.nx, p.ny, p.nz);
@@ -516,6 +541,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
     let setup_seconds = t0.elapsed().as_secs_f64();
     for n in 0..spec.max_steps {
         update_h(p, &mut s);
+        hcorr_update(p, &mut s);
         pml_h(p, &mut s);
         disp_save(p, &mut s);
         update_e(p, &mut s);

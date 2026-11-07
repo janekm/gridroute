@@ -656,6 +656,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                     .collect();
                 crate::cond::Conductor { metals, f_lo: o("f_lo").unwrap_or(fmin.max(0.1e9)), f_hi: o("f_hi").unwrap_or(fmax) }
             }),
+            // "edges": true or {"conformal": .., "singular": .., ...}: sub-cell copper edges (edge.rs)
+            edge: sp.get("edges").and_then(crate::edge::EdgeOpts::from_json),
         },
         freqs: linspace(fmin, fmax, nf),
         fmax,

@@ -205,6 +205,16 @@ pub struct Problem {
     pub disp: Option<Disp>,
     /// Surface-impedance copper edges (see `cond.rs`), if conductor loss is modelled.
     pub cond: Option<crate::cond::Cond>,
+    /// H components next to copper edges whose update is scaled (see `edge.rs`), if any.
+    pub hcorr: Option<HCorr>,
+}
+
+/// Sparse H-update corrections: after the H update, `H += fac * dH` on the listed components, where dH is
+/// the change the plain update made (`ids`: index | component << 30). `fac = 1/kappa - 1`.
+#[derive(Clone, Debug, Default)]
+pub struct HCorr {
+    pub ids: Vec<u32>,
+    pub fac: Vec<f32>,
 }
 
 /// Dispersive edges live in the mesh-plane range `k0..=k1`; per component the compact index is
@@ -246,11 +256,13 @@ pub struct BuildOpts {
     pub wideband: Option<crate::disp::Wideband>,
     /// Conductor loss on copper sheets (surface impedance), per sheet in `Layout::sheets` order.
     pub conductor: Option<crate::cond::Conductor>,
+    /// Sub-cell copper edges: conformal and edge-singularity corrections (`edge.rs`).
+    pub edge: Option<crate::edge::EdgeOpts>,
 }
 
 impl Default for BuildOpts {
     fn default() -> Self {
-        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95, wideband: None, conductor: None }
+        BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 6e9, cfl: 0.95, wideband: None, conductor: None, edge: None }
     }
 }
 
@@ -266,6 +278,17 @@ pub struct SheetMask {
 
 fn paint(mask: &mut [bool], nets: &mut [u32], net: u32, nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
     // xs: sample x positions (len nx), ys: sample rows; mask[(j * nx) + i]
+    debug_assert_eq!(nx, xs.len());
+    paint_with(xs, ys, p, |q| {
+        mask[q] = p.dark;
+        nets[q] = if p.dark { net } else { 0 };
+    });
+}
+
+/// Visit the samples `(xs[i], ys[j])` (index `j * xs.len() + i`, both sorted) that lie in `p`'s shape:
+/// even-odd scanline spans for polygons, the inside test otherwise.
+pub(crate) fn paint_with(xs: &[f64], ys: &[f64], p: &Prim, mut set: impl FnMut(usize)) {
+    let nx = xs.len();
     let bb = p.shape.bbox();
     let ir = range_in(xs, bb.x0, bb.x1);
     let jr = range_in(ys, bb.y0, bb.y1);
@@ -289,8 +312,7 @@ fn paint(mask: &mut [bool], nets: &mut [u32], net: u32, nx: usize, xs: &[f64], y
                 xc.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 for s in xc.chunks_exact(2) {
                     for i in range_in(xs, s[0], s[1]) {
-                        mask[j * nx + i] = p.dark;
-                        nets[j * nx + i] = if p.dark { net } else { 0 };
+                        set(j * nx + i);
                     }
                 }
             }
@@ -299,8 +321,7 @@ fn paint(mask: &mut [bool], nets: &mut [u32], net: u32, nx: usize, xs: &[f64], y
             for j in jr {
                 for i in ir.clone() {
                     if sh.contains(P2::new(xs[i], ys[j])) {
-                        mask[j * nx + i] = p.dark;
-                        nets[j * nx + i] = if p.dark { net } else { 0 };
+                        set(j * nx + i);
                     }
                 }
             }
@@ -737,6 +758,45 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         }
     }
 
+    let (masks, mask_nets) = sheet_masks(g, lay);
+    // sub-cell copper edges: redistribute the permittivity of edges next to copper (before the lumped
+    // elements add theirs)
+    let efix = o.edge.as_ref().map(|eo| crate::edge::analyse(g, lay, &masks, lumped, &o.pml, eo));
+    if let (Some(fx), Some(eo)) = (&efix, &o.edge) {
+        for &(a, id, beta) in &fx.e {
+            let (a, id) = (a as usize, id as usize);
+            let (i, j, k) = (id % nx, (id / nx) % ny, id / (nx * ny));
+            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+            let pos = [i as isize, j as isize, k as isize];
+            let mut enew = 0.0;
+            let mut t = 0;
+            for db in [-1isize, 0] {
+                for dc in [-1isize, 0] {
+                    let mut q = pos;
+                    q[b] += db;
+                    q[c] += dc;
+                    enew += cell(q[0], q[1], q[2]).0 * beta[t] as f64;
+                    t += 1;
+                }
+            }
+            let old = eps[a][id] as f64;
+            if old <= 0.0 || enew <= 0.0 {
+                continue;
+            }
+            // quantised (log steps) so that the Metal material table stays small
+            let f = ((enew / old).ln() / eo.quant).round() * eo.quant;
+            let f = f.exp();
+            eps[a][id] = (old * f) as f32;
+            sig[a][id] = (sig[a][id] as f64 * f) as f32;
+            if npole > 0 && k >= kd0 && k <= kd1 {
+                let qd = ((k - kd0) * ny + j) * nx + i;
+                for p in 0..npole {
+                    dep[a][qd * npole + p] = (dep[a][qd * npole + p] as f64 * f) as f32;
+                }
+            }
+        }
+    }
+
     // lumped elements: extra conductivity / capacitance per edge, and source/probe lists for ports
     let mut ports = Vec::new();
     let mut shorts: Vec<(usize, usize)> = Vec::new();
@@ -847,7 +907,6 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
             }
         }
     }
-    let (masks, mask_nets) = sheet_masks(g, lay);
     for m in &masks {
         for j in 0..ny {
             for i in 0..nx {
@@ -871,6 +930,19 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
                 ca[2][id] = 0.0;
                 cb[2][id] = 0.0;
             }
+        }
+    }
+    // conformal edges: metal by the midpoint rule, but mostly open
+    if let Some(fx) = &efix {
+        for &(a, id) in &fx.open {
+            let (a, id) = (a as usize, id as usize);
+            let (x, y) = coef(eps[a][id] as f64 * EPS0, sig[a][id] as f64, bsum(a, id));
+            ca[a][id] = x;
+            cb[a][id] = y;
+        }
+        for &(a, id) in &fx.close {
+            ca[a as usize][id as usize] = 0.0;
+            cb[a as usize][id as usize] = 0.0;
         }
     }
     // lumped elements win over copper they overlap (a port drawn across a pad gap that the mesh closed)
@@ -904,7 +976,35 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         // b_p per edge; metal edges (cb = 0) keep b but are skipped by the updates
         b: std::array::from_fn(|a| (0..nd * npole).map(|qp| pc[qp % npole].2 as f32 * dep[a][qp]).collect()),
     });
-    Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone(), disp, cond }
+    let hcorr = efix.as_ref().filter(|f| !f.h.is_empty()).map(|f| HCorr {
+        ids: f.h.iter().map(|&(a, id, _)| id | (a as u32) << 30).collect(),
+        fac: f.h.iter().map(|&(_, _, k)| 1.0 / k - 1.0).collect(),
+    });
+    let p = Problem { nx, ny, nz, dt, inv_d, inv_dd, ca, cb, pml, ports, probes: vec![], grid: g.clone(), disp, cond, hcorr };
+    if let (Some(fx), Some(eo)) = (&efix, &o.edge) {
+        let st = &fx.stats;
+        eprintln!(
+            "fieldsolve: edges ({}{}): {} E conformal, {} E singular, {} H conformal, {} H singular; {} metal edges opened, {} closed, {} staircase nodes kept for connectivity, {} fits rejected, {} shared dropped",
+            if eo.conformal { "conformal" } else { "" },
+            if eo.singular { if eo.conformal { "+singular" } else { "singular" } } else { "" },
+            st.e_conformal, st.e_singular, st.h_conformal, st.h_singular, st.opened, st.closed, st.kept_for_connectivity, st.fit_rejected, st.dropped_shared
+        );
+        if eo.dt_check && (!fx.e.is_empty() || !fx.h.is_empty()) {
+            let t0 = std::time::Instant::now();
+            let mu = crate::edge::stability(&p, 150);
+            let lim = 4.0 * o.cfl * o.cfl;
+            eprintln!("fieldsolve: edges: dt^2 lambda_max {:.4} (limit {:.4} at cfl {}), {:.1} s", mu, lim, o.cfl, t0.elapsed().as_secs_f64());
+            if mu > lim {
+                let cfl = o.cfl * (lim / mu).sqrt() * 0.99;
+                eprintln!("fieldsolve: edges: time step lowered by {:.3}", cfl / o.cfl);
+                let mut o2 = o.clone();
+                o2.cfl = cfl;
+                o2.edge.as_mut().unwrap().dt_check = false;
+                return build(g, lay, lumped, &o2);
+            }
+        }
+    }
+    p
 }
 
 /// Copper sheet edges that get a surface impedance: metal in-plane edges (cb = 0) of real copper outside
