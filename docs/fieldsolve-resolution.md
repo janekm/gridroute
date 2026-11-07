@@ -268,3 +268,37 @@ unknown it is 3× more expensive on the CPU and would be gather-bound on the GPU
 where the tensor-product waste is extreme (sparse copper in a large domain), and only after a full GPU
 implementation. The recommendation stands: rectilinear mesh, edge corrections, static refinement;
 `no_slivers` and `z_grade` are worth making the default once the fast-mode calibration is re-run.
+
+## Edge corrections and antenna efficiency: the MTH R7A check (Nov 2026)
+
+A PIFA run (MTH R7A, C20 one-port, `"extent": "board"`, 0.05 mm ROI with cells graded to 1.48 mm around
+it, wideband FR4 loss, `"mesh": {"no_slivers", "z_grade": 3}`) lost about 8 points of radiation efficiency
+at 2.40 GHz with `"edges"`, and a 0.035 mm mesh took it back. The discriminating runs (radiation
+efficiency at 2.40 / 2.44 / 2.48 GHz, port stop at -60 dB):
+
+| run (0.05 mm unless noted) | 2.40 | 2.44 | 2.48 GHz |
+|---|---|---|---|
+| no edges, same mesh policy | 89.5 | 89.1 | 88.0 % |
+| no edges, without the `loss.copper` stand-in | 90.6 | 90.3 | 89.2 % |
+| edges, without `loss.copper` | 84.0 | 85.4 | 87.6 % |
+| conformal only | 83.9 | 86.4 | 88.5 % |
+| singular only | 89.1 | 89.0 | 88.3 % |
+| edges, limited to the fine mesh (`max_cell`) | 89.9 | | |
+| edges, limited, 0.035 mm | 91.8 | | |
+| no edges, 0.035 mm | 90.4 | 89.2 | 87.2 % |
+
+The mesh policy and the copper-loss term are not involved; the conformal fractions are. Of the
+permittivity × volume they added, 98 % sat on graded 1.48 mm in-plane edges where ground pours end, just
+outside the ROI, at factors up to 1/min_open = 6.7. The corrections are now limited to edges no longer
+than 2.5 fine cells (`"edges"` / `max_cell`, `fieldsolve.md`).
+
+The efficiency spectrum explains the size of the effect. With 21 far-field frequencies over 2-3 GHz and
+the energy stop at -50 dB (3.3× the steps of the port stop), each mesh shows one narrow lossy board
+resonance (late-time Q 70-80): uncorrected at 2.25 GHz (81 % against 92 % around it), with the unlimited
+corrections at 2.40 GHz (77 %). Away from it the port and energy stops agree within 1-2 points; the
+energy stop only sharpens the dip. With `"conductor": true` (surface-impedance copper) instead of the
+stand-in, limited corrections and none agree within 1.5 points over 2.40-2.50 GHz (84.6 / 82.1 / 82.4 %
+and 84.8 / 83.5 / 81.0 % at 2.40 / 2.45 / 2.50), both with the dip at 2.25 GHz. The resonance lives on the
+coarse board mesh, so its frequency is uncertain by several percent either way: single-frequency
+efficiencies near a band edge are better read from a dense frequency list, and a run whose field energy
+still decays slower than a few dB/ns at the stop has such a mode.

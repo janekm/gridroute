@@ -32,6 +32,54 @@ fn problem(edge: Option<EdgeOpts>, wideband: Option<crate::disp::Wideband>, pml:
     model::build(&g, &lay, &[port], &model::BuildOpts { pml: [pml; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband, conductor: None, edge })
 }
 
+/// An oblique copper edge that runs from 0.1 mm cells into graded cells up to 0.6 mm: the in-plane edges it
+/// crosses are corrected (fractions, opening) only where they are at most `max_cell` (2.5 x 0.1 mm) long.
+#[test]
+fn no_conformal_fractions_on_graded_cells() {
+    let l = |a: f64, b: f64| -> Vec<f64> { mesh::lines_1d(a, b, &[], &[mesh::Refine { a: 0.0, b: 4.0, h: 0.1 }], 1.3, 0.6, &[]).into_iter().map(|v| v * 1e-3).collect() };
+    let g = mesh::Grid { x: l(-3.0, 16.0), y: l(-3.0, 16.0), z: mesh::lines_1d(-4.0, 4.0, &[0.0, 0.4], &[mesh::Refine { a: 0.0, b: 0.4, h: 0.1 }], 1.3, 1.0, &[]).into_iter().map(|v| v * 1e-3).collect() };
+    let lay = model::Layout {
+        sheets: vec![model::Sheet { name: "top".into(), z: 0.4, prims: vec![poly(&[(0.5, 0.3), (14.0, 10.3), (14.0, 14.0), (0.5, 14.0)])] }],
+        slabs: vec![model::Slab { z0: 0.0, z1: 0.4, eps: 4.3, tand: 0.02 }],
+        barrels: vec![],
+        outline: vec![vec![P2::new(-2.0, -2.0), P2::new(15.0, -2.0), P2::new(15.0, 15.0), P2::new(-2.0, 15.0)]],
+        copper_window: None,
+    };
+    let build = |edge: Option<EdgeOpts>| model::build(&g, &lay, &[], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband: None, conductor: None, edge });
+    let p0 = build(None);
+    let k = mesh::snap(&p0.grid.z, 0.4e-3);
+    let (nx, ny) = (p0.nx, p0.ny);
+    // (corrected edges at most max_cell long, longer ones)
+    let count = |p: &model::Problem| -> (usize, usize) {
+        let (mut fine, mut coarse) = (0, 0);
+        for j in 1..ny - 1 {
+            for i in 1..nx - 1 {
+                let id = (k * ny + j) * nx + i;
+                for a in 0..2 {
+                    let changed = (p0.cb[a][id] == 0.0) != (p.cb[a][id] == 0.0) || (p0.cb[a][id] != 0.0 && (p.cb[a][id] / p0.cb[a][id] - 1.0).abs() > 1e-3);
+                    if changed {
+                        let len = if a == 0 { p.grid.x[i + 1] - p.grid.x[i] } else { p.grid.y[j + 1] - p.grid.y[j] } * 1e3;
+                        if len <= 0.25 + 1e-9 {
+                            fine += 1;
+                        } else {
+                            coarse += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (fine, coarse)
+    };
+    let conf = EdgeOpts { singular: false, ..EdgeOpts::default() };
+    // without the limit the graded edges get fractions too (what the limit removes)
+    let (_, unlimited) = count(&build(Some(EdgeOpts { max_cell: Some(1e9), ..conf.clone() })));
+    assert!(unlimited > 10, "the case has only {unlimited} graded edges to correct");
+    let (fine, coarse) = count(&build(Some(conf)));
+    eprintln!("corrected in-plane edges: {fine} fine, {coarse} longer than max_cell ({unlimited} without the limit)");
+    assert!(fine > 20, "only {fine} corrected fine edges");
+    assert_eq!(coarse, 0, "{coarse} corrected edges longer than max_cell");
+}
+
 #[test]
 fn edge_corrections_touch_the_rotated_strip() {
     let p0 = problem(None, None, 6);
