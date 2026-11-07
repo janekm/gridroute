@@ -533,7 +533,61 @@ Errors against Hammerstad-Jensen over seven insets (0.05, 0.2, 0.35, 0.5, 0.65, 
 - On the plain mesh, an edge exactly on a mesh line is ambiguous for the midpoint rule: the polygon's
   scanline counts the lower edge as copper and the upper one not. The tables avoid exact insets of 0.
 
-EDGE_EXTRA_TABLES
+**Narrow line on a thin substrate** (w ≈ 0.3 mm, h = 0.2 mm, εr 4.3; 0.05 mm cells, 4 across h; 7 insets):
+
+| | none | conformal | both |
+|---|---|---|---|
+| εeff, max | 21.7 % | 1.0 % | 0.27 % |
+| Z0, range | −5.2 to +8.5 % | −7.0 to −1.8 % | −2.8 to +3.2 % |
+| C per length, range | −2.9 to +15.9 % | +2.0 to +8.1 % | −3.3 to +2.8 % |
+
+**DK-like substrate** (w ≈ 0.3 mm on 75 µm, εr 4.4; 0.05 mm cells, 1.5 across h; 4 insets). Here the
+ground plane is closer than the singular factors' fade distance, so "both" equals conformal:
+
+| | none | conformal (= both) |
+|---|---|---|
+| εeff, max | 30.2 % | 1.5 % |
+| Z0, range | −5.2 to +47.9 % | −7.5 to +8.0 % |
+| C per length, range | −23.3 to +6.1 % | −7.4 to +8.9 % |
+
+With 1.5 cells across the substrate the line's capacitance is set by a strip only 6 cells wide: the
+corrections remove the stub error (εeff, and Z0 from +48 % to within 8 %), but ±8 % in C remains. RF traces
+on thin prepreg need finer cells across the strip, not only better edges.
+
+**45° line** (the same 3 mm line as the first table, turned by 45° on the axis-aligned mesh, so its edges cross
+the cells at every offset along the line):
+
+| cell | none: Z0 / εeff / C | both: Z0 / εeff / C |
+|---|---|---|
+| 0.4 mm | +1.1 / +19.4 / +8.1 % | +1.3 / −2.4 / −2.5 % |
+| 0.2 mm | −2.7 / +3.9 / +4.8 % | −2.6 / +4.9 / +5.1 % |
+| 0.1 mm | +0.6 / +1.2 / 0.0 % | +0.5 / +0.4 / −0.3 % |
+
+The corrections remove the coarse-mesh error but not the 0.2 mm one. On an oblique edge the current
+flows along the staircase of metal edges, and an edge either carries current (metal) or not: a partly
+covered edge cannot carry its share. Opening the staircase corners as well (`"open_corners": true`) made
+the capacitance right but the inductance 8 % high (εeff +12 % at 0.2 mm), so corners stay metal by default.
+
+**Series gap** in a 0.3 mm line on 0.2 mm (εr 4.3): C_gap = −Im(Y21)/ω over 0.5-2 GHz, fF. The mesh is
+uniform through the gap, so its edges fall where they fall:
+
+| gap | cell | none | both | Garg-Bahl |
+|---|---|---|---|---|
+| 0.10 mm | 0.1 / 0.05 / 0.025 / 0.0125 mm | shorted / 8.77 / 6.95 / 6.22 | 8.29 / 7.12 / 6.04 / 5.73 | 4.98 |
+| 0.13 mm | | 4.52 / 7.45 / 4.69 / 5.01 | 6.70 / 4.88 / 4.55 / 4.61 | 4.04 |
+| 0.17 mm | | 4.52 / 4.04 / 4.45 / 3.56 | 5.60 / 3.66 / 3.54 / 3.43 | 3.12 |
+
+- With the corrections C_gap converges monotonically: at 0.025 mm it is within −1 to +5 % of the 0.0125 mm
+  value, at 0.05 mm within +6 to +24 %. Without them it jumps with the mesh (+62 % then +2 % for the 0.13 mm
+  gap) and the two wider gaps are identical at 0.1 mm (both snap to the same raster).
+- At 0.1 mm the 0.10 mm gap is closed by the midpoint rule (both of its edges sit exactly on edge midpoints),
+  a short. The conformal rule opens such raster bridges: the copper connectivity check sees two pieces of
+  copper on the two sides.
+- Garg and Bahl's closed form (1978; as given in Gupta, Garg, Bahl and Bhartia, *Microstrip Lines and
+  Slotlines*) is 9-13 % below the finest values: its fit accuracy and the extraction (which includes the
+  ports' 2 mm stubs) both enter at that level.
+  The convergence, not the absolute value, is the test here.
+
 
 ## Fields and Blender
 
@@ -684,6 +738,20 @@ The node labels and bridges match the original algorithm, run with ordered maps 
 order. `dense_traversal_matches_the_reference` checks this on a test board with raster and barrel shorts.
 `real_board_matches_the_reference` (ignored; `FIELDSOLVE_CONNECT_SPEC=spec.json`) checks real boards, and
 it passed on MTH, 1BP and 1BP at 0.3 mm cells.
+
+**Sub-cell copper edges.** `fieldsolve edge-bench spec.json 2000 3` builds a board with and without
+`"edges"` and alternates fixed-length Metal runs (2000 steps, three rounds each). On the nRF52840 DK at
+0.05 mm (18.8 M cells), with another session's long run sharing the GPU:
+
+| | plain | edges |
+|---|---|---|
+| step rate | 653 / 655 / 660 Mcell/s | 631 / 618 / 627 Mcell/s (−4.5 %) |
+| build | 2.4 s | 115 s, of which 109 s is the stability check (150 power iterations on the CPU) |
+| GPU memory | 639 MB | 640 MB (89 373 H corrections, the E factors are material-table entries) |
+
+The step cost is the separate `hcorr` dispatch and its scattered reads; folding it into the fused H kernel
+would remove the extra pass. The stability check converged to four digits within 50 iterations on this
+board (`FS_DEBUG=1` prints its progress); `"dt_check": false` skips it for repeated runs of one board.
 
 ## Code map
 
