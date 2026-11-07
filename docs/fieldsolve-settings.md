@@ -116,11 +116,18 @@ then start the long run.
 
 ## Known open issues
 
-- **`"edges"` at 0.05 mm cut the MTH PIFA's efficiency at 2.40 GHz by about 8 points.**
-  - **Cause:** conformal fractions on the coarse (about 1.5 mm) graded cells just outside the ROI, at
-    ground-pour edges. Those fractions also moved a narrow, lossy board mode (Q 70-80) by about 150 MHz,
-    onto 2.40 GHz.
-  - **Fix:** don't apply the edge factors to edges longer than 2.5× the fine cell. It is on the edge
-    session's branch and not yet merged (Nov 2026).
-  - **Until it lands:** check edge-corrected far-field runs against a run without `"edges"`, on a dense
-    frequency grid.
+- **Narrow lossy board modes.** The MTH board has a lossy mode with a Q of about 70-80, near 2.25 GHz.
+  Its excess field sits on the coarse 1.48 mm mesh, 15-35 mm from the antenna (KiCad x 153-158, y 102-107
+  mm). It is probably a gap in the ground pour, or a slot. It may be real hardware, which a measurement
+  would show; otherwise a finer `max_cell` there would move it. The ringing warning flags such modes.
+
+## Fixed issues (keep in mind when reading older results)
+
+- **`"edges"` on coarse cells (fixed Nov 2026, 58f602d).** Conformal fractions were applied on the coarse
+  graded cells outside the ROI. On the MTH PIFA at 0.05 mm, they moved the board mode above onto 2.40 GHz
+  and cut efficiency there by about 8 points. Edge factors now apply only to edges no longer than 2.5×
+  the fine cell (`"edges": {"fine": 2.5}`, or an absolute `{"max_cell": mm}`). `"edges": true` needs no
+  change.
+- **Copper loss through the plane-pair stand-in.** On the MTH PIFA, real copper (`"conductor": true`)
+  costs 4-5 points of radiation efficiency compared with `"loss": {"copper": true}`. Every far-field
+  result from before Nov 2026 that used the stand-in is that much optimistic.
