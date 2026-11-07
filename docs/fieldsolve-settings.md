@@ -85,6 +85,10 @@ then start the long run.
   with a model that also leaves it out.
 - **Decoupling capacitors near the RF section:** model them as `"elements"` shorts. Without them, the
   supply copper floats at RF.
+- **Tracks to unmodelled ICs:** a long track that ends at a chip pin is open-ended in the model, and so a
+  resonant stub (a quarter wave is about 17 mm at 2.4 GHz on FR4 microstrip). Near an antenna it can take
+  efficiency in a narrow band, as on MTH (see Known open issues). Load such pins with `"elements"` (a few
+  pF to ground) when the tracks are longer than about 10 mm and lie within a few cm of the antenna.
 
 ## Ports, band and stopping
 
@@ -116,16 +120,22 @@ then start the long run.
 
 ## Known open issues
 
-- **Narrow lossy board modes.** The MTH board has a lossy mode with a Q of about 70-80, near 2.25 GHz.
-  Its excess field sits on the coarse 1.48 mm mesh, 15-35 mm from the antenna (KiCad x 153-158, y 102-107
-  mm). It is probably a gap in the ground pour, or a slot. It may be real hardware, which a measurement
-  would show; otherwise a finer `max_cell` there would move it. The ringing warning flags such modes.
+- **Open-ended tracks at unmodelled ICs make resonant stubs.**
+  - On the MTH board, two signal tracks run side by side from the nRF52840 to header H5: P1_04 (0.15 mm
+    wide, 24.7 mm long) and SWDCLK (about 32 mm). The chip isn't modelled, so both are open at the U12 end,
+    and together they resonate near 2.25-2.40 GHz with a Q of about 70-80. The resonance takes 5-12 points
+    of antenna efficiency in a narrow band.
+  - The tracks run along y where the y cells are 1.48 mm, so their frequency also depends on the mesh.
+  - On the real board, the pin capacitance moves the resonance, so the dip is partly a model artefact.
+  - Not yet automated. For an antenna run, load the pins of unmodelled ICs that long tracks near the
+    antenna lead to, with `"elements"` (a few pF to ground, or an R), or check where the ringing
+    warning's mode lives with a field export at its frequency.
 
 ## Fixed issues (keep in mind when reading older results)
 
 - **`"edges"` on coarse cells (fixed Nov 2026, 58f602d).** Conformal fractions were applied on the coarse
-  graded cells outside the ROI. On the MTH PIFA at 0.05 mm, they moved the board mode above onto 2.40 GHz
-  and cut efficiency there by about 8 points. Edge factors now apply only to edges no longer than 2.5×
+  graded cells outside the ROI. On the MTH PIFA at 0.05 mm, they moved the track resonance above onto
+  2.40 GHz and cut efficiency there by about 8 points. Edge factors now apply only to edges no longer than 2.5×
   the fine cell (`"edges": {"fine": 2.5}`, or an absolute `{"max_cell": mm}`). `"edges": true` needs no
   change.
 - **Copper loss through the plane-pair stand-in.** On the MTH PIFA, real copper (`"conductor": true`)

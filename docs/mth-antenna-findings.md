@@ -187,7 +187,7 @@ candidates in about a minute.
     2.40 GHz by up to 8 points.
   - The efficiency difference is a solver artefact, since fixed (58f602d):
     - In the edge-corrected 0.05 mm run, the conformal fractions on coarse graded cells just outside the
-      ROI moved a narrow, lossy board mode (Q 70-80, about 0.05 GHz wide) onto 2.40 GHz.
+      ROI moved a narrow, lossy track resonance (Q 70-80, about 0.05 GHz wide; see below) onto 2.40 GHz.
     - Without edges, and with the fix, the same mode sits at 2.25 GHz, and 2.40 GHz reads 89-90 % with
       the copper stand-in.
     - The 2.40 GHz efficiency and scores above are therefore 0.3-0.5 dB pessimistic. 2.44 and 2.48 GHz
@@ -196,9 +196,10 @@ candidates in about a minute.
     fixed edges, the antenna alone radiates 84.6 / 82.1 / 82.4 % at 2.40 / 2.45 / 2.50 GHz, against about
     89 % with the stand-in. That is about 0.2-0.3 dB off every score above. The ladder ranking is
     unaffected, because it applies equally to all candidates.
-  - **The board mode near 2.25 GHz** has its excess field 15-35 mm from the antenna, at KiCad x 153-158,
-    y 102-107 mm, on the coarse mesh. It may be a gap in the ground pour, or a slot, worth checking in the
-    layout. If it is real, a measurement would show an efficiency dip just below the band.
+  - **The board mode near 2.25 GHz** is a resonance of two signal tracks, P1_04 and SWDCLK. They run
+    side by side from U12 to header H5 (24.7 mm and about 32 mm), and they are open at the chip end
+    because the chip isn't modelled. On the real board the pin capacitance shifts the resonance, so the
+    modelled dip is partly an artefact. A re-run should load those pins, with a few pF to ground.
   - Single-frequency values can land on such a dip. A re-run should use a dense far-field grid
     (0.02-0.05 GHz) and band averages ([fieldsolve-settings.md](fieldsolve-settings.md)).
   - The ranking of the ladder options is the same on both meshes.
