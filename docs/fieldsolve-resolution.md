@@ -132,6 +132,10 @@ smallest cell.
   with both corrections, 4 cells across the substrate give εeff within 0.73 % and C within 2.3 % rms. Without
   them, 4 cells are 18 % out in εeff, and even 16 cells are 4.9 % out. See
   [fieldsolve.md](fieldsolve.md#sub-cell-copper-edges) for the tables.
+- **On a real board.** On the nRF52840 DK the corrected 0.05 mm mesh gives the S-parameters the plain mesh
+  approaches as the cell shrinks: extrapolated from 0.05 and 0.025 mm, the plain model lands on the corrected
+  one (the fitted extra shunt capacitance per node: −0.33, −0.28, extrapolated −0.24 pF; corrected −0.24 and
+  −0.25 pF). The corrected 0.05 and 0.025 mm runs agree to |ΔS| 0.016 below 3 GHz.
 - **Where the corrections stop helping.** A 0.3 mm trace on 75 µm prepreg at 0.05 mm cells (1.5 cells
   across the substrate, as on the nRF52840 DK) keeps ±8 % in C after the corrections: the strip is only 6
   cells wide and the field under it 1.5 cells high. There the answer is finer cells around that trace,

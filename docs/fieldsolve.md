@@ -605,13 +605,14 @@ capacitor models in `fieldsolve cosim`, and the ΔC that best fits the measureme
 | plain, 0.05 mm | −4.28 / −2.64 dB | 2.48 / 3.12 / 3.79 | 3.36 dB | −0.33 / −0.32 pF |
 | plain, 0.025 mm | −4.38 / −2.54 dB | 2.49 / 3.16 / 3.85 | 2.89 dB | −0.28 / −0.27 pF |
 | plain, first-order extrapolation | | | | ≈ −0.24 / −0.23 pF |
-| edges, 0.05 mm | DK_E05B_ROW |
+| edges, 0.05 mm | −4.49 / −2.51 dB | 2.50 / 3.20 / 3.93 | 2.42 dB | −0.24 / −0.22 pF |
 | edges, 0.025 mm | −4.54 / −2.47 dB | 2.51 / 3.20 / 3.91 | 2.54 dB | −0.25 / −0.23 pF |
 
 - **The excess shrinks by about a quarter, and the rest is not the mesh.** The plain model moves by
   0.05 pF per node between 0.05 and 0.025 mm, towards the value the corrected models already have at
   0.05 mm. Extrapolated to zero cell size, the plain model lands on the corrected one. The corrected
-  0.05 and 0.025 mm S-matrices agree to 0.008 below 3 GHz; the plain ones to 0.027. So about 0.09 pF per
+  0.05 and 0.025 mm S-matrices agree to 0.016 below 3 GHz; the plain ones to 0.027, and the plain
+  0.05 mm one is 0.055 from the corrected 0.025 mm one. So about 0.09 pF per
   node was a discretisation error of the zero-thickness copper, and about 0.24 pF per node remains.
 - **It is not the zero thickness either.** Real 35 µm copper has side walls: it adds fringe capacitance,
   so it would make the model's shunt C larger, not smaller.
