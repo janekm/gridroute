@@ -4,7 +4,8 @@ edit EM, PORT, CHOICES and BASE for another board.
 
 Run it from a working directory holding the EM run (EM below), Nordic's target network
 (nordic_ref_network.s2p) and Murata's S-parameter libraries unpacked as murata_sparams/lib_grm and
-murata_sparams/lib_lqg. FIELDSOLVE points at the binary (default: fieldsolve on PATH).
+murata_sparams/lib_lqg. FIELDSOLVE points at the binary (default: fieldsolve on PATH); EM at the EM run's
+Touchstone file (default mth7_board/sparams.s7p); OUT names the results file.
 
 Score per frequency: (1 - |G_t|^2) * P_rad / P_in, where G_t is the power-wave reflection against the chip's
 design load (Nordic's network, 35 - j35 ohm) and P_rad / P_in the share of the power entering the chip pin
@@ -15,7 +16,7 @@ that is radiated (ladder + antenna losses). The objective is the worst of 2.40 /
 import glob, json, math, os, random, subprocess, sys
 
 FS = os.environ.get('FIELDSOLVE', 'fieldsolve')
-EM = 'mth7_board/sparams.s7p'
+EM = os.environ.get('EM', 'mth7_board/sparams.s7p')
 PORT = 'CHIP'
 GRM = 'murata_sparams/lib_grm'; LQG = 'murata_sparams/lib_lqg'
 
@@ -128,5 +129,5 @@ if __name__ == '__main__':
         results.append((s[0], c, s))
         show(f'start {i}', c, s)
     results.sort(key=lambda x: -x[0])
-    json.dump([{'score_db': r[0], 'parts': r[1], 'per_f': r[2][1], 'harm': r[2][2]} for r in results], open('ladder_retune_results.json', 'w'), indent=1)
+    json.dump([{'score_db': r[0], 'parts': r[1], 'per_f': r[2][1], 'harm': r[2][2]} for r in results], open(os.environ.get('OUT', 'ladder_retune_results.json'), 'w'), indent=1)
     print(f'{calls[0]} cosim calls, {len(cache)} candidates')
