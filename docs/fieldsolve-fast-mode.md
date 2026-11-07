@@ -308,8 +308,18 @@ Measured while another session's FDTD queue shared the GPU, so the wall-time sav
 median 2.7 × for screening, 1.6–4.7 × per candidate. The reference runs took 458–1128 s and the
 screening runs 202–298 s, with the spread coming from the other jobs. The machine-independent figure is cells × steps
 (median 3.1 ×; the step count already reflects the 1.14 × longer time step). With the Metal kernels' throughput roughly
-constant in cells per second, that is the wall-time saving to expect on an idle GPU. No idle window came
-up during this work to confirm it.
+constant in cells per second, that is the wall-time saving to expect on an idle GPU.
+
+An idle re-time of the as-built pair confirms it. No other FDTD job ran during it, apart from two 20-step dry runs:
+
+| | cells × steps | stepping | total wall time | stepping rate |
+|---|---|---|---|---|
+| full (`spec`) | 12.85 M × 55 040 | 253.7 s | 258 s | 2788 Mcell/s |
+| screening | 4.45 M × 49 152 | 75.3 s | 77 s | 2908 Mcell/s |
+| ratio | 3.23 × | 3.37 × | 3.35 × | |
+
+On an idle GPU, the wall-time saving matches the cells × steps saving: 3.35 × against 3.23 ×. The small
+excess comes from the far-field transform, which shrinks with the box.
 
 ### Reproducing
 
@@ -428,9 +438,19 @@ A surrogate search with the space above (budget 16), on the widened-ROI MTH mode
 | | screening solves | full solves | cells × steps | full-run equivalents | best full value |
 |---|---|---|---|---|---|
 | surrogate + mapping | 16 | 5 | 7.10e12 (3.56 screening + 3.54 full) | 10.0 | −0.467 dB |
-PATTERN_ROW
+| pattern (no mapping), the simple bounded search | 16 | 5 | 7.19e12 (3.55 screening + 3.64 full) | 10.2 | −0.709 dB |
 
-One full run of the as-built model is 7.07e11 cells × steps. Trajectory of full solves (the as-built model
+At the same budget and nearly the same cost, the compass search ended 0.24 dB worse, at (−0.6, +0.4, 0).
+It followed raw screening values, which were wrong by −0.27 to +0.34 dB on the points it promoted. Its
+first poll, `arm` +0.8 alone, screened at −3.68 dB, so it turned towards shorter arms. The surrogate's
+optimum lies the other way: a longer arm only pays off together with a wider clearance. Its best screening
+point, (−0.8, +0.4, 0), scored −0.75 dB at screening and −0.85 dB at full fidelity. This is one run of each
+method on one problem, so the synthetic benchmark above is the basis for comparing them. The MTH run agrees
+with it.
+
+One full run of the as-built model is 7.07e11 cells × steps. At the idle rates of Stage 2 (77 s per screening
+run, 258 s per full run), a 16 + 5 search takes about 42 min of GPU time, against about 69 min for 16 full
+solves. Trajectory of full solves (the as-built model
 scores −0.914 dB):
 
 | after | full solve at (arm, feed, clr) mm | predicted | full | why |
@@ -470,15 +490,29 @@ Caveats:
 
 The proposal's fourth stage is a decision: adjoint sensitivities, another solver, or local time stepping,
 "only after profiling identifies the remaining dominant cost". The profile, on the MTH screening run of the
-as-built board (4.45 M cells, 49 152 steps):
+as-built board (4.45 M cells, 49 152 steps), on an idle GPU:
 
 | phase | time | share |
 |---|---|---|
-| set-up and mesh build | 0.8 s | 0.3 % |
-| time stepping (Metal) | 259.6 s | 94.6 % |
-| far-field transform (CPU, 1.0 M face samples, 3 frequencies) | 13.8 s | 5.0 % |
+| set-up and mesh build | 0.4 s | 0.5 % |
+| time stepping (Metal) | 75.3 s | 97.8 % |
+| far-field transform (CPU, 1.0 M face samples, 3 frequencies) | 1.0 s | 1.3 % |
 
-KERNEL_BENCH
+The time stepping is the field-update kernel itself, not the bookkeeping around it. Each run below is 8000
+steps on the same screening mesh, on an idle GPU:
+
+| configuration | rate |
+|---|---|
+| `fieldsolve bench` (update, PML, source, conductor loss, port probes; no DFTs, no checks) | 3080 Mcell/s |
+| screening spec, no objective, no far-field box | 3043 Mcell/s |
+| + far-field box (gathered DFT every 414 steps) | 3033 Mcell/s |
+| + objective, evaluated every 1000 steps (port spectra and box flux on the CPU) | 3020 Mcell/s |
+
+The accumulators and the objective checks cost about 2 % together. The whole 49 152-step run reaches
+2908 Mcell/s, 6 % below the bench. Nothing outside the update is worth optimising first.
+
+(An earlier profile of the same run, taken while another session's queue shared the GPU, showed 843 Mcell/s
+and a 5 % far-field share. Both were contention.)
 
 Inside the stepping, the step count is the product of two things:
 - **Physical time:** 4.9 ns, set by the objective's settling against the slowly decaying 2.67 GHz
