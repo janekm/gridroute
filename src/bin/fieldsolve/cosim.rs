@@ -477,8 +477,13 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
                 return Err(format!("variant {vname:?}: EM port {n:?} has no part (use \"open\" to leave it open)"));
             }
         }
+        // red: S at the requested references (what the report shows); red0: the same network at the EM
+        // file's real reference, from which physical impedances are taken and which the Touchstone export
+        // uses unless every requested reference is one real value it can declare
         let mut red: Vec<Vec<Vec<Cx>>> = vec![vec![Vec::with_capacity(freqs.len()); keep.len()]; keep.len()];
+        let mut red0: Vec<Vec<Vec<Cx>>> = vec![vec![Vec::with_capacity(freqs.len()); keep.len()]; keep.len()];
         let mut ideal: Vec<[[Cx; 2]; 2]> = Vec::new();
+        let mut ideal0: Vec<Cx> = Vec::new();
         for (fi, &f) in freqs.iter().enumerate() {
             let sf: Vec<Vec<Cx>> = (0..em.s.len()).map(|i| (0..em.s.len()).map(|j| em.s[i][j][fi]).collect()).collect();
             let t: Vec<(usize, Cx)> = parts.iter().map(|(k, p)| (*k, p.gamma(f, em.z0))).collect();
@@ -488,17 +493,20 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
                 let zs: Vec<Cx> = keep.iter().map(|&k| Cx::new(0.0, -w * bar_l.get(&names[k]).copied().unwrap_or(0.0))).collect();
                 r = add_series(&r, em.z0, &zs);
             }
+            let r0 = r.clone();
             if renorm {
                 r = renormalise(&r, em.z0, &zr);
             }
             for i in 0..keep.len() {
                 for j in 0..keep.len() {
                     red[i][j].push(r[i][j]);
+                    red0[i][j].push(r0[i][j]);
                 }
             }
             if !ladder_spec.is_empty() {
                 let steps: Vec<(bool, Part)> = ladder_spec.iter().map(|(sh, n)| (*sh, by_name.get(n).cloned().unwrap_or(Part::Open))).collect();
                 let mut l = ladder(&steps, f, em.z0);
+                ideal0.push(l[0][0]);
                 if renorm && keep.len() == 2 {
                     let m = vec![vec![l[0][0], l[0][1]], vec![l[1][0], l[1][1]]];
                     let m = renormalise(&m, em.z0, &zr);
@@ -508,7 +516,11 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
             }
         }
         let safe: String = vname.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        crate::post::write_touchstone(&out.join(format!("{safe}.s{}p", keep.len())), freqs, &red, em.z0).map_err(|e| e.to_string())?;
+        // Touchstone v1 declares one real reference for all ports: export the renormalised data only when
+        // that is what was asked for, otherwise the network at the EM file's reference
+        let one_real = zr.iter().all(|z| z.im.abs() < 1e-12 && (z.re - zr[0].re).abs() < 1e-12);
+        let (exp, exp_z0) = if !renorm { (&red, em.z0) } else if one_real { (&red, zr[0].re) } else { (&red0, em.z0) };
+        crate::post::write_touchstone(&out.join(format!("{safe}.s{}p", keep.len())), freqs, exp, exp_z0).map_err(|e| e.to_string())?;
         let (col, col2) = if plot_ideal {
             (colours[(2 * vk) % colours.len()], colours[(2 * vk + 1) % colours.len()])
         } else {
@@ -518,14 +530,14 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         for &fr in &report {
             let fi = at(fr);
             let (s11, s21) = (red[0][0][fi], if keep.len() > 1 { red[1][0][fi] } else { Cx::default() });
-            let z = zin(s11, zr[0].re);
+            let z = zin(red0[0][0][fi], em.z0);
             println!("{:<24} {:>8.3} {:>9.2} {:>9.2} {:>9.2} {:+8.2}j{}", format!("{vname} + layout"), freqs[fi] / 1e9, db(s11), db(s21), z.re, z.im, tcol(z, fi));
             let mut row = json!({"f": freqs[fi], "s11_db": db(s11), "s21_db": db(s21), "zin": [z.re, z.im]});
             if let Some(g) = gam_t(z, fi) {
                 row["gamma_vs_target"] = json!(g);
             }
             if let Some(l) = ideal.get(fi) {
-                let zi = zin(l[0][0], zr[0].re);
+                let zi = zin(ideal0[fi], em.z0);
                 if plot_ideal {
                     println!("{:<24} {:>8.3} {:>9.2} {:>9.2} {:>9.2} {:+8.2}j{}", format!("{vname}, ideal ladder"), freqs[fi] / 1e9, db(l[0][0]), db(l[1][0]), zi.re, zi.im, tcol(zi, fi));
                 }
@@ -533,7 +545,7 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
             }
             rows.push(row);
         }
-        let mut vjson = json!({"touchstone": format!("{safe}.s{}p", keep.len()), "report": rows});
+        let mut vjson = json!({"touchstone": format!("{safe}.s{}p", keep.len()), "touchstone_z0": exp_z0, "report": rows});
         // radiated vs conducted: drive the first kept port with 1 W incident, the parts set the waves on
         // their ports, the other kept ports are matched; the per-port patterns add with those waves
         if let Some((ffreq, fnames, fpats)) = &far {

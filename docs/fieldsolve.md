@@ -31,10 +31,13 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
 
 - **Geometry.** Copper is a zero-thickness conductor on the mesh plane of its layer (perfect, or with a surface impedance: see conductor loss below), as in openEMS
   PCB models and gerber2ems. An in-plane E edge is metal when its midpoint lies in copper. Gerber
-  primitives (flashes, macros, tracks as capsules, regions, LPC clears) are rasterised in file order.
+  primitives (flashes, macros, tracks as capsules, regions, LPC clears) are rasterised in file order. An
+  aperture macro's exposure-off primitives cut holes in that aperture's own image only, so copper drawn
+  earlier shows through them (as the Gerber specification requires).
   Plated holes are solid conductor columns: z edges at the mesh nodes inside the drill, or at the nearest
   node for holes thinner than a cell. Copper is only rasterised inside the fine-meshed copper window (ROI
-  plus `air`).
+  plus `air`). Outside it, whatever crosses the window's edge continues straight out to the grid boundary,
+  so a cropped plane or track runs into the absorbing layer instead of ending inside the domain.
 - **Net-aware raster.** Every metal edge remembers the Gerber net (X2 `.N`) of the copper that painted
   it. Wherever two nets' edges would share a mesh node (a gap of about a cell or less), the minority net's
   edges at that node are dropped. Wherever a via barrel's nodes touch another net's copper (an antipad too
@@ -94,7 +97,8 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   - `"energy"`: stop when the total field energy falls `end_db` (default −70 dB) below its peak.
 
   With a far-field box the run also waits for the Poynting flux through the box to settle, at every far-field
-  frequency, to within `farfield.tol` (default 1 %). Stopping on the ports alone underestimated radiated
+  frequency, to within `farfield.tol` (default 1 %). That check gates both rules: neither ends a run before
+  the flux has settled, and only `max_steps` does. Stopping on the ports alone underestimated radiated
   power by 1.3-2.2 dB on 1BP. Every run logs the late-time energy decay: dB/ns and the Q it implies at
   fmax/3. A positive rate is flagged as numerical growth, not ringing.
 
@@ -144,6 +148,10 @@ Ports and elements come in two forms:
   Optionally `"size": [w, h]` spreads the port over an area.
 - **In-plane, between two pads.** `"pos"`/`"neg"` with `"layer"`. A copper bar as wide as the smaller pad
   joins the pads, and a one-cell gap at the midpoint holds the element: the body of a two-terminal part.
+  For pads not on a common mesh line (a part rotated by, say, 45°, offset by more than 1.5 cells across the
+  dominant axis) the bar is a one-cell staircase along the mesh from each pad centre instead, and the gap
+  sits in the middle of the copper-free stretch between the pads, not at the midpoint (which can lie in a
+  pad's own copper or a pour). `"straight": true` forces the old straight bar.
   The element's edges span 80 % of the bar's width, and the gap column is cleared of other copper (a pour
   between the pads would otherwise short the element). With edges on the full width, the outermost ones
   could have no metal at one end: they carried source and probe without being in the circuit, which read
@@ -215,7 +223,10 @@ Optional settings:
 - **`ladder`:** the same parts are also cascaded as an ideal ladder (ABCD) with no layout, so the
   layout's own effect is the difference between the two.
 - **`zref`:** renormalises the kept ports to complex reference impedances (power waves), e.g. a chip's
-  optimum load.
+  optimum load. The report's S columns use these references; its impedances are always physical. A
+  Touchstone v1 file declares one real reference, so the exported network is renormalised only when every
+  `zref` is the same real value; otherwise it is written at the EM file's reference (`touchstone_z0` in
+  `cosim.json` says which).
 - **`target`:** a measured matching network, a two-port with port 1 on the chip side. Loaded with 50 Ω,
   it gives the impedance the chip is designed to see. Each case gets a column |Γ| = |(Zin − Zt)/(Zin + Zt*)|
   against it, which is only meaningful in band. Use the vendor's own measured reference network: it
@@ -467,14 +478,16 @@ the captions.
 A spec's `"frames": {"layers": ["F.Cu", "In1.Cu"], "every_ps": 2, "until_ps": 500}` records the surface
 current on those layers during the first excitation. The output is `frames/J_<layer>_<NNNN>.f32` plus
 `frames.json`. `post::tdr` turns S11 on a uniform grid from DC into a TDR impedance curve, with a Gaussian
-edge of 0.88 / f_top (44 ps for 20 GHz).
+edge of 0.88 / f_top (44 ps for 20 GHz). The step integrates from before t = 0, because the window spreads
+a reflection at the port itself symmetrically in time; starting at t = 0 had read an open as about half a
+reflection.
 
 `fieldsolve gap --out DIR` is the demonstration case: a fast edge on a 50 Ω microstrip (0.2 mm FR4,
 30 mm long, matched at both ends) whose ground plane has a 1 × 10 mm slot across the trace's path. It is
 run with and without the slot, and writes `tdr.svg`/`tdr.json` and the frames of both runs.
 
-- **Solid plane:** the TDR is flat at 49.9 Ω.
-- **With the slot:** a 112 Ω inductive bump at the slot. The return current, which runs under the trace,
+- **Solid plane:** the TDR is flat at 48.9-49.0 Ω.
+- **With the slot:** a 110 Ω inductive bump at the slot. The return current, which runs under the trace,
   has to detour around the slot's ends; you can watch it crowd along the slot edges.
 
 ```sh

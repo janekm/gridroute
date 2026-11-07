@@ -202,6 +202,7 @@ fn map_shape(s: &Shape, f: &dyn Fn(P2) -> P2, rs: f64) -> Shape {
         Shape::Circle { c, r } => Shape::Circle { c: f(*c), r: r * rs },
         Shape::Capsule { a, b, r } => Shape::Capsule { a: f(*a), b: f(*b), r: r * rs },
         Shape::Polygon(p) => Shape::Polygon(p.iter().map(|&q| f(q)).collect()),
+        Shape::Macro(parts) => Shape::Macro(parts.iter().map(|(s, on)| (map_shape(s, f, rs), *on)).collect()),
     }
 }
 
@@ -215,6 +216,7 @@ fn shape_pts(s: &Shape) -> Vec<P2> {
             v
         }
         Shape::Polygon(p) => p.clone(),
+        Shape::Macro(parts) => parts.iter().filter(|(_, on)| *on).flat_map(|(s, _)| shape_pts(s)).collect(),
     }
 }
 
@@ -223,6 +225,7 @@ fn non_degenerate(s: &Shape) -> bool {
     match s {
         Shape::Circle { r, .. } | Shape::Capsule { r, .. } => *r > 0.0,
         Shape::Polygon(p) => p.len() >= 3 && poly_area(p).abs() > 1e-14,
+        Shape::Macro(parts) => parts.iter().any(|(s, on)| *on && non_degenerate(s)),
     }
 }
 
@@ -867,9 +870,15 @@ impl Gerber {
                 self.emit(Shape::Circle { c, r: d / 2.0 * xf.s }, self.dark);
             }
             Aperture::Shapes(shapes) => {
-                for (s, exposed) in shapes {
-                    let sh = map_shape(&s, &|p| add(at, xf.apply(p)), xf.s);
-                    self.emit(sh, self.dark && exposed);
+                // the macro's primitives make one aperture image (exposure off cuts holes in that image
+                // only); the flash then paints the image with the current polarity
+                let parts: Vec<(Shape, bool)> = shapes.iter().map(|(s, exposed)| (map_shape(s, &|p| add(at, xf.apply(p)), xf.s), *exposed)).collect();
+                if parts.iter().all(|(_, on)| *on) {
+                    for (sh, _) in parts {
+                        self.emit(sh, self.dark);
+                    }
+                } else {
+                    self.emit(Shape::Macro(parts), self.dark);
                 }
             }
         }
@@ -1779,6 +1788,14 @@ pub fn load_dir(dir: &Path) -> Result<Board, String> {
 fn svg_shape(s: &Shape, out: &mut String) {
     use std::fmt::Write;
     match s {
+        // debug view: the exposed primitives only (the macro's holes are not drawn)
+        Shape::Macro(parts) => {
+            for (p, on) in parts {
+                if *on {
+                    svg_shape(p, out);
+                }
+            }
+        }
         Shape::Circle { c, r } => {
             let _ = write!(out, "<circle cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\"/>", c.x, c.y, r);
         }
@@ -2071,13 +2088,14 @@ mod tests {
         let p = parse_gerber(&g).unwrap();
         let b = p[0].shape.bbox();
         assert!(close(b.x1 - b.x0, 0.5, 1e-9) && close(b.y1 - b.y0, 2.0, 1e-9));
-        // exposure off -> clear prim; variable definitions
+        // exposure off -> a hole in the aperture's own image (one macro prim, dark); variable definitions
         let g =
             format!("{HDR}%AMDONUT*\n$3=$1x0.5*\n1,1,$1,0,0*\n1,0,$3,0,0*%\n%ADD13DONUT,1.0*%\nD13*\nX0Y0D03*\nM02*\n");
         let p = parse_gerber(&g).unwrap();
-        assert_eq!(p.len(), 2);
-        assert!(p[0].dark && !p[1].dark);
-        assert_eq!(p[1].shape, Shape::Circle { c: P2::new(0.0, 0.0), r: 0.25 });
+        assert_eq!(p.len(), 1);
+        assert!(p[0].dark);
+        assert!(matches!(&p[0].shape, Shape::Macro(parts) if parts.len() == 2 && parts[1] == (Shape::Circle { c: P2::new(0.0, 0.0), r: 0.25 }, false)));
+        assert!(p[0].shape.contains(P2::new(0.4, 0.0)) && !p[0].shape.contains(P2::new(0.1, 0.0)));
     }
 
     #[test]

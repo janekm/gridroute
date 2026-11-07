@@ -492,23 +492,24 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
             let en: f64 = read(&eout, ny * nz).iter().map(|&x| x as f64).sum();
             ehist.push((steps, en));
             peak = peak.max(en);
-            if steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
-                done = true;
-            }
             if !en.is_finite() {
                 return Err(format!("fields diverged at step {steps}"));
             }
+            // as on the CPU: a configured gathered-field metric gates every convergence exit
+            let gs = match &spec.gather_metric {
+                Some(m) => {
+                    // unified memory: read the accumulators in place
+                    let cur: Vec<[Vec<f32>; 6]> = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
+                    ghist.push((m.0)(&cur));
+                    crate::fdtd::gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
+                }
+                None => true,
+            };
+            if gs && steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
+                done = true;
+            }
             if spec.port_stop {
                 let pd = crate::fdtd::ports_decayed(&v, spec.check_every, spec.end_db, &mut port_peak) && steps > spec.exc.len();
-                let gs = match &spec.gather_metric {
-                    Some(m) => {
-                        // unified memory: read the accumulators in place
-                        let cur: Vec<[Vec<f32>; 6]> = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
-                        ghist.push((m.0)(&cur));
-                        crate::fdtd::gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
-                    }
-                    None => true,
-                };
                 if pd && gs {
                     done = true;
                 }

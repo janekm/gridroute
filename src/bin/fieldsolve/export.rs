@@ -27,21 +27,49 @@ fn write_f32(path: &Path, v: &[f32]) -> std::io::Result<()> {
     std::fs::write(path, b)
 }
 
-/// Complex component `c` (0..6) at node (i,j,k), averaged from its staggered samples.
+/// Complex component `c` (0..6) at node (i,j,k), averaged from its staggered samples: E_a from its two
+/// samples along a, H_a from its four samples in the plane across a (offsets fixed, no allocation).
 fn node_val(p: &Problem, fd: &[Vec<f32>; 6], c: usize, i: usize, j: usize, k: usize) -> (f32, f32) {
+    let a = c % 3;
+    let mut offs = [[0isize; 3]; 4];
+    let len = if c >= 3 {
+        let (b, d) = ((a + 1) % 3, (a + 2) % 3);
+        offs[1][b] = -1;
+        offs[2][d] = -1;
+        offs[3][b] = -1;
+        offs[3][d] = -1;
+        4
+    } else {
+        offs[1][a] = -1;
+        2
+    };
+    let (mut re, mut im, mut n) = (0.0f32, 0.0f32, 0.0f32);
+    for o in &offs[..len] {
+        let (ii, jj, kk) = (i as isize + o[0], j as isize + o[1], k as isize + o[2]);
+        if ii < 0 || jj < 0 || kk < 0 || ii >= p.nx as isize || jj >= p.ny as isize || kk >= p.nz as isize {
+            continue;
+        }
+        let id = ((kk as usize * p.ny + jj as usize) * p.nx + ii as usize) * 2;
+        re += fd[c][id];
+        im += fd[c][id + 1];
+        n += 1.0;
+    }
+    if n > 0.0 {
+        (re / n, im / n)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// The previous allocating version, kept to check the fixed-offset one against.
+#[cfg(test)]
+fn node_val_reference(p: &Problem, fd: &[Vec<f32>; 6], c: usize, i: usize, j: usize, k: usize) -> (f32, f32) {
     let (nx, ny, nz) = (p.nx, p.ny, p.nz);
     let a = c % 3;
-    let is_h = c >= 3;
-    // E_a is staggered along a; H_a is staggered along the two other axes
     let mut offs: Vec<[isize; 3]> = vec![[0, 0, 0]];
-    let stag: Vec<usize> = if is_h { vec![(a + 1) % 3, (a + 2) % 3] } else { vec![a] };
+    let stag: Vec<usize> = if c >= 3 { vec![(a + 1) % 3, (a + 2) % 3] } else { vec![a] };
     for s in stag {
-        let mut more = Vec::new();
-        for o in &offs {
-            let mut q = *o;
-            q[s] = -1;
-            more.push(q);
-        }
+        let more: Vec<[isize; 3]> = offs.iter().map(|o| { let mut q = *o; q[s] = -1; q }).collect();
         offs.extend(more);
     }
     let (mut re, mut im, mut n) = (0.0f32, 0.0f32, 0.0f32);
@@ -55,10 +83,29 @@ fn node_val(p: &Problem, fd: &[Vec<f32>; 6], c: usize, i: usize, j: usize, k: us
         im += fd[c][id + 1];
         n += 1.0;
     }
-    if n > 0.0 {
-        (re / n, im / n)
-    } else {
-        (0.0, 0.0)
+    if n > 0.0 { (re / n, im / n) } else { (0.0, 0.0) }
+}
+
+#[cfg(test)]
+mod node_val_tests {
+    use super::*;
+    #[test]
+    fn fixed_offsets_match_the_allocating_version_exactly() {
+        let g = crate::mesh::Grid { x: (0..7).map(|v| v as f64 * 1e-3).collect(), y: (0..6).map(|v| v as f64 * 1e-3).collect(), z: (0..5).map(|v| v as f64 * 1e-3).collect() };
+        let p = crate::model::build(&g, &crate::model::Layout::default(), &[], &crate::model::BuildOpts { pml: [0; 6], ..Default::default() });
+        let n = p.nx * p.ny * p.nz * 2;
+        let mut seed = 12345u64;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 33) as f32) / (1u64 << 31) as f32 - 0.5 };
+        let fd: [Vec<f32>; 6] = std::array::from_fn(|_| (0..n).map(|_| rnd()).collect());
+        for c in 0..6 {
+            for k in 0..p.nz {
+                for j in 0..p.ny {
+                    for i in 0..p.nx {
+                        assert_eq!(node_val(&p, &fd, c, i, j, k), node_val_reference(&p, &fd, c, i, j, k), "c {c} at {i},{j},{k}");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -104,7 +151,8 @@ pub fn write_copper_obj(path: &Path, prims: &[crate::geom::Prim], z: f64) -> std
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut nv = 0usize;
     for pr in prims.iter().filter(|p| p.dark) {
-        let pts: Vec<P2> = match &pr.shape {
+        let pts: Vec<P2> = match &pr.shape.outline_shape() {
+            Shape::Macro(_) => Vec::new(), // outline_shape never returns a macro
             Shape::Polygon(v) => v.clone(),
             Shape::Circle { c, r } => (0..24).map(|k| {
                 let t = k as f64 / 24.0 * std::f64::consts::TAU;

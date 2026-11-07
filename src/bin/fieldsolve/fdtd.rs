@@ -552,18 +552,20 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
             let en = energy(&s);
             ehist.push((steps, en));
             peak = peak.max(en);
-            if steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
+            // a configured gathered-field metric (e.g. the far field) gates every convergence exit, energy-
+            // and port-based alike; only max_steps ends a run without it
+            let gs = match &spec.gather_metric {
+                Some(m) => {
+                    ghist.push((m.0)(&gathered));
+                    gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
+                }
+                None => true,
+            };
+            if gs && steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
                 break;
             }
             if spec.port_stop {
                 let pd = ports_decayed(&v, spec.check_every, spec.end_db, &mut port_peak) && steps > spec.exc.len();
-                let gs = match &spec.gather_metric {
-                    Some(m) => {
-                        ghist.push((m.0)(&gathered));
-                        gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
-                    }
-                    None => true,
-                };
                 if pd && gs {
                     break;
                 }

@@ -59,8 +59,32 @@ impl std::ops::Div for Cx {
     }
 }
 
-/// DFT of samples `x[n]` taken at times `(n + t_off) * dt`.
+/// DFT of samples `x[n]` taken at times `(n + t_off) * dt`. The phase advances by a fixed rotation per
+/// sample instead of a sin/cos each; it is recomputed exactly every `REANCHOR` samples, so rounding in the
+/// recurrence cannot accumulate over long records.
 pub fn dft(x: &[f64], dt: f64, t_off: f64, freqs: &[f64]) -> Vec<Cx> {
+    const REANCHOR: usize = 1024;
+    freqs
+        .iter()
+        .map(|&f| {
+            let w = -2.0 * PI * f * dt;
+            let (ss, cs) = w.sin_cos();
+            let (mut re, mut im) = (0.0, 0.0);
+            for (b, chunk) in x.chunks(REANCHOR).enumerate() {
+                let (mut s, mut c) = (w * ((b * REANCHOR) as f64 + t_off)).sin_cos();
+                for &v in chunk {
+                    re += v * c;
+                    im += v * s;
+                    (c, s) = (c * cs - s * ss, s * cs + c * ss);
+                }
+            }
+            Cx::new(re * dt, im * dt)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn dft_direct(x: &[f64], dt: f64, t_off: f64, freqs: &[f64]) -> Vec<Cx> {
     freqs
         .iter()
         .map(|&f| {
@@ -74,6 +98,29 @@ pub fn dft(x: &[f64], dt: f64, t_off: f64, freqs: &[f64]) -> Vec<Cx> {
             Cx::new(re * dt, im * dt)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod dft_tests {
+    use super::*;
+    #[test]
+    fn recurrence_matches_direct_dft_including_dc_offsets_long_records_and_nulls() {
+        let dt = 1e-13;
+        // a long record (beyond many re-anchor blocks) of a decaying tone plus a DC step
+        let n = 300_000;
+        let x: Vec<f64> = (0..n).map(|k| { let t = k as f64 * dt; 0.3 + (2.0 * PI * 2.4e9 * t).sin() * (-t / 2e-9).exp() }).collect();
+        let freqs: Vec<f64> = std::iter::once(0.0).chain((1..300).map(|k| k as f64 * 3e7)).collect();
+        for t_off in [0.0, 0.5, 1.0] {
+            let a = dft(&x, dt, t_off, &freqs);
+            let b = dft_direct(&x, dt, t_off, &freqs);
+            let peak = b.iter().map(|v| v.abs()).fold(0.0, f64::max);
+            for (k, (p, q)) in a.iter().zip(&b).enumerate() {
+                let e = (*p - *q).abs();
+                // relative to each bin where it is not tiny, and to the peak everywhere (deep nulls)
+                assert!(e <= 1e-9 * q.abs().max(1e-6 * peak), "t_off {t_off} bin {k}: {p:?} vs {q:?}");
+            }
+        }
+    }
 }
 
 /// Voltage and current spectra of one port. `v` are the probe voltages at integer steps 0..=N, `vs` the
@@ -176,7 +223,8 @@ pub fn s_column(v: &[Vec<Cx>], i: &[Vec<Cx>], z0: f64, j: usize) -> Vec<Vec<Cx>>
         .collect()
 }
 
-/// Touchstone v1 file, RI format; `s[i][j][f]`.
+/// Touchstone v1 file, RI format; `s[i][j][f]`. Two ports: S11 S21 S12 S22 on one line. More ports: one
+/// matrix row per line (the first on the frequency's line), continued after every four pairs.
 pub fn write_touchstone(path: &std::path::Path, freqs: &[f64], s: &[Vec<Vec<Cx>>], z0: f64) -> std::io::Result<()> {
     use std::fmt::Write as _;
     let n = s.len();
@@ -187,7 +235,7 @@ pub fn write_touchstone(path: &std::path::Path, freqs: &[f64], s: &[Vec<Vec<Cx>>
         // Touchstone 2-port order is S11 S21 S12 S22; N > 2 is row-major
         let order: Vec<(usize, usize)> = if n == 2 { vec![(0, 0), (1, 0), (0, 1), (1, 1)] } else { (0..n).flat_map(|i| (0..n).map(move |j| (i, j))).collect() };
         for (q, (i, j)) in order.into_iter().enumerate() {
-            if n > 2 && q > 0 && q % 4 == 0 {
+            if n > 2 && q > 0 && (j == 0 || j % 4 == 0) {
                 o.push('\n');
             }
             let x = s[i][j][fi];
@@ -232,7 +280,15 @@ pub fn tdr(freqs: &[f64], s11: &[Cx], z0: f64, t_max: f64, nt: usize) -> (Vec<f6
         }
         2.0 * df * s
     };
-    let mut prev = h(0.0);
+    // the window spreads a reflection at t = 0 symmetrically in time (a Gaussian of width ~ 1/(pi fg)), so
+    // the step starts integrating from where that has died away, not from t = 0
+    let n_neg = (4.0 / fg / dt).ceil() as usize;
+    let mut prev = h(-(n_neg as f64) * dt);
+    for k in (0..n_neg).rev() {
+        let cur = h(-(k as f64) * dt);
+        acc += 0.5 * (prev + cur) * dt;
+        prev = cur;
+    }
     let ts: Vec<f64> = (0..nt).map(|k| k as f64 * dt).collect();
     for (k, &t) in ts.iter().enumerate() {
         if k > 0 {

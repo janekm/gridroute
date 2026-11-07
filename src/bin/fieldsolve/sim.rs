@@ -304,6 +304,9 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     enum Geo {
         Vert { c: P2, half: [f64; 2], z0: f64, z1: f64, plus_hi: bool },
         Plane { a: P2, b: P2, axis: usize, w: f64, z: f64, layer: String },
+        /// pads not on a common mesh line (a part rotated by e.g. 45°): a one-cell staircase bar along the
+        /// mesh from each pad centre to a one-cell gap at the part's midpoint
+        Diag { a: P2, b: P2, m: P2, axis: usize, z: f64, layer: String },
     }
     let mut geos = Vec::new();
     let mut bars = Vec::new();
@@ -343,6 +346,44 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 port_nets(&pd.name, (cx.net_at(a, &layer), &layer), (cx.net_at(b, &layer), &layer), false);
             }
             let axis = if (b.x - a.x).abs() >= (b.y - a.y).abs() { 0 } else { 1 };
+            // a straight bar along one axis only reaches the far pad when both pads sit on (nearly) one line.
+            // For a rotated part the bar would end beside the far pad, usually on the near pad's own copper
+            // (shorting the port), so lay a staircase along the line between the pad centres instead.
+            let off = if axis == 0 { (b.y - a.y).abs() } else { (b.x - a.x).abs() };
+            if off > 1.5 * cell && !e.get("straight").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let z = cx.z_of(&layer)?;
+                let n = 400;
+                let len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+                let free: Vec<bool> = (0..n)
+                    .map(|k| {
+                        let t = (k as f64 + 0.5) / n as f64;
+                        cx.net_at(P2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t), &layer).is_none()
+                    })
+                    .collect();
+                let bare = free.iter().filter(|&&f| f).count();
+                let gap = bare as f64 / n as f64 * len;
+                bars.push((pd.name.clone(), gap, cell, strip_inductance_nh(gap, cell)));
+                // the element's gap goes in the middle of the longest copper-free stretch of the line (the
+                // clearance the part body spans), not at the midpoint: that may lie in one pad's copper or
+                // pour, which would bridge the gap
+                let (mut best, mut run) = ((0usize, 0usize), None::<usize>);
+                for k in 0..=n {
+                    match (k < n && free[k], run) {
+                        (true, None) => run = Some(k),
+                        (false, Some(s0)) => {
+                            if k - s0 > best.1 - best.0 {
+                                best = (s0, k);
+                            }
+                            run = None;
+                        }
+                        _ => {}
+                    }
+                }
+                let t = if best.1 > best.0 { 0.5 * (best.0 + best.1) as f64 / n as f64 } else { 0.5 };
+                let m = P2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                geos.push(Geo::Diag { a, b, m, axis, z, layer });
+                continue;
+            }
             // bridge width: the smaller pad dimension across the axis
             let wa = if axis == 0 { ba.y1 - ba.y0 } else { ba.x1 - ba.x0 };
             let wb = if axis == 0 { bb.y1 - bb.y0 } else { bb.x1 - bb.x0 };
@@ -480,6 +521,86 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 hi[2] = *z;
                 lumped.push(Lumped { name: pd.name.clone(), axis: *axis, lo, hi, plus_at_hi: pa > pb, r: if kind == "short" { 0.0 } else { r }, c, port: pd.port });
             }
+            Geo::Diag { a, b, m, axis, z, layer } => {
+                let sheet = sheets.iter_mut().find(|s| &s.name == layer).unwrap();
+                let (ax, o) = (*axis, 1 - *axis);
+                let gl = [&gx, &gy];
+                let pc = |p: &P2, k: usize| if k == 0 { p.x } else { p.y };
+                let node = |p: &P2| [crate::mesh::snap(&gx, p.x), crate::mesh::snap(&gy, p.y)];
+                let mut i = crate::mesh::snap(gl[ax], pc(m, ax));
+                if i + 1 >= gl[ax].len() {
+                    i -= 1;
+                }
+                let jm = crate::mesh::snap(gl[o], pc(m, o));
+                // the gap edge runs along `ax` from line i to i+1 on cross line jm; each pad's staircase ends
+                // on its own side of it
+                let a_low = pc(a, ax) < pc(b, ax);
+                let mut ga = [0usize; 2];
+                let mut gb = [0usize; 2];
+                ga[ax] = if a_low { i } else { i + 1 };
+                gb[ax] = if a_low { i + 1 } else { i };
+                ga[o] = jm;
+                gb[o] = jm;
+                // a mesh edge as a thin strip of copper: only that edge's midpoint falls inside it
+                let mut edge_bar = |p: [usize; 2], q: [usize; 2]| {
+                    let (x0, x1) = (gx[p[0]].min(gx[q[0]]), gx[p[0]].max(gx[q[0]]));
+                    let (y0, y1) = (gy[p[1]].min(gy[q[1]]), gy[p[1]].max(gy[q[1]]));
+                    let tx = 0.3 * (gx[(p[0] + 1).min(gx.len() - 1)] - gx[p[0].saturating_sub(1)]).abs() / 2.0;
+                    let ty = 0.3 * (gy[(p[1] + 1).min(gy.len() - 1)] - gy[p[1].saturating_sub(1)]).abs() / 2.0;
+                    let pts = vec![P2::new(x0 - tx, y0 - ty), P2::new(x1 + tx, y0 - ty), P2::new(x1 + tx, y1 + ty), P2::new(x0 - tx, y1 + ty)];
+                    sheet.prims.push(Prim { shape: Shape::Polygon(pts), dark: true, net: Some(format!("~{}", pd.name)), pad: None });
+                };
+                // 4-connected walk in index space from s to t (alternating steps keep it on the straight line)
+                let mut walk = |s: [usize; 2], t: [usize; 2]| {
+                    let (mut cur, d) = (s, [t[0] as i64 - s[0] as i64, t[1] as i64 - s[1] as i64]);
+                    let n = d[0].abs() + d[1].abs();
+                    for k in 1..=n {
+                        // ideal position after k unit steps along the straight line
+                        let f = k as f64 / n as f64;
+                        let want = [s[0] as f64 + d[0] as f64 * f, s[1] as f64 + d[1] as f64 * f];
+                        let ex = (want[0] - cur[0] as f64).abs() - (want[1] - cur[1] as f64).abs();
+                        let mut nxt = cur;
+                        if ex >= 0.0 && cur[0] != t[0] {
+                            nxt[0] = (cur[0] as i64 + d[0].signum()) as usize;
+                        } else if cur[1] != t[1] {
+                            nxt[1] = (cur[1] as i64 + d[1].signum()) as usize;
+                        } else {
+                            nxt[0] = (cur[0] as i64 + d[0].signum()) as usize;
+                        }
+                        edge_bar(cur, nxt);
+                        cur = nxt;
+                    }
+                };
+                if kind == "short" && !pd.port {
+                    walk(node(a), node(b));
+                    continue;
+                }
+                walk(node(a), ga);
+                walk(gb, node(b));
+                let g0 = gl[ax][i];
+                let g1 = gl[ax][i + 1];
+                let cl = gl[o][jm];
+                let h = 0.5 * (gl[o][(jm + 1).min(gl[o].len() - 1)] - gl[o][jm.saturating_sub(1)]);
+                // clear the gap edge itself (and only it) of any copper bridging it
+                {
+                    let (u0, u1, v0, v1) = (g0 + 1e-6, g1 - 1e-6, cl - 0.5 * h, cl + 0.5 * h);
+                    let pts = if ax == 0 {
+                        vec![P2::new(u0, v0), P2::new(u1, v0), P2::new(u1, v1), P2::new(u0, v1)]
+                    } else {
+                        vec![P2::new(v0, u0), P2::new(v1, u0), P2::new(v1, u1), P2::new(v0, u1)]
+                    };
+                    sheet.prims.push(Prim { shape: Shape::Polygon(pts), dark: false, net: None, pad: None });
+                }
+                let mut lo = [0.0; 3];
+                let mut hi = [0.0; 3];
+                lo[ax] = g0;
+                hi[ax] = g1;
+                lo[o] = cl - 0.4 * h;
+                hi[o] = cl + 0.4 * h;
+                lo[2] = *z;
+                hi[2] = *z;
+                lumped.push(Lumped { name: pd.name.clone(), axis: ax, lo, hi, plus_at_hi: !a_low, r: if kind == "short" { 0.0 } else { r }, c, port: pd.port });
+            }
         }
     }
 
@@ -614,7 +735,8 @@ pub fn raster_json(st: &Setup, p: &Problem) -> Value {
 /// Scene file: exactly what was simulated, for an independent solver (tools/openems_scene.py).
 pub fn scene_json(st: &Setup, p: &Problem, exc_port: Option<usize>) -> Value {
     let poly = |p: &Prim| -> Vec<[f64; 2]> {
-        let pts: Vec<P2> = match &p.shape {
+        let pts: Vec<P2> = match &p.shape.outline_shape() {
+            Shape::Macro(_) => Vec::new(), // outline_shape never returns a macro
             Shape::Polygon(v) => v.clone(),
             Shape::Circle { c, r } => (0..32).map(|k| {
                 let t = k as f64 / 32.0 * std::f64::consts::TAU;

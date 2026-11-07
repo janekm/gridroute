@@ -357,17 +357,36 @@ pub fn sheet_masks(g: &Grid, lay: &Layout) -> (Vec<SheetMask>, Vec<String>) {
                 paint(&mut ey, &mut eyn, net, nx, &xmm, &yh, p);
             }
             if let Some(w) = lay.copper_window {
-                for j in 0..ny {
-                    for i in 0..nx {
-                        let q = j * nx + i;
-                        if ex[q] && !w.contains(P2::new(xh[i], ymm[j])) {
-                            ex[q] = false;
-                        }
-                        if ey[q] && !w.contains(P2::new(xmm[i], yh[j])) {
-                            ey[q] = false;
-                        }
+                // Inside the window the copper is as drawn. Outside it (graded cells and the absorber) copper
+                // is not rasterised from the layout, where it would merge across gaps on coarse cells;
+                // instead whatever crosses the window's edge continues straight out to the grid boundary,
+                // so a cropped plane or track runs into the absorbing layer instead of ending in the domain.
+                let span = |v: &[f64], lo: f64, hi: f64| -> Option<(usize, usize)> {
+                    let a = v.iter().position(|&x| x >= lo && x <= hi)?;
+                    let b = v.iter().rposition(|&x| x >= lo && x <= hi)?;
+                    Some((a, b))
+                };
+                let (exi, exj) = (span(&xh, w.x0, w.x1), span(&ymm, w.y0, w.y1));
+                let (eyi, eyj) = (span(&xmm, w.x0, w.x1), span(&yh, w.y0, w.y1));
+                let extrude = |m: &mut Vec<bool>, mn: &mut Vec<u32>, si: Option<(usize, usize)>, sj: Option<(usize, usize)>| {
+                    let (Some((i0, i1)), Some((j0, j1))) = (si, sj) else {
+                        m.iter_mut().for_each(|v| *v = false);
+                        return;
+                    };
+                    let src: Vec<(bool, u32)> = (0..ny * nx)
+                        .map(|q| {
+                            let (i, j) = (q % nx, q / nx);
+                            let s = j.clamp(j0, j1) * nx + i.clamp(i0, i1);
+                            (m[s], mn[s])
+                        })
+                        .collect();
+                    for (q, (on, net)) in src.into_iter().enumerate() {
+                        m[q] = on;
+                        mn[q] = net;
                     }
-                }
+                };
+                extrude(&mut ex, &mut exn, exi, exj);
+                extrude(&mut ey, &mut eyn, eyi, eyj);
             }
             SheetMask { k, ex, ey, exn, eyn }
         })

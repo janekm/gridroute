@@ -64,6 +64,9 @@ pub enum Shape {
     Capsule { a: P2, b: P2, r: f64 },
     /// Simple polygon, implicitly closed, even-odd fill (arcs already linearised).
     Polygon(Vec<P2>),
+    /// An aperture macro's image: its primitives in order, each adding (exposure on) or removing (off)
+    /// area from the aperture only, so a hole shows whatever copper lies underneath.
+    Macro(Vec<(Shape, bool)>),
 }
 
 fn seg_dist2(p: P2, a: P2, b: P2) -> f64 {
@@ -97,6 +100,23 @@ impl Shape {
             Shape::Circle { c, r } => (p.x - c.x).powi(2) + (p.y - c.y).powi(2) <= r * r,
             Shape::Capsule { a, b, r } => seg_dist2(p, *a, *b) <= r * r,
             Shape::Polygon(pts) => point_in_polygon(pts, p),
+            Shape::Macro(parts) => parts.iter().fold(false, |inside, (s, on)| if s.contains(p) { *on } else { inside }),
+        }
+    }
+    /// A single plain shape standing in for this one where only an outline can be used (meshes, scene
+    /// polygons): itself, or for a macro its largest exposed primitive (holes are not represented).
+    pub fn outline_shape(&self) -> Shape {
+        match self {
+            Shape::Macro(parts) => parts
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(s, _)| s.outline_shape())
+                .max_by(|a, b| {
+                    let (ba, bb) = (a.bbox(), b.bbox());
+                    ((ba.x1 - ba.x0) * (ba.y1 - ba.y0)).partial_cmp(&((bb.x1 - bb.x0) * (bb.y1 - bb.y0))).unwrap()
+                })
+                .unwrap_or(Shape::Polygon(Vec::new())),
+            s => s.clone(),
         }
     }
     pub fn bbox(&self) -> BBox {
@@ -112,6 +132,15 @@ impl Shape {
                 b = b.grow(*r);
             }
             Shape::Polygon(pts) => pts.iter().for_each(|&p| b.add(p)),
+            Shape::Macro(parts) => {
+                for (s, on) in parts {
+                    if *on {
+                        let o = s.bbox();
+                        b.add(P2::new(o.x0, o.y0));
+                        b.add(P2::new(o.x1, o.y1));
+                    }
+                }
+            }
         }
         b
     }

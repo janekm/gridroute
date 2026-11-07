@@ -181,6 +181,12 @@ fn main() {
                 }
             }
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        "bench" => {
+            eprintln!("fieldsolve bench: times the Metal kernels; this build has no Metal backend (macOS with the \"metal\" feature)");
+            std::process::exit(2);
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         "bench" => {
             // time the Metal kernels on a spec's real problem: fixed step count, no early stop
             let Some(spec) = args.get(2) else {
@@ -214,11 +220,15 @@ fn main() {
             let out: Vec<serde_json::Value> = prims
                 .iter()
                 .map(|p| {
-                    let shape = match &p.shape {
-                        geom::Shape::Polygon(v) => serde_json::json!({"polygon": v.iter().map(|q| [q.x, q.y]).collect::<Vec<_>>()}),
-                        geom::Shape::Circle { c, r } => serde_json::json!({"circle": [c.x, c.y, *r]}),
-                        geom::Shape::Capsule { a, b, r } => serde_json::json!({"capsule": [a.x, a.y, b.x, b.y, *r]}),
-                    };
+                    fn js(s: &geom::Shape) -> serde_json::Value {
+                        match s {
+                            geom::Shape::Polygon(v) => serde_json::json!({"polygon": v.iter().map(|q| [q.x, q.y]).collect::<Vec<_>>()}),
+                            geom::Shape::Circle { c, r } => serde_json::json!({"circle": [c.x, c.y, *r]}),
+                            geom::Shape::Capsule { a, b, r } => serde_json::json!({"capsule": [a.x, a.y, b.x, b.y, *r]}),
+                            geom::Shape::Macro(parts) => serde_json::json!({"macro": parts.iter().map(|(s, on)| serde_json::json!({"exposed": on, "shape": js(s)})).collect::<Vec<_>>()}),
+                        }
+                    }
+                    let shape = js(&p.shape);
                     serde_json::json!({"dark": p.dark, "net": p.net, "shape": shape})
                 })
                 .collect();
@@ -311,6 +321,9 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod review_tests;
 
 #[cfg(test)]
 mod tests {
