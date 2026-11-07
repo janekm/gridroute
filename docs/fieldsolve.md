@@ -118,6 +118,7 @@ target/release/fieldsolve copper-check             # copper cavity Q against h/d
 target/release/fieldsolve cond-fit [--rough-um 1]  # copper surface impedance: exact vs the fitted network
 target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see below)
 target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
+target/release/fieldsolve connect spec.json [reps]  # time the mesh connectivity check, print the shorts it finds
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
 target/release/fieldsolve prims board.GTL > prims.json        # a Gerber's primitives (shape, polarity, net)
 ```
@@ -535,6 +536,57 @@ its default 0.1–100 units turns millimetre fog into blocks.
 
 ![H field lines and surface current, AMOLED U1.46 → C112 decoupling loop at 100 MHz (rendered before the mesh-short fix, so the current paths are only indicative)](img/fieldsolve_decap_hlines.jpg)
 
+## Performance
+
+The CPML corrections are fused into the main Metal kernels, and materials are a 16-bit index into a
+coefficient table: 1769 → about 2100 Mcell/s on 5.8 M cells (M3 Max, `fieldsolve bench`).
+`FIELDSOLVE_FUSED=0` selects the separate kernels; the wideband dielectric needs the fused ones.
+
+**Set-up reuse across excitations.** The Metal backend keeps one device context (compiled library,
+pipelines, queue) for the whole command and the last problem's GPU buffers. A multiport run then builds
+the material table and uploads the static coefficients once. Every later excitation zeroes the state with a
+GPU blit: fields, CPML psi, Debye and conductor currents, probe and energy outputs, DFT and gathered
+accumulators. The cache key is a content fingerprint of everything uploaded, plus the kernel choice, so a
+changed problem is prepared again. The fused kernels read only the material table, so the full per-edge
+`ca`/`cb` (24 bytes per cell) are uploaded only for `FIELDSOLVE_FUSED=0`. The material table is built with
+a previous-pair check and `FxHashMap` instead of the std `HashMap`.
+
+MTH antenna spec (`mth7_board.json`, 354 × 437 × 70 = 10.83 M cells, 7 ports, far field at 5 frequencies
+and a field export), capped at 2000 steps per excitation so that set-up is a visible share. One run each,
+before and after, on an idle M3 Max (`/usr/bin/time -l`):
+
+| | before | after |
+|---|---|---|
+| set-up per excitation (in `result.json` `runs[].setup_seconds`) | 0.57-0.68 s, 4.1 s over 7 | 0.13 s first, then 0.04 s; 0.44 s over 7 |
+| peak memory footprint | 4036 MB | 3720 MB (−316 MB) |
+| GPU buffers held (fused) | 883 MB (623 + 260 MB `ca`/`cb`, computed) | 623 MB (`fieldsolve bench`) |
+| total wall time | 149.3 s | 147.6 s |
+
+All outputs (`sparams.s7p`, `farfield.json`, the far-field plots, the field exports) are byte-identical
+before and after, and `result.json` matches apart from the timings. On an uncapped run (50-100 k steps per
+port, 5-15 min each) the 0.6 s per excitation is under 0.1 %, so the memory is the larger gain.
+`metal_session_reuse_leaks_no_state` runs an excitation and then a run with no source on one session;
+the second must be exactly zero. It also checks that a repeated excitation, another port and a changed
+problem are bit-identical to a fresh context.
+
+**Connectivity check.** `connect::check` labels metal edges with nets and floods the labels. It used to keep
+std `HashMap`/`HashSet`s keyed by node id and built a `Vec` of neighbours for every node it visited. Now the
+in-plane edges are dense net tables over the few mesh planes that carry copper, barrels are a bitset, and
+neighbours go into a fixed six-entry buffer. Only the bridge list (a few net pairs) is hashed (`FxHashMap`).
+Seeding is in increasing node index, and bridges are sorted by count and then net pair. The report is now
+deterministic; before, the std hash order made ties and the reported example node vary between runs.
+`fieldsolve connect spec.json 11` reports the median of 11 runs, including the rasterisation:
+
+| board | nodes | before | after |
+|---|---|---|---|
+| MTH (`mth7_board.json`) | 10.83 M | 50.4 / 52.6 ms | 7.4 / 7.5 ms |
+| 1BP (`1bp_board_ff.json`) | 5.80 M | 53.8 / 52.1 ms | 8.3 / 8.3 ms |
+
+The node labels and bridges match the original algorithm, run with ordered maps so it seeds in the same
+order. `dense_traversal_matches_the_reference` checks this on a test board with raster and barrel shorts.
+`real_board_matches_the_reference` (ignored; `FIELDSOLVE_CONNECT_SPEC=spec.json`) checks real boards, and
+it passed on MTH, 1BP and 1BP at 0.3 mm cells.
+
 ## Code map
 
 The code is in `src/bin/fieldsolve/`.
@@ -583,9 +635,7 @@ The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free
   inductor, the model's in-band S21 is about 1 dB low and its roll-off 5-9 % low. openEMS on the same
   raster agrees with fieldsolve, the mesh is converged in band and the stack-up barely matters, so the
   cause is not the solver or the cell size: see [1bp-rf-findings.md](1bp-rf-findings.md).)
-- **Performance.** The CPML corrections are fused into the main Metal kernels, and materials are a 16-bit
-  index into a coefficient table: 1769 → about 2100 Mcell/s on 5.8 M cells (M3 Max, `fieldsolve bench`).
-  `FIELDSOLVE_FUSED=0` selects the separate kernels; the wideband dielectric needs the fused ones.
-  Half-precision field storage is still open; most time on large runs is memory traffic.
+- **Performance.** Half-precision field storage is still open; most time on large runs is memory traffic
+  (see [Performance](#performance)).
 - **Router input.** Read gridroute/topor `layout.json` directly, so a routed candidate can be checked
   without a KiCad round trip.

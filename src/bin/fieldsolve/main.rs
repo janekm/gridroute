@@ -28,11 +28,15 @@ fn backend(args: &[String]) -> Box<dyn Fn(&model::Problem, &fdtd::RunSpec) -> fd
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         if want != "cpu" && metal_fdtd::available() {
-            return Box::new(|p: &model::Problem, s: &fdtd::RunSpec| match metal_fdtd::run_metal(p, s) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("fieldsolve: Metal failed ({e}); running on the CPU");
-                    fdtd::run_cpu(p, s)
+            // one device context for every run; a problem's buffers are reused across its excitations
+            let session = std::cell::OnceCell::new();
+            return Box::new(move |p: &model::Problem, s: &fdtd::RunSpec| {
+                match session.get_or_init(metal_fdtd::Session::new).as_ref().map_err(|e| e.clone()).and_then(|ss| ss.run(p, s)) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("fieldsolve: Metal failed ({e}); running on the CPU");
+                        fdtd::run_cpu(p, s)
+                    }
                 }
             });
         }
@@ -200,11 +204,18 @@ fn main() {
             let exc = fdtd::gauss_excite(0.0, st.fmax, p.dt);
             let rs = fdtd::RunSpec { excite: Some(0), exc, max_steps: steps, end_db: -1000.0, check_every: 1000, dft_every: 1, ..Default::default() };
             println!("{} x {} x {} = {:.2} M cells, {} steps", p.nx, p.ny, p.nz, p.n() as f64 * 1e-6, steps);
+            let session = metal_fdtd::Session::new().unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
             for (fused, tg) in [("0", "32x4x1"), ("1", "32x4x1"), ("1", "64x2x1"), ("1", "32x2x2"), ("1", "16x8x1"), ("1", "128x1x1"), ("1", "32x8x1")] {
                 std::env::set_var("FIELDSOLVE_FUSED", fused);
                 std::env::set_var("FIELDSOLVE_TG", tg);
-                match metal_fdtd::run_metal(&p, &rs) {
-                    Ok(r) => println!("fused {fused} tg {tg:>8}: {:7.1} s  {:6.0} Mcell/s", r.seconds, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6),
+                match session.run(&p, &rs) {
+                    Ok(r) => println!(
+                        "fused {fused} tg {tg:>8}: {:7.1} s  {:6.0} Mcell/s  (set-up {:.2} s, {:.0} MB on the GPU)",
+                        r.seconds,
+                        p.n() as f64 * r.steps as f64 / r.seconds * 1e-6,
+                        r.setup_seconds,
+                        session.cached_bytes() as f64 * 1e-6
+                    ),
                     Err(e) => println!("fused {fused} tg {tg}: {e}"),
                 }
             }
@@ -233,6 +244,30 @@ fn main() {
                 })
                 .collect();
             println!("{}", serde_json::to_string(&out).unwrap());
+        }
+        "connect" => {
+            // time the mesh connectivity check on a spec's board and print its report
+            let Some(spec) = args.get(2) else {
+                eprintln!("usage: fieldsolve connect SPEC.json [repeats]");
+                std::process::exit(2);
+            };
+            let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5).max(1);
+            let (mut cx, _) = sim::load(std::path::Path::new(spec)).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let (g, lay) = (&st.grid, &st.layout);
+            println!("{} x {} x {} = {:.2} M nodes", g.nx(), g.ny(), g.nz(), g.n() as f64 * 1e-6);
+            let mut times = Vec::new();
+            let mut bridges = Vec::new();
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                bridges = connect::check(g, lay);
+                times.push(t.elapsed().as_secs_f64());
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("connect::check: median {:.1} ms, min {:.1} ms, max {:.1} ms over {reps} runs", times[reps / 2] * 1e3, times[0] * 1e3, times[reps - 1] * 1e3);
+            for l in connect::describe(&bridges, cx.kicad) {
+                println!("{l}");
+            }
         }
         "raster" => {
             // ASCII view of the rasterised model on one copper layer: metal edges and lumped edges
@@ -447,6 +482,55 @@ mod tests {
         }
         let diff = a.v[0].iter().zip(&b.v[0]).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
         assert!(diff <= 1e-4 * peak, "port voltage differs: {diff} vs peak {peak}");
+    }
+
+    /// A reused Metal problem starts every run from zero: a run without a source after an excited run is
+    /// silent, re-running an excitation is bit-identical, another port's excitation matches a fresh context,
+    /// and a changed problem is prepared again.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn metal_session_reuse_leaks_no_state() {
+        if !metal_fdtd::available() {
+            return;
+        }
+        let ss = metal_fdtd::Session::new().unwrap();
+        let same = |a: &fdtd::RunResult, b: &fdtd::RunResult, what: &str| {
+            assert_eq!(a.steps, b.steps, "{what}: steps");
+            assert!(a.v == b.v && a.probes == b.probes, "{what}: probes differ");
+            assert!(a.gathered == b.gathered, "{what}: gathered DFT differs");
+            assert!(a.fields.as_ref().map(|f| &f.data) == b.fields.as_ref().map(|f| &f.data), "{what}: field DFT differs");
+            assert!(a.energy == b.energy, "{what}: energy differs");
+        };
+        // Debye dielectric and surface-impedance copper: every kind of state buffer is in use
+        let m = cond::Metal { sigma: 5.8e7, t: 35e-6, rough: 1e-6 };
+        let p = small_problem_full(Some(disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false }), Some(cond::Conductor { metals: vec![m.clone(), m], f_lo: 0.3e9, f_hi: 10e9 }));
+        let plan = nf2ff::auto_plan(&p, [6; 6], 2).unwrap();
+        let exc = fdtd::gauss_excite(0.0, 10e9, p.dt);
+        let full = fdtd::RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 1500, end_db: -300.0, check_every: 500, dft_freqs: vec![3e9], dft_every: 4, gather_freqs: vec![3e9], gather: plan.gather.clone(), ..Default::default() };
+        let a = ss.run(&p, &full).unwrap();
+        let quiet = fdtd::RunSpec { excite: None, ..full.clone() };
+        let z = ss.run(&p, &quiet).unwrap();
+        assert!(z.v.iter().flatten().all(|&x| x == 0.0), "a run without a source saw the previous run's fields");
+        assert!(z.gathered.iter().flat_map(|g| g.iter().flatten()).all(|&x| x == 0.0), "gathered DFT not reset");
+        assert!(z.fields.as_ref().unwrap().data.iter().flat_map(|d| d.iter().flatten()).all(|&x| x == 0.0), "field DFT not reset");
+        same(&a, &ss.run(&p, &full).unwrap(), "repeated excitation");
+        same(&a, &metal_fdtd::run_metal(&p, &full).unwrap(), "fresh context");
+        // two ports: port 1 after port 0 (as in a multiport run, the later runs without DFTs)
+        let st = cases::gap_setup(true, 0.4, 6e9);
+        let q = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+        assert_eq!(q.ports.len(), 2);
+        let qexc = fdtd::gauss_excite(0.0, 6e9, q.dt);
+        let r0 = fdtd::RunSpec { excite: Some(0), exc: qexc, max_steps: 1500, end_db: -300.0, check_every: 500, dft_freqs: vec![3e9], dft_every: 4, ..Default::default() };
+        let r1 = fdtd::RunSpec { excite: Some(1), dft_freqs: vec![], ..r0.clone() };
+        ss.run(&q, &r0).unwrap();
+        same(&ss.run(&q, &r1).unwrap(), &metal_fdtd::run_metal(&q, &r1).unwrap(), "second port");
+        // a changed problem (same size) is not served from the cache
+        let mut q2 = q.clone();
+        for x in q2.cb[2].iter_mut().step_by(7) {
+            *x *= 0.5;
+        }
+        same(&ss.run(&q2, &r1).unwrap(), &metal_fdtd::run_metal(&q2, &r1).unwrap(), "changed problem");
+        assert!(ss.run(&q2, &r1).unwrap().v != ss.run(&q, &r1).unwrap().v, "the change should matter");
     }
 
     #[test]

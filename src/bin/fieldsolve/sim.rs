@@ -936,7 +936,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             gather_lag: 5,
         };
         let r = backend(&p, &spec);
-        eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
+        eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s (set-up {:.2} s) on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.setup_seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
         if let Some((rate, q)) = crate::fdtd::energy_decay(&r.energy, p.dt, st.fmax / 3.0) {
             eprintln!(
                 "fieldsolve:   late-time field energy {:+.2} dB/ns{}",
@@ -979,7 +979,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             let names: Vec<String> = snap_sheets.iter().map(|s| s.name.clone()).collect();
             crate::export::write_frames(out, &p, &st, &names, &r.snaps, &exc).map_err(|e| e.to_string())?;
         }
-        runs.push(json!({"port": names[j], "steps": r.steps, "seconds": r.seconds, "backend": r.backend}));
+        runs.push(json!({"port": names[j], "steps": r.steps, "seconds": r.seconds, "setup_seconds": r.setup_seconds, "backend": r.backend}));
     }
     let mut zmat_out = Value::Null;
     let mut balance_out = Value::Null;

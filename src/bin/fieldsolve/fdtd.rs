@@ -120,6 +120,8 @@ pub struct RunResult {
     pub energy: Vec<(usize, f64)>,
     pub snaps: Vec<Snap>,
     pub seconds: f64,
+    /// Of `seconds`, the time before the first step (buffers, material tables, kernel set-up).
+    pub setup_seconds: f64,
     pub backend: String,
 }
 
@@ -511,6 +513,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
     let mut ehist: Vec<(usize, f64)> = Vec::new();
     let mut steps = 0;
     let mut snaps = Vec::new();
+    let setup_seconds = t0.elapsed().as_secs_f64();
     for n in 0..spec.max_steps {
         update_h(p, &mut s);
         pml_h(p, &mut s);
@@ -572,7 +575,7 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
             }
         }
     }
-    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), backend: "cpu".into() }
+    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: "cpu".into() }
 }
 
 #[allow(unused)]
