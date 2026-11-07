@@ -19,6 +19,8 @@ mod lines;
 mod edge;
 mod edge_cases;
 mod amr2d;
+mod meshpol;
+mod octree;
 mod tune;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;
@@ -70,9 +72,37 @@ fn main() {
             let (mut cx, _) = sim::load(std::path::Path::new(&args[2])).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
             let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
             let (masks, _) = model::sheet_masks(&st.grid, &st.layout);
+            // where the rectilinear mesh's cells are: per axis, by cell size
+            for a in 0..3 {
+                let l = st.grid.axis(a);
+                let d: Vec<f64> = l.windows(2).map(|w| (w[1] - w[0]) * 1e3).collect();
+                let hmin = d.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mut bins = [0usize; 5];
+                for &v in &d {
+                    let r = v / hmin;
+                    bins[if r < 1.05 { 0 } else if r < 2.0 { 1 } else if r < 4.0 { 2 } else if r < 8.0 { 3 } else { 4 }] += 1;
+                }
+                println!("axis {a}: {} cells, finest {hmin:.4} mm; at the finest {} , <2x {}, <4x {}, <8x {}, coarser {}", d.len(), bins[0], bins[1], bins[2], bins[3], bins[4]);
+            }
             for r in [1.3, 1.5, 2.0] {
                 let (nr, no) = amr2d::octree_estimate(&st.grid, &masks, r);
                 println!("grading {r}: rectilinear {:.2} M cells, octree estimate {:.2} M ({:.1} x fewer)", nr as f64 * 1e-6, no * 1e-6, nr as f64 / no);
+            }
+        }
+        "octree-check" => {
+            // octree prototype (octree.rs) on the microstrip: octree-check [hc] [nz] [insets,..] [grading] [smax]
+            let num = |i: usize, d: f64| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+            let (hc, nz) = (num(2, 0.2), num(3, 8.0) as u32);
+            let insets: Vec<f64> = args.get(4).map(|s| s.as_str()).unwrap_or("0.05,0.35,0.65,0.95").split(',').filter_map(|v| v.parse().ok()).collect();
+            let (r, smax) = (num(5, 1.3), num(6, 8.0) as u32);
+            for &f in &insets {
+                let (w, z0, ee, leaves, masters, faces, steps, secs) = octree::microstrip(3.0, 1.6, 4.3, hc, nz, f, r, smax);
+                let (z0r, eer) = cases::hammerstad(w, 1.6, 4.3);
+                let (cs, cr) = (ee.sqrt() / (299_792_458.0 * z0), eer.sqrt() / (299_792_458.0 * z0r));
+                println!(
+                    "octree cell {hc} nz {nz} inset {f:.3} w {w:.4}: Z0 {z0:.3} ({:+.2} %)  eps_eff {ee:.4} ({:+.2} %)  C {:+.2} %  [{leaves} leaves, {masters} edge unknowns, {faces} faces, {steps} steps, {secs:.0} s]",
+                    100.0 * (z0 / z0r - 1.0), 100.0 * (ee / eer - 1.0), 100.0 * (cs / cr - 1.0)
+                );
             }
         }
         "amr-check" => {

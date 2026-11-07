@@ -175,3 +175,96 @@ Not recommended: dynamic (field-driven) refinement (step 2), higher-order stenci
 dispersion, which is not the limit), and unstructured or frequency-domain solvers as a replacement. A planar
 MoM would be a valuable independent cross-check of matching networks (like openEMS today), not a
 successor.
+
+## Implemented and measured: static refinement and an octree (Nov 2026)
+
+Branch `claude/fieldsolve-refine-octree` (on top of the edge corrections and the fast-mode branch's
+`"refine"` boxes) adds both and compares them.
+
+### Static refinement on the rectilinear mesh (`meshpol.rs`, spec `"mesh"`)
+
+```json
+"mesh": {"no_slivers": true, "z_grade": 3.0, "copper_bands": {"layers": ["F.Cu"], "cell": 0.05, "margin": 0.1}}
+```
+
+- `no_slivers` fills the interval between two fixed lines with ceil(n − 0.35) cells instead of ceil(n).
+  Fixed lines (port and part coordinates) a little over a cell apart used to leave two half cells, and the
+  smallest cell sets the time step for the whole mesh: on the DK the finest x cell was 0.025 mm and y
+  0.035 mm in a 0.05 mm mesh.
+- `z_grade` keeps `cell_z` within two cells of every copper plane and dielectric interface and lets cells
+  grow (1.3 per cell, up to 3 · `cell_z`) through thick cores.
+- `copper_bands` makes the spec's `cell` the base of the copper window and adds bands of a finer cell
+  around the listed layers' copper edges (found on a supersampled raster: x bands where copper changes
+  along x, y bands along y).
+
+`fieldsolve octree-count spec.json` now also prints the cells per axis by size. The DK at 0.05 mm: more than
+half of the cells along each axis are coarse (≥ 8× the finest), so only about 5 % of the 18.8 M cells are
+fine in all three directions. That is the tensor-product waste an octree recovers.
+
+nRF52840 DK, configuration 1, all five excitations, with `"edges"`. "Work" is cells / dt, the cost per
+simulated nanosecond, relative to the 0.05 mm mesh. The reference is the 0.025 mm run with corrections:
+
+| mesh | cells | dt | work | max \|ΔS\| 0.1-3 / 3-6 / 6-8 GHz | best ΔC (edges / rms) |
+|---|---|---|---|---|---|
+| 0.05 mm (as before) | 18.8 M | 56.7 fs | 1.00 | 0.016 / 0.163 / 0.094 | −0.24 / −0.22 pF |
+| + no slivers | 18.3 M | 71.4 fs | 0.77 | 0.019 / 0.045 / 0.113 | −0.23 / −0.22 pF |
+| + z grading | 16.4 M | 71.0 fs | 0.69 | 0.017 / 0.041 / 0.104 | −0.23 / −0.22 pF |
+| + 0.1 mm base, 0.05 mm copper bands | 16.0 M | 78.5 fs | 0.61 | 0.017 / 0.085 / 0.071 | −0.24 / −0.24 pF |
+| 0.1 mm base, no bands | 10.6 M | 79.6 fs | 0.40 | 0.025 / 0.210 / 0.300 | −0.24 / −0.24 pF |
+
+- **1.6× less work at the same in-band accuracy**, almost all of it from removing slivers (larger dt) and
+  grading z. The copper bands add little: the RF path has copper edges at nearly every x and y, so the
+  bands cover most of the window.
+- A 0.1 mm window everywhere is 2.5× cheaper and still fine in band (with the edge corrections), but loses
+  accuracy above 3 GHz.
+- **The number of steps is not a reliable cost measure on this board.** Runs stop when every port's signal
+  has fallen 60 dB. A weakly coupled board resonance (late-time Q 45-65) sometimes stays above that line for
+  a port and sometimes not, so the same board took 63 k steps on one mesh and 250 k on another. The table
+  therefore compares cost per simulated time. (The 3-6 GHz column is affected the same way: where a run, or
+  the reference, stopped early, that resonance is truncated.)
+
+### An octree (`octree.rs`, CPU prototype, `fieldsolve octree-check`)
+
+A 3-D FIT scheme on a 2:1-balanced octree (faces and edges), with box cells (the finest cell may differ per
+axis). Edge voltages and face fluxes on the leaf edges and faces split at hanging nodes; hanging edges are
+constrained to the coarser leaf's edges (halves 1/2, edges inside a coarse face 1/4 + 1/4), Ampère acts
+through Pᵀ, and the mass is the lumped Pᵀ M_ε P. The scheme is symmetric in the energy inner product, so
+it conserves energy and is stable at the Yee time step of the finest cell (power iteration: dt²λ = 3.39
+at 0.4 mm, limit 3.61; `refined_octree_is_stable_and_conserves_energy`). Strip current is exact in this
+form (the curl term of the strip's metal edges).
+
+Microstrip (w ≈ 3 mm, h = 1.6 mm, PEC box 14 mm), plain staircase (the edge corrections are not ported to
+the octree), leaves sized by distance from the strip's edges with grading r:
+
+| finest cell | mesh | cells / leaves | Z0 vs uniform | εeff vs uniform |
+|---|---|---|---|---|
+| 0.4 mm, 4 across h | uniform octree (= Yee) | 793 600 | | |
+| | octree, r 1.3 | 44 000-49 000 (16-18×) | −0.16 to +0.09 % | −0.15 to −0.14 % |
+| 0.2 mm, 8 across h | uniform octree (= Yee) | 2 571 000 | | |
+| | octree, r 1.3 | 79 000 (32×) | −0.30 % | −0.03 % |
+| | octree, r 1.5 | 49 000 (52×) | +0.68 % | −0.08 % |
+| | octree, r 2.0 | 36 000 (71×) | +1.16 % | −0.14 % |
+| | graded rectilinear (fieldsolve) | 250 000 | | |
+
+- **The octree's interfaces cost little accuracy** (under 0.3 % at r 1.3, about 1 % at r 2), and against
+  the graded rectilinear mesh it needs 3.2× (r 1.3) to 6.8× (r 2) fewer cells. With local time stepping
+  it would do 77 % of the updates at r 1.3 (most leaves are near the finest level around the strip).
+- **But it is not faster per unknown.** On the CPU, 79 000 leaves (472 000 unknowns) took the same 22 s as
+  the rectilinear mesh's 250 000 cells (1.5 M unknowns): gathering through edge and face lists costs about
+  3× more per unknown than the structured stencil. On the GPU the structured kernels run at 2 000 Mcell/s
+  because neighbours are implicit; an octree kernel is gather-bound, so the 3-7× cell saving would turn into
+  perhaps 1-2× in time, after a rewrite of the GPU backend, ports, CPML, far field and exports.
+- Against Hammerstad-Jensen the octree runs (uniform and refined alike) are within −3.8 to +3.1 % in Z0,
+  against −5.6 to −0.3 % for the rectilinear mesh at the same insets. The setups differ: a closed PEC box
+  (doubling it moved Z0 by 0.7 %) against absorbing walls. The comparison above is therefore octree against
+  uniform octree, on the same setup.
+
+### Conclusion
+
+Static refinement on the existing mesh is the cheap win: about 1.6× on the DK with nothing new to trust,
+and it combines with the edge corrections (which allow coarser cells in the first place). The octree
+delivers the predicted cell savings (3-7× against a graded mesh) with small interface errors, but per
+unknown it is 3× more expensive on the CPU and would be gather-bound on the GPU. It pays only on boards
+where the tensor-product waste is extreme (sparse copper in a large domain), and only after a full GPU
+implementation. The recommendation stands: rectilinear mesh, edge corrections, static refinement;
+`no_slivers` and `z_grade` are worth making the default once the fast-mode calibration is re-run.

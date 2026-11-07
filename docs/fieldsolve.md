@@ -126,7 +126,8 @@ target/release/fieldsolve connect spec.json [reps]  # time the mesh connectivity
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
 target/release/fieldsolve edge-check line|line45|gap [w,h,er] [cells] [insets|gaps] [variants]  # sub-cell edges
 target/release/fieldsolve amr-check [h_mm] [steps] [absorb_mm]  # 2-D dynamic-resolution prototype
-target/release/fieldsolve octree-count spec.json   # cells an octree would need on this board's mesh
+target/release/fieldsolve octree-count spec.json   # cells per axis, and what an octree would need
+target/release/fieldsolve octree-check [hc] [nz] [insets] [grading] [smax]  # octree prototype, microstrip
 target/release/fieldsolve prims board.GTL > prims.json        # a Gerber's primitives (shape, polarity, net)
 ```
 
@@ -166,7 +167,9 @@ Ports and elements come in two forms:
   as a flat 2-14 % "loss" in the port.
 
 `"edges": true` (or an object, see [Sub-cell copper edges](#sub-cell-copper-edges)) turns on the
-conformal and edge-singularity corrections of the copper edges.
+conformal and edge-singularity corrections of the copper edges. `"mesh": {"no_slivers": true, "z_grade":
+3.0, "copper_bands": {...}}` refines the mesh from the layout (`meshpol.rs`; measured in
+[fieldsolve-resolution.md](fieldsolve-resolution.md#implemented-and-measured-static-refinement-and-an-octree-nov-2026)).
 
 `kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
@@ -830,6 +833,8 @@ The code is in `src/bin/fieldsolve/`.
 | `cond.rs` | conductor loss: copper surface impedance (skin effect, thickness, roughness), Foster fit, sheet edges |
 | `edge.rs` | sub-cell copper edges: coverage, local edge fit, conformal fractions, half-plane static-field factors, stability check |
 | `edge_cases.rs`, `edge_tests.rs` | microstrip / 45° line / gap cases for the edge corrections; their tests |
+| `meshpol.rs` | static mesh refinement from the layout: no slivers, z grading, copper-edge bands |
+| `octree.rs` | 3-D octree FIT prototype (hanging-edge constraints), microstrip check |
 | `amr2d.rs` | 2-D dynamic-resolution prototype (quadtree LC network) and the octree cell estimate, see [fieldsolve-resolution.md](fieldsolve-resolution.md) |
 | `tools/blender_frames.py` | time-domain current animation |
 | `tools/blender_farfield.py`, `tools/render_farfield_panels.py` | far-field patterns over the board, panel comparisons |
