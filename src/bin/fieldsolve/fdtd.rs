@@ -45,7 +45,7 @@ pub struct RunSpec {
     pub gather_lag: usize,
     /// Objective components (dB, e.g. a band's |S_kj|^2 and radiated power per watt incident), evaluated
     /// at every energy check and kept in [`RunResult::objective`]. With `objective_stop` the run also ends
-    /// once every component has stayed within `objective_tol_db` over the last `objective_window` steps,
+    /// once every component has stayed within a spread of `objective_tol_db` over the last `objective_window` steps,
     /// the source is off and at least `min_steps` have run (the minimum settling time).
     pub objective: Option<ObjectiveMetric>,
     pub objective_stop: bool,
@@ -147,7 +147,11 @@ impl StopState {
             if self.standard.is_none() {
                 self.standard = standard.map(|r| (steps, r));
             }
-            let settled = src_off && steps >= spec.min_steps && objective_tail(&self.ohist, spec.objective_window).is_some_and(|(last, tail)| last <= spec.objective_tol_db && tail <= spec.objective_tol_db);
+            // settled: every component within the tolerance over the whole window. The window must span
+            // the slow parts of the approach: a geometric creep (the remaining change is below the
+            // window's) and a beat against a slowly decaying resonance near the band (the window's spread
+            // is twice the beat's amplitude, which bounds the distance to its centre)
+            let settled = src_off && steps >= spec.min_steps && objective_spread(&self.ohist, spec.objective_window).is_some_and(|sp| sp <= spec.objective_tol_db);
             return settled.then_some("objective");
         }
         standard

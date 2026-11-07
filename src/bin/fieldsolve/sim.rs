@@ -847,9 +847,8 @@ pub struct RunOpts {
 /// `"objective": {"port": "C20", "band": [2.40e9, 2.44e9, 2.48e9], "harmonics": [4.88e9], "tol_db": 0.05,
 /// "window_periods": 4, "min_settle_periods": 6}`: the band's radiated power per watt incident at `port` (other ports matched),
 /// tracked at every energy check of every excitation together with each port's |S_kj|^2. With `"stop":
-/// "objective"` a run ends when all of them have stayed within `tol_db` over `window_periods` periods of the
-/// lowest band frequency (and the projected remaining change from the last two windows is as small), after
-/// the source and `min_settle_periods` more periods.
+/// "objective"` a run ends when all of them have stayed within a spread of `tol_db` over `window_periods`
+/// periods of the lowest band frequency, after the source and `min_settle_periods` more periods.
 #[derive(Clone, Debug, Default)]
 pub struct ObjectiveOpts {
     pub port: Option<String>,

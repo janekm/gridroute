@@ -1,7 +1,7 @@
 //! Fidelity policies for geometry iteration: `fieldsolve run SPEC --fast` (screening) or
 //! `--fidelity screening|refined|validated`. A plain `fieldsolve run` is level `spec`: the spec as given.
-//! `validated` keeps the spec's mesh and outputs and only replaces the energy/port stop by strict objective
-//! convergence (0.01 dB); `refined` and `screening` coarsen as below.
+//! `validated` keeps the spec's mesh and outputs and only replaces the energy/port stop by a stricter
+//! objective rule (0.1 dB over 8 periods); `refined` and `screening` coarsen as below.
 //!
 //! A policy rewrites the spec's numerical effort and nothing of its physics: the whole board stays in the
 //! domain (radiation needs the ground plane), materials, loss, ports, PML and air are untouched. It
@@ -10,7 +10,7 @@
 //!   through `"refine"` boxes;
 //! - drops volume fields, current frames and the scene export, and keeps far-field frequencies only in the
 //!   objective's band (plus `objective.harmonics`);
-//! - stops each excitation when the objective's components have been stable within `tol_db` over
+//! - stops each excitation when the objective's components have stayed within a spread of `tol_db` over
 //!   `window_periods` periods of the band's lowest frequency, after the source and a minimum settling time
 //!   of `min_settle_periods` periods (the energy/port decay rules still apply if they come first; a run that
 //!   reaches `max_steps` is reported as incomplete).
@@ -38,9 +38,10 @@ impl Policy {
     pub fn defaults(level: &str) -> Result<Policy, String> {
         let p = |cell_scale, tol_db, window_periods, min_settle_periods| Policy { level: level.to_string(), cell_scale, protect_margin: 0.25, tol_db, window_periods, min_settle_periods };
         match level {
-            "screening" => Ok(p(2.0, 0.1, 4.0, 8.0)),
-            "refined" => Ok(p(1.5, 0.03, 6.0, 12.0)),
-            "validated" => Ok(p(1.0, 0.01, 4.0, 8.0)),
+            // stop rules from replays on the MTH PIFA's full-mesh history (docs/fieldsolve-fast-mode.md)
+            "screening" => Ok(p(2.0, 0.2, 4.0, 8.0)),
+            "refined" => Ok(p(1.5, 0.1, 6.0, 8.0)),
+            "validated" => Ok(p(1.0, 0.1, 8.0, 8.0)),
             "spec" => Ok(p(1.0, 0.0, 0.0, 0.0)),
             _ => Err(format!("unknown fidelity {level:?}: use screening, refined or validated")),
         }
@@ -201,7 +202,7 @@ mod tests {
         assert!(s.get("fields").is_none() && s.get("frames").is_none());
         assert_eq!(s["farfield"]["freqs"], json!([2.4e9, 2.44e9, 2.48e9, 4.88e9]));
         assert_eq!(s["stop"], "objective");
-        assert_eq!(s["objective"]["tol_db"], json!(0.1));
+        assert_eq!(s["objective"]["tol_db"], json!(0.2));
         // ports and protected features keep the spec's 0.05 mm; the user's own refine box is kept
         let r = s["refine"].as_array().unwrap();
         assert_eq!(r[0], json!({"box": [0, 0, 1, 1], "cell": 0.02}));
@@ -223,7 +224,7 @@ mod tests {
         let v = resolve(&spec(), "validated").unwrap();
         let keys: Vec<&str> = v["fidelity_record"]["overrides"].as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap()).collect();
         assert_eq!(keys, ["stop", "objective"]);
-        assert_eq!(v["objective"]["tol_db"], json!(0.01));
+        assert_eq!(v["objective"]["tol_db"], json!(0.1));
         assert_eq!((v["cell"].clone(), v["fields"].clone(), v["farfield"].clone()), (spec()["cell"].clone(), spec()["fields"].clone(), spec()["farfield"].clone()));
         let mut sp = spec();
         sp["fidelity"]["cell_scale"] = json!(1.5);

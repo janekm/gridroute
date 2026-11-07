@@ -53,7 +53,7 @@ fn objective_stop_waits_for_the_objective_and_records_the_standard_rule() {
     let base = fdtd::RunSpec { max_steps: 1000, check_every: 5, end_db: -70., port_stop: true, objective: Some(metric), objective_stop: true, objective_tol_db: 1e-3, objective_window: 20, min_steps: 50, ..Default::default() };
     let r = fdtd::run_cpu(&p, &base);
     assert_eq!(r.stop, "objective");
-    // settled when the last window change 3 * 0.5^(t / 10) <= 1e-3: the check at 120, after min_steps
+    // settled when the window's spread 3 * 0.5^(t / 10) <= 1e-3: the check at 120, after min_steps
     assert_eq!(r.steps, 120, "stopped at {}", r.steps);
     assert_eq!(r.standard_stop.as_ref().map(|s| s.0), Some(5), "the energy rule fires at the first check");
     assert_eq!(r.objective.len(), r.steps / 5);
