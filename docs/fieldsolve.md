@@ -344,10 +344,17 @@ the other, then the same with the ends swapped, for point and pad-footprint port
 | point (single node) | 1.305 nH | 1.264 nH | 1.284 nH | identical |
 | pad footprint | 1.112 nH | 1.043 nH | 1.029 nH | identical |
 
-Pad-footprint ports converge (steps of 6.6 % then 1.3 %); point ports do not. openEMS on the same scenes
-gives 0.896 / 0.940 nH (pad, 0.1 / 0.05 mm), approaching from below while fieldsolve approaches from above.
-Extrapolated, that is about 0.98 vs 1.02 nH. The two codes rasterise zero-thickness metal edges
-differently, which is a first-order mesh effect.
+Pad-footprint ports converge (steps of 6.6 % then 1.3 %); point ports do not.
+
+openEMS agrees once it is given the same discrete structure:
+
+| pad port | fieldsolve | openEMS, our raster | openEMS, its own rasterisation of the polygons |
+|---|---|---|---|
+| 0.1 mm | 1.112 nH | 1.122 nH (−0.9 %) | 0.896 nH |
+| 0.05 mm | 1.043 nH | 1.051 nH (−0.7 %) | 0.940 nH |
+
+The earlier 20 % gap was the two codes rasterising zero-thickness copper differently (a first-order mesh
+effect), not the solvers.
 
 ### Board case: AMOLED ESP32-S3 3V3 decoupling (U1.46 → C112 → In1 GND)
 
@@ -377,13 +384,44 @@ U1.46 with C112 shorted" and "port at C112 with U1.46 shorted" are different qua
 
 This rebuilds `RUN_DIR/scene.json` in openEMS with fieldsolve's mesh lines (no smoothing):
 
-- copper polygons as zero-thickness metal, in priority order;
-- dielectric slabs extruded from the outline, with tan δ as conductivity at the same `f_loss`;
-- barrels as metal lines on the same nodes;
+- the resolved raster: every perfect-conductor edge fieldsolve used (copper after the net-aware conflict
+  resolution, barrels, shorted elements) as wires along mesh lines, which openEMS maps to exactly those
+  edges, and the dielectric as boxes of whole cells. `--polygons` gives openEMS the copper polygons,
+  outline and barrels instead, to rasterise its own way;
+- tan δ as conductivity at the same `f_loss` (the wideband and copper-loss models are not replayed: run
+  fieldsolve without them for a like-for-like comparison);
 - `AddLumpedPort` / `AddLumpedElement` on the same boxes;
-- the same Gaussian, PML and end criterion.
+- the same Gaussian, PML thickness and end criterion.
 
-It prints both impedances and the inductance fit over the same band. openEMS was built from
+`--ports all` (or a list) runs one excitation per port, keeps each column in `RUN_DIR/openems/col_N.json`
+so a long run can be resumed, and writes `sparams.sNp` once all exist. It prints both impedances of the
+first excitation and the inductance fit over the same band.
+
+**Board case: Nordic's nRF52840 reference, configuration 1** (6.6 M cells, the whole board, 5 ports, εr
+4.2/4.8, 0.05 mm mesh on the RF path). All five excitations, 0.1-8 GHz:
+
+| | 0.1-3 GHz | 3-6 GHz | 6-8 GHz |
+|---|---|---|---|
+| max \|S_fieldsolve − S_openEMS\|, CHIP column | 0.008 | 0.025 | 0.050 |
+| max \|S_fieldsolve − S_openEMS\|, full 5×5 matrix | 0.010 | 0.049 | 0.103 |
+
+At 2.44 GHz every entry agrees within 0.11 dB and 0.8°; along the network from CHIP the phase difference
+grows to 1.5° at 7 GHz. A 10 % frequency-scale error would be tens of degrees there. The largest differences sit
+at a weak board resonance near 7.5 GHz: openEMS ran into the 150 k step limit with its field energy at
+−37 dB (its end criterion is total energy), while fieldsolve stopped on the port signals at 119 k steps.
+openEMS's own matrix is reciprocal to 0.008.
+
+With Nordic's parts on both matrices (`fieldsolve cosim`, v1.0 values, bars de-embedded):
+
+| | S11 / S21 at 2.436 GHz | S21 at 4.87 / 7.33 GHz | best frequency scale of \|S21\|, 1-6 GHz |
+|---|---|---|---|
+| fieldsolve | −3.27 / −3.45 dB | −61.7 / −23.9 dB | |
+| openEMS | −3.34 / −3.33 dB | −54.1 / −26.4 dB | 0.998 (v1.1 values: 0.995) |
+
+In band the two agree within 0.12 dB, and their low-pass edges lie within 20 MHz (0.6 %). The H2 null
+depth and the H3 level differ by several dB, as expected for a deep null and for the truncated resonance.
+
+openEMS took 37-44 min per excitation on the M3 Max CPU (380 Mcell/s); fieldsolve 4 min on Metal. openEMS was built from
 `openEMS-Project` with `update_openEMS.sh ~/opt/openEMS --python --disable-GUI`. The Homebrew formula is no
 longer maintained.
 
@@ -516,8 +554,6 @@ The code is in `src/bin/fieldsolve/`.
 The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free space, enclosure, pipe) is in
 [fieldsolve-rf-roadmap.md](fieldsolve-rf-roadmap.md). Engine items:
 
-- **openEMS parity on boards.** Export the resolved raster (metal edges) rather than polygons to openEMS,
-  so board scenes compare like for like.
 - **Vertical ports through planes.** A vertical port or short whose column crosses an intermediate copper
   layer shares a node with it. Warn about this, or route the column only to the nearest reference layer.
 - **Capacitor models.** Series R-L-C elements, so a real capacitor (ESR, ESL, C) can replace the short.
@@ -530,8 +566,10 @@ The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free
   antennas on a board, and an enclosure.
 - **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins); the thirds rule
   applied in the rasteriser (shrink copper by 1/3 cell at edges) instead of relying on random edge
-  positions. The thirds rule matters for RF: against Nordic's measured network, the model's frequencies
-  run 10-15 % low ([1bp-rf-findings.md](1bp-rf-findings.md)).
+  positions. (Against Nordic's measured network, modelled on the nRF52840 DK layout with the 2018 DK's thin-film
+  inductor, the model's in-band S21 is about 1 dB low and its roll-off 5-9 % low. openEMS on the same
+  raster agrees with fieldsolve, the mesh is converged in band and the stack-up barely matters, so the
+  cause is not the solver or the cell size: see [1bp-rf-findings.md](1bp-rf-findings.md).)
 - **Performance.** The CPML corrections are fused into the main Metal kernels, and materials are a 16-bit
   index into a coefficient table: 1769 → about 2100 Mcell/s on 5.8 M cells (M3 Max, `fieldsolve bench`).
   `FIELDSOLVE_FUSED=0` selects the separate kernels; the wideband dielectric needs the fused ones.

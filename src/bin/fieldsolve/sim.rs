@@ -545,8 +545,74 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     })
 }
 
+/// The resolved raster of a built problem, so another solver can be given exactly the same structure:
+/// - `metal`: runs of perfect-conductor edges `[axis, a0, a1, b, c]`, edges a0..=a1 along `axis` at the
+///   transverse node indices (b, c) of the next two axes in cyclic order (x: (j, k), y: (k, i), z: (i, j)).
+///   This is every interior edge with cb = 0: rasterised copper after conflict resolution, via barrels and
+///   shorted lumped elements. Edges carrying a lumped element are not metal and are not listed.
+/// - `cells`: runs of dielectric cells `[slab, i0, i1, j, k0, k1]`, cells i0..=i1 of row j over the z cells
+///   k0..=k1 of one slab (cells inside the outline, by centre, as `build` assigns them).
+pub fn raster_json(st: &Setup, p: &Problem) -> Value {
+    let g = &st.grid;
+    let nn = [p.nx, p.ny, p.nz];
+    let mut metal: Vec<[usize; 5]> = Vec::new();
+    for a in 0..3 {
+        let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+        for ic in 1..nn[c].saturating_sub(1) {
+            for ib in 1..nn[b].saturating_sub(1) {
+                let mut run: Option<usize> = None;
+                for ia in 0..nn[a] {
+                    let mut pos = [0usize; 3];
+                    pos[a] = ia;
+                    pos[b] = ib;
+                    pos[c] = ic;
+                    let on = ia + 1 < nn[a] && p.cb[a][g.idx(pos[0], pos[1], pos[2])] == 0.0;
+                    match (on, run) {
+                        (true, None) => run = Some(ia),
+                        (false, Some(s)) => {
+                            metal.push([a, s, ia - 1, ib, ic]);
+                            run = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let (inside, slab_of_k) = crate::model::cell_materials(g, &st.layout);
+    let (nx, ny) = (p.nx, p.ny);
+    // contiguous z ranges of each slab
+    let mut zr: Vec<(usize, usize, usize)> = Vec::new();
+    for (k, s) in slab_of_k.iter().enumerate() {
+        if let Some(s) = *s {
+            match zr.last_mut() {
+                Some(l) if l.0 == s && l.2 + 1 == k => l.2 = k,
+                _ => zr.push((s, k, k)),
+            }
+        }
+    }
+    let mut cells: Vec<[usize; 6]> = Vec::new();
+    for &(s, k0, k1) in &zr {
+        for j in 0..ny.saturating_sub(1) {
+            let mut run: Option<usize> = None;
+            for i in 0..nx {
+                let on = i + 1 < nx && inside[j * nx + i];
+                match (on, run) {
+                    (true, None) => run = Some(i),
+                    (false, Some(a)) => {
+                        cells.push([s, a, i - 1, j, k0, k1]);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    json!({"metal": metal, "cells": cells})
+}
+
 /// Scene file: exactly what was simulated, for an independent solver (tools/openems_scene.py).
-pub fn scene_json(st: &Setup, exc_port: Option<usize>) -> Value {
+pub fn scene_json(st: &Setup, p: &Problem, exc_port: Option<usize>) -> Value {
     let poly = |p: &Prim| -> Vec<[f64; 2]> {
         let pts: Vec<P2> = match &p.shape {
             Shape::Polygon(v) => v.clone(),
@@ -580,6 +646,7 @@ pub fn scene_json(st: &Setup, exc_port: Option<usize>) -> Value {
         "lumped": st.lumped.iter().map(|l| json!({"name": l.name, "axis": l.axis, "lo": l.lo, "hi": l.hi, "plus_at_hi": l.plus_at_hi, "r": l.r, "c": l.c, "port": l.port})).collect::<Vec<_>>(),
         "pml": st.opts.pml, "f_loss": st.opts.f_loss, "fmax": st.fmax, "end_db": st.end_db, "max_steps": st.max_steps,
         "freqs": st.freqs, "excite": exc_port,
+        "raster": raster_json(st, p),
     })
 }
 
@@ -697,7 +764,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     let snap_every = if snap_k.is_empty() { 0 } else { ((ro.snap_ps * 1e-12 / p.dt).round() as usize).max(1) };
     let exc = gauss_excite(0.0, st.fmax, p.dt);
     let dft_every = ((1.0 / (2.0 * st.fmax * 1.5)) / p.dt).floor().max(1.0) as usize;
-    std::fs::write(out.join("scene.json"), serde_json::to_string(&scene_json(&st, excite.first().copied())).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("scene.json"), serde_json::to_string(&scene_json(st, &p, excite.first().copied())).unwrap()).map_err(|e| e.to_string())?;
     let freqs = &st.freqs;
     let z0 = 50.0;
     let mut far = match &ro.farfield {

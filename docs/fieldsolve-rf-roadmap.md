@@ -228,7 +228,7 @@ stay.**
 - The H3 figure rests on the EM model's coupling between the two ends of the ladder. Check it with a
   spectrum analyser before relying on it for approval margins. The later comparison with Nordic's layout
   shows how fragile H3 figures are in this model: near a trap resonance they move 4-5 dB per 100 MHz,
-  and the model's frequencies run 10-15 % low.
+  and the model's frequency scale is uncertain by several percent (v1.0 vs v1.1 values).
 - **Nordic's reference plane is uncertain.** Their trace header reads "Cal Offs": the chip-side plane
   was set with a VNA offset (port extension), not physically, and S21 shows about 400 ps of fixture
   delay. Moving the plane ±10 ps (about 2 mm of trace) moves the 2.44 GHz target from 46 − j43 to
@@ -267,11 +267,13 @@ built, 1BP with a hand-made C21 ground tie to F23, and 1BP with Nordic's C3 rout
   routing (ground pad isolated, return trace to VSS_PA alongside the ANT trace) recovers 12-15 dB of that.
   The result holds for any assumption about the chip's harmonic output.
 - **H3 is not trustworthy for the tight-loop layouts.** Their trap sits near 7.3 GHz on a 4-5 dB per
-  100 MHz slope, and the model's frequency scale is 10-15 % low. Real H3 is probably 25-30 dB lower than
+  100 MHz slope, and the model's frequency scale is uncertain by several percent. Real H3 is probably lower than
   modelled there, in line with Nordic's measured −48 to −51 dBc.
-- **Validation:** configuration 1 simulated against Nordic's measured network matches its shape, but the
-  cutoff sits 10-15 % low. The in-band match cannot be judged from the model until that is understood
-  (thirds rule, F4; a 0.025 mm run).
+- **Validation:** configuration 1 against Nordic's measured network matches its shape. The measured board
+  was most likely a 2018 nRF52840 DK: v1.0 values with a thin-film LQP15MN inductor, on the same copper
+  as the reference layout. Modelled that way, in-band S21 is about 1 dB low and the roll-off 5-9 % low.
+  The stack-up, the solver, J1's capacitance and the fixture delay are ruled out
+  (see 1bp-rf-findings.md).
 - **For the next revision:** copy Nordic's C21 routing. Then measure conducted H2/H3 at J1 and the network
   from the ANT pad with a VNA.
 

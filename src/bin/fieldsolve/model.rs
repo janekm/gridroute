@@ -557,6 +557,38 @@ fn cpml_axis(lines: &[f64], nlo: usize, nhi: usize, dt: f64, fmax: f64) -> PmlAx
     ax
 }
 
+/// Cell materials: whether cell (i, j) lies inside the board outline (by its centre; index j * nx + i), and
+/// the slab of each z cell k (by its centre), if any.
+pub fn cell_materials(g: &Grid, lay: &Layout) -> (Vec<bool>, Vec<Option<usize>>) {
+    let (nx, ny, nz) = (g.nx(), g.ny(), g.nz());
+    let mut inside = vec![true; nx * ny];
+    if !lay.outline.is_empty() {
+        let mut bb = BBox::empty();
+        lay.outline.iter().flatten().for_each(|&p| bb.add(p));
+        for j in 0..ny.saturating_sub(1) {
+            for i in 0..nx.saturating_sub(1) {
+                let p = P2::new(0.5e3 * (g.x[i] + g.x[i + 1]), 0.5e3 * (g.y[j] + g.y[j + 1]));
+                let mut c = false;
+                if bb.contains(p) {
+                    for l in &lay.outline {
+                        if crate::geom::point_in_polygon(l, p) {
+                            c = !c;
+                        }
+                    }
+                }
+                inside[j * nx + i] = c;
+            }
+        }
+    }
+    let slab_of_k = (0..nz.saturating_sub(1))
+        .map(|k| {
+            let zc = 0.5e3 * (g.z[k] + g.z[k + 1]);
+            lay.slabs.iter().position(|s| zc >= s.z0.min(s.z1) && zc <= s.z0.max(s.z1))
+        })
+        .collect();
+    (inside, slab_of_k)
+}
+
 /// Build the update coefficients and runtime ports.
 pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Problem {
     let (nx, ny, nz) = (g.nx(), g.ny(), g.nz());
@@ -588,34 +620,7 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
     }
 
     // cell materials: inside-outline mask per (i,j) cell, slab per k cell
-    let inside: Vec<bool> = {
-        let mut v = vec![true; nx * ny];
-        if !lay.outline.is_empty() {
-            let mut bb = BBox::empty();
-            lay.outline.iter().flatten().for_each(|&p| bb.add(p));
-            for j in 0..ny.saturating_sub(1) {
-                for i in 0..nx.saturating_sub(1) {
-                    let p = P2::new(0.5e3 * (g.x[i] + g.x[i + 1]), 0.5e3 * (g.y[j] + g.y[j + 1]));
-                    let mut c = false;
-                    if bb.contains(p) {
-                        for l in &lay.outline {
-                            if crate::geom::point_in_polygon(l, p) {
-                                c = !c;
-                            }
-                        }
-                    }
-                    v[j * nx + i] = c;
-                }
-            }
-        }
-        v
-    };
-    let slab_of_k: Vec<Option<usize>> = (0..nz.saturating_sub(1))
-        .map(|k| {
-            let zc = 0.5e3 * (g.z[k] + g.z[k + 1]);
-            lay.slabs.iter().position(|s| zc >= s.z0.min(s.z1) && zc <= s.z0.max(s.z1))
-        })
-        .collect();
+    let (inside, slab_of_k) = cell_materials(g, lay);
     let w_loss = 2.0 * std::f64::consts::PI * o.f_loss;
     // wideband loss: per slab (eps_inf, deps per pole); the copper-loss gap is the slab's thickness
     let poles: Vec<f64> = o.wideband.as_ref().map(|w| w.poles()).unwrap_or_default();

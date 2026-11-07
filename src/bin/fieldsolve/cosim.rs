@@ -573,6 +573,10 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
                         "theta_deg": pat.theta.iter().map(|t| t.to_degrees()).collect::<Vec<_>>(),
                         "phi_deg": pat.phi.iter().map(|t| t.to_degrees()).collect::<Vec<_>>(),
                         "eirp_per_w_db": u.iter().map(|&x| d(4.0 * PI * x)).collect::<Vec<_>>(),
+                        // the same split by polarisation (E_theta, E_phi), for polar cuts
+                        "eirp_theta_db": pat.eth.iter().map(|e| d(4.0 * PI * e.abs().powi(2) / (2.0 * crate::model::ETA0))).collect::<Vec<_>>(),
+                        "eirp_phi_db": pat.eph.iter().map(|e| d(4.0 * PI * e.abs().powi(2) / (2.0 * crate::model::ETA0))).collect::<Vec<_>>(),
+                        "p_in_db": d(p_in),
                         "p_rad_db": d(p_rad), "p_conducted_db": d(p_out),
                     }))
                     .unwrap(),
