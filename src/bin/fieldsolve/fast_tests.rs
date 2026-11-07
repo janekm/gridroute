@@ -164,3 +164,34 @@ fn screening_run_records_policy_metadata() {
     // on a matched line the accepted power is ~ all of it
     assert!(o["per_f"][0]["accepted_db"].as_f64().unwrap() > -0.5, "{o}");
 }
+
+/// `optimise` on a parameterised spec: the edit's expression is resolved per point, screening and full
+/// solves land in the cache, and a repeated search solves nothing.
+#[test]
+fn optimise_solves_parameterised_specs_once() {
+    let pads = vec![rect(-4.2, -0.2, -3.8, 0.2, "A"), rect(-3.2, -0.2, -2.8, 0.2, "B")];
+    let spec = json!({"roi": [-8, -8, 8, 8], "cell": 0.5, "air": 4, "air_z": 4, "max_cell": 2.0, "pml": 4, "fmax": 6e9, "max_steps": 3000,
+                      "ports": [{"name": "P", "pos": "A.1", "neg": "B.1", "layer": "F.Cu"}],
+                      "farfield": {"freqs": [4e9, 5e9], "step_deg": 30},
+                      "objective": {"port": "P", "band": [4e9, 5e9]},
+                      "edits": [{"layer": "F.Cu", "op": "add", "rect": [-2.9, -0.2, "=-2.9 + len", 0.2], "net": "B"}]});
+    let board = ctx(pads, json!({})).board;
+    let ps = optimise::parse_params(&json!([{"name": "len", "min": 2.0, "max": 6.0, "step": 1.0, "start": 4.0}])).unwrap();
+    let dir = std::env::temp_dir().join(format!("fieldsolve-test-optimise-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let be = crate::backend(&[]);
+    let mut ev = optimise::SimEval { spec, board, kicad: false, ps: ps.clone(), cache: dir.join("cache"), backend: &*be };
+    let o = optimise::Opts { budget: 3, init: 3, promote_every: 0, final_n: 1, ..Default::default() };
+    let r = optimise::search(&ps, &mut ev, &o).unwrap();
+    assert_eq!((r["screening_solves"].as_u64(), r["full_solves"].as_u64(), r["cached"].as_u64()), (Some(3), Some(1), Some(0)), "{}", r["evaluations"]);
+    assert!(r["cell_steps"]["screening"].as_f64().unwrap() > 0.0 && r["cell_steps"]["full"].as_f64().unwrap() > 0.0);
+    assert_eq!(r["best"]["full_per_f_db"].as_array().unwrap().len(), 2, "one value per band frequency");
+    let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("cache/screening/len+4.0000/spec.json")).unwrap()).unwrap();
+    assert!((s["edits"][0]["rect"][2].as_f64().unwrap() - 1.1).abs() < 1e-12, "{}", s["edits"][0]);
+    assert_eq!(s["fidelity_record"]["level"], "screening");
+    let again = optimise::search(&ps, &mut ev, &o).unwrap();
+    assert_eq!(again["cached"].as_u64(), Some(4));
+    assert_eq!(again["cell_steps"]["total"].as_f64(), Some(0.0));
+    assert_eq!(again["best"], r["best"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

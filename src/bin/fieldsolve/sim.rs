@@ -1283,6 +1283,9 @@ pub fn apply_edits(board: &mut Board, spec: &Value, kicad: bool) -> Result<(), S
         }
         let y = |v: f64| if kicad { -v } else { v };
         let (x0, x1, y0, y1) = (r[0].min(r[2]), r[0].max(r[2]), y(r[1]).min(y(r[3])), y(r[1]).max(y(r[3])));
+        if x1 - x0 < 1e-9 || y1 - y0 < 1e-9 {
+            continue; // empty: lets a parameterised edit vanish (fieldsolve optimise)
+        }
         let l = board.layers.iter_mut().find(|l| l.name == layer).ok_or_else(|| format!("edit: no copper layer {layer}"))?;
         let shape = Shape::Polygon(vec![P2::new(x0, y0), P2::new(x1, y0), P2::new(x1, y1), P2::new(x0, y1)]);
         if dark {

@@ -1,16 +1,18 @@
 # fieldsolve fast iteration: component tuning and fidelity policies
 
-November 2026. This implements the first two stages of the
+November 2026. This implements the
 [fast-mode proposal](../reports/pcb-field-solver-review-2097498/fast-mode/proposal.md) (outside the repository,
-in `reports/pcb-field-solver-review-2097498/fast-mode/`):
+in `reports/pcb-field-solver-review-2097498/fast-mode/`) in its four stages:
 
 1. **Component changes reuse one EM extraction.** `fieldsolve tune` scores part combinations on a saved
    N-port result, with no new EM run.
 2. **Geometry changes get cheaper EM runs with a measured accuracy budget.** `fieldsolve run SPEC --fast`
    resolves to a recorded fidelity policy (`screening`, `refined` or `validated`).
-
-Stages 3 and 4 (surrogate-assisted outer search, adjoint or other solver backends) are not implemented; see
-[Follow-ups](#follow-ups).
+3. **Geometry search spends full solves only where they matter.** `fieldsolve optimise SPACE.json` searches a
+   few geometry parameters on screening solves, maps screening onto full fidelity from a few promoted
+   full solves, and returns the best full-fidelity candidate.
+4. **The next solver investment, chosen from a profile.** Where a screening run's time goes, and what adjoint,
+   frequency-domain or local time stepping could and could not save ([Stage 4](#stage-4-where-the-remaining-time-goes)).
 
 All timings are on the M3 Max (12 P + 4 E cores, 40-core GPU).
 
@@ -137,7 +139,16 @@ values for the untrimmed antenna.
 > on coarse cells, which those corrections are meant to reduce, so the policies and these tables need a
 > re-run with the corrections on once that branch is merged (`tools/fieldsolve_calib/`, below). A level
 > switches them on through `"fidelity": {"set": {"screening": {"<spec key>": value}}}`, which is passed into
-> the resolved spec and recorded.
+> the resolved spec and recorded. On that branch the corrections are the `"edges"` spec key, and the
+> recommended per-level setting is:
+>
+> ```json
+> "edges": true,
+> "fidelity": {"set": {"screening": {"edges": {"dt_check": false}}, "refined": {"edges": true}, "validated": {"edges": true}}}
+> ```
+>
+> Screening skips the CPU stability check (about 100 s on large boards); it could also leave `"edges"` out.
+> `make_specs.py --edges` writes the calibration specs this way.
 
 ### What it does
 
@@ -208,10 +219,23 @@ Twelve candidates of the MTH R7A PIFA (antenna alone at the C20 feed, whole boar
 come from the as-built Gerbers through the new spec key `"edits"`
 (`[{"layer", "op": "add" | "clear", "rect", "net"}]`):
 
-- the radiator's open end trimmed by 1.1 and 2.0 mm, or extended by 1.0 and 1.5 mm;
+- the radiator's open end (x = 141.9) trimmed by 1.0 and 1.94 mm, or extended by 1.0 and 1.5 mm;
 - the feed moved 0.5 or 1.0 mm towards the open end, or 0.3 mm away from it;
 - the ground clearance under the radiator widened by 0.5 or 1.0 mm, or narrowed by 0.5 mm;
 - a trim combined with a feed move.
+
+**The as-built model differs from the earlier MTH reference.** These specs widen the fine-mesh ROI from
+x = 145 to 141.5, so the radiator's open end (x 141.9–144.35) is meshed at 0.05 mm. In the reference run of
+[mth-antenna-findings.md](mth-antenna-findings.md) it fell in graded cells of about 0.35–0.5 mm (about 5 nodes
+along the 2.45 mm arm), and that coarse open end lowers the resonance. With the reference ROI, the same
+one-port spec reproduces the reference's antenna-alone impedance to about 1 Ω. The widened ROI is the
+better-resolved as-built model; its own mesh convergence is not demonstrated.
+
+| C20 into 50 Ω, as built | 2.40 GHz | 2.44 GHz | 2.48 GHz | worst in band |
+|---|---|---|---|---|
+| reference 7-port, other ports open | 37.5+j5.1 Ω | 28.5+j16.1 Ω | 21.8+j26.3 Ω | |
+| one-port, reference ROI (x ≥ 145) | 38.3+j5.6 Ω | 28.3+j17.2 Ω | 21.9+j27.7 Ω | −2.09 dB |
+| one-port, widened ROI (x ≥ 141.5) | 59.8−j8.8 Ω | 44.3+j2.3 Ω | 33.4+j13.2 Ω | −0.91 dB |
 
 Every candidate ran at `spec` level (the reference: 12.85 M cells, dt 88.1 fs, standard stop) and at
 `screening` (4.45 M cells, dt 100.5 fs); six also ran at `refined` (6.60 M cells, dt 97.2 fs). The worst
@@ -220,7 +244,7 @@ in-band radiated power per watt incident, in dB:
 | candidate | full | screening | error | refined | error | screening cells × steps saving |
 |---|---|---|---|---|---|---|
 | base | −0.914 | −1.321 | −0.41 | −1.375 | −0.46 | 3.23 × |
-| trim 1.1 mm | −1.685 | −1.404 | +0.28 | | | 3.21 × |
+| trim 1.0 mm | −1.685 | −1.404 | +0.28 | | | 3.21 × |
 | trim 2.0 mm | −3.220 | −3.002 | +0.22 | −2.921 | +0.30 | 2.89 × |
 | extend 1.0 mm | −3.013 | −3.826 | −0.81 | | | 2.94 × |
 | extend 1.5 mm | −4.495 | −5.559 | −1.06 | −5.825 | −1.33 | 2.44 × |
@@ -230,7 +254,7 @@ in-band radiated power per watt incident, in dB:
 | clearance +0.5 mm | −1.080 | −0.880 | +0.20 | | | 3.40 × |
 | clearance +1.0 mm | −1.727 | −1.500 | +0.23 | −1.499 | +0.23 | 2.83 × |
 | clearance −0.5 mm | −4.269 | −5.407 | −1.14 | −5.507 | −1.24 | 2.63 × |
-| trim 1.1 + feed −0.5 | −2.458 | −2.195 | +0.26 | | | 3.04 × |
+| trim 1.0 + feed −0.5 | −2.458 | −2.195 | +0.26 | | | 3.04 × |
 
 | | screening (n = 12) | refined (n = 6) |
 |---|---|---|
@@ -294,16 +318,224 @@ up during this work to confirm it.
 `analyze.py [--replay RUN]` prints the tables above and writes `calib.json`. About 3.5 h of GPU time on the
 M3 Max.
 
+## Stage 3: geometry search with adaptive promotion
+
+### What it does
+
+```sh
+target/release/fieldsolve optimise space.json      # [--method surrogate|pattern] [--budget N] [--out DIR]
+target/release/fieldsolve optimise-bench           # [--seeds N] [--promote-every N] [--final N] [--json OUT]
+```
+
+`space.json` names a spec and a few parameters. The spec is parameterised by expressions: any string
+starting with `=` is evaluated with the parameters (numbers, names, `+ - * /`, parentheses, `min`, `max`,
+`abs`, `clamp`), and an edit whose rectangle comes out empty is skipped, so one spec covers both trimming
+and extending. The MTH space, three parameters on a 0.1 mm grid:
+
+```json
+{ "spec": "mth_param.json", "out": "surrogate", "cache": "cache", "budget": 16,
+  "parameters": [{"name": "arm",  "min": -1.9, "max": 1.5, "step": 0.1, "start": 0},
+                 {"name": "feed", "min": -1.0, "max": 0.5, "step": 0.1, "start": 0},
+                 {"name": "clr",  "min": -0.5, "max": 1.0, "step": 0.1, "start": 0}] }
+```
+
+with edits such as `{"layer": "F.Cu", "op": "add", "rect": ["=141.9 - max(arm, 0)", 74.64, "=141.9 + min(max(arm, 0), 0.05)", 74.94]}`
+for the radiator's open end. `arm` lengthens (positive) or trims the radiator. `feed` moves the feed strip
+towards the open end (negative) or towards the short. `clr` widens (positive) or narrows the ground
+clearance under the radiator. All values are mm.
+
+- **Screening solves explore.** The default method, `surrogate`, does the following:
+  - starts from the start point and a Latin hypercube (2d + 1 points);
+  - then screens the point of largest expected improvement of a Gaussian-process model, inside a trust
+    region around the incumbent. The trust region doubles after an improvement and halves after repeated
+    failures.
+
+  `pattern` is a compass search from the start point. It is the simple bounded search the proposal asks to
+  compare against, with the same budget and promotion rules.
+- **Full solves are promotions:**
+  - every `promote_every` (6) screening solves, the best predicted full-fidelity point gets a full solve;
+  - at the end, up to `final` (3) more, while the prediction is within `tie_db` (1.2 dB, the calibration's
+    2 sd) of the best full value.
+
+  The answer is the best full-fidelity point.
+- **Space mapping carries screening onto full fidelity.** The screening model is a Gaussian process per
+  band frequency. Full fidelity is modelled as that model at shifted parameters plus an offset:
+  `full_f(u) ≈ screen_f(u + s) + b`. The shift `s` and offset `b` are fitted by ridge-regularised least
+  squares to every full solve's per-frequency values, so one full solve already constrains the shift.
+  Expected improvement uses the mapped prediction, and the solve is made at the point's screening image
+  `u + s`. `mapping: false` promotes the best screening candidates as they are.
+- **Every solve is cached.** `cache/LEVEL/KEY/` holds `result.json` and the resolved `spec.json`. A
+  repeated point is never solved twice, two searches can share a cache, and an interrupted search resumes.
+- **The record** `optimise.json` holds:
+  - every evaluation (level, point, per-frequency values, cells × steps, seconds, why it was chosen);
+  - the trajectory of the best full value;
+  - screening and full solve counts and costs;
+  - the fitted mapping;
+  - the full-minus-screening differences.
+
+### Why space mapping
+
+The calibration shows a systematic error: screening shifts the resonance down by about 1 %. On a sharp
+worst-in-band objective, the screening optimum is then a different geometry, and in the synthetic test
+below its full-fidelity value is about 1.3–1.5 dB below the true optimum. Any search that trusts
+screening values as they are inherits that gap, however many solves it spends. A constant offset model
+cannot remove it, because the error depends on where the band edge sits. A parameter shift is the right
+model, and the per-frequency responses identify it from very few full solves.
+
+### Synthetic benchmark
+
+`optimise-bench` runs the methods on a two-fidelity test problem built to match the measured behaviour:
+- three parameters, each on a 41-point grid;
+- a resonance moved by the parameters (strongly by the first, like a radiator length), with a match factor
+  on the others;
+- worst of three band frequencies;
+- the screening level shifts the resonance down 1 % and adds 0.03 dB of repeatable noise;
+- cost is counted in full-solve equivalents, a screening solve being 1 / 3.1 (the measured cells × steps
+  saving).
+
+30 seeds; regret is the true full-fidelity optimum minus the best full value found:
+
+| method | screening solves | full solves | cost (full solves) | mean regret | median | within 0.1 dB |
+|---|---|---|---|---|---|---|
+| surrogate + mapping | 12 | 4.0 | 7.9 | 0.29 dB | 0.22 dB | 33 % |
+| surrogate + mapping | 16 | 5.0 | 10.2 | 0.16 dB | 0.09 dB | 53 % |
+| surrogate + mapping | 24 | 6.0 | 13.7 | 0.13 dB | 0.08 dB | 60 % |
+| surrogate + mapping | 39 | 8.9 | 21.6 | 0.04 dB | 0.03 dB | 90 % |
+| pattern + mapping | 16 | 5.0 | 10.2 | 0.13 dB | 0.10 dB | 53 % |
+| surrogate, no mapping | 16 | 4.9 | 10.1 | 1.26 dB | 1.43 dB | 0 % |
+| pattern (no mapping) | 16 | 5.0 | 10.1 | 1.34 dB | 1.29 dB | 0 % |
+| pattern (no mapping) | 36 | 8.4 | 19.9 | 1.53 dB | 1.55 dB | 0 % |
+| surrogate, full fidelity only | 0 | 12 | 12 | 0.32 dB | 0.30 dB | 23 % |
+| surrogate, full fidelity only | 0 | 16 | 16 | 0.12 dB | 0.07 dB | 67 % |
+| pattern, full fidelity only | 0 | 24 | 24 | 0.26 dB | 0.21 dB | 20 % |
+
+- **Mapping is what makes screening useful.** Without it, both search methods stay 1.3–1.5 dB from the
+  optimum, and more screening solves do not help.
+- **With mapping, screening plus promotion beats searching at full fidelity, by a modest margin.** At about
+  10 full-solve equivalents it reaches 0.16 dB mean regret, which a full-fidelity surrogate needs about
+  14–16 full solves to match. That is roughly a third less EM. It is not an order of magnitude: one
+  screening solve costs a third of a full one, and a few full solves are needed to fit the mapping.
+- **The surrogate beats the compass search at full fidelity** (0.12 dB at 16 solves against 0.26 dB at 24).
+  With mapping on, the two are close at a budget of 16, because the mapped promotions do much of the work.
+- **Promotion settings:** final 3 and promote every 6 are the defaults. In a sweep of promote every
+  {4, 6} × final {2, 3}, the variants differed by about 0.05 dB in mean regret, against a cost difference of
+  one or two full solves.
+
+### MTH PIFA search
+
+A surrogate search with the space above (budget 16), on the widened-ROI MTH model of the calibration:
+
+| | screening solves | full solves | cells × steps | full-run equivalents | best full value |
+|---|---|---|---|---|---|
+| surrogate + mapping | 16 | 5 | 7.10e12 (3.56 screening + 3.54 full) | 10.0 | −0.467 dB |
+PATTERN_ROW
+
+One full run of the as-built model is 7.07e11 cells × steps. Trajectory of full solves (the as-built model
+scores −0.914 dB):
+
+| after | full solve at (arm, feed, clr) mm | predicted | full | why |
+|---|---|---|---|---|
+| 6 screening | (0, 0, 0), as built | −1.33 | −0.914 | periodic promotion |
+| 12 screening | (+0.3, +0.3, +0.5) | −0.31 | −0.579 | periodic promotion |
+| 16 screening | (+1.5, −0.3, +1.0) | −0.43 | −0.532 | final |
+| | (+1.5, −0.2, +1.0) | −0.45 | −0.487 | final |
+| | **(+1.4, −0.3, +0.9)** | −0.46 | **−0.467** | final |
+
+At the end, the fitted mapping was a shift of +0.11 mm in `arm` and +0.19 mm in `clr`, with a 0.02 dB offset
+and 0.035 dB rms residual. Its last prediction was within 0.004 dB of the full solve, and the shift is in the
+direction the calibration predicts: the coarse mesh's lower resonance has to be compensated by a shorter
+radiator in screening.
+
+C20 impedance into 50 Ω and the objective's parts (full fidelity):
+
+| | 2.40 GHz | 2.44 GHz | 2.48 GHz | radiated / accepted |
+|---|---|---|---|---|
+| as built | 59.8−j8.8 Ω | 44.3+j2.3 Ω | 33.4+j13.2 Ω | −0.43 / −0.48 / −0.58 dB |
+| best (+1.4, −0.3, +0.9) | 79.5−j6.2 Ω | 62.6+j1.1 Ω | 49.3+j10.3 Ω | −0.25 / −0.26 / −0.37 dB |
+
+About half the gain is radiation: the longer arm and wider clearance raise the share of the accepted power
+that is radiated by 0.2 dB. The other half is the match, which is flatter across the band.
+
+Caveats:
+- **Antenna-alone values only.** These are free-space values for the antenna alone at the C20 feed into
+  50 Ω, with the ladder open. A geometry change is evaluated properly together with a retuned ladder:
+  `tune` on a 7-port extraction of the chosen geometry.
+- **Two parameters are at the edge of their range.** The best point has `arm` and `clr` one step inside
+  their upper bounds, so a wider range may do better.
+- **Mesh convergence of the widened-ROI model is not demonstrated** (calibration note above).
+- **Fabrication tolerance.** Each move is a fraction of a millimetre, so the result should be checked at
+  ±0.1 mm on each parameter before the last tenth of a dB is trusted.
+
+## Stage 4: where the remaining time goes
+
+The proposal's fourth stage is a decision: adjoint sensitivities, another solver, or local time stepping,
+"only after profiling identifies the remaining dominant cost". The profile, on the MTH screening run of the
+as-built board (4.45 M cells, 49 152 steps):
+
+| phase | time | share |
+|---|---|---|
+| set-up and mesh build | 0.8 s | 0.3 % |
+| time stepping (Metal) | 259.6 s | 94.6 % |
+| far-field transform (CPU, 1.0 M face samples, 3 frequencies) | 13.8 s | 5.0 % |
+
+KERNEL_BENCH
+
+Inside the stepping, the step count is the product of two things:
+- **Physical time:** 4.9 ns, set by the objective's settling against the slowly decaying 2.67 GHz
+  resonance (Stage 2).
+- **The time step:** 100.5 fs, fixed by the protected 0.047 mm cells around the feed.
+
+Without the protected regions, the same screening mesh would have 3.44 M cells and a 165.4 fs step. The
+protection therefore costs a factor of 1.29 × 1.65 = 2.1 in cells × steps. On a tensor-product grid, its
+fine lines run through the whole domain, and its smallest cell sets the step everywhere.
+
+What each option could and could not buy:
+
+- **Adjoint sensitivities** give a gradient for about two solves, whatever the number of parameters.
+  - With three to five parameters they do not pay: the MTH search found its optimum in about 10 full-run
+    equivalents, and a finite-difference gradient costs d + 1 solves.
+  - They also need geometry that is differentiable through the rasterisation. Today copper is binary per
+    cell edge, so an adjoint would first need the conformal treatment of the adaptive-mesh branch.
+  - They become the right tool for free-form copper (tens to thousands of pixel or boundary variables),
+    which this work does not attempt.
+- **Frequency-domain solves.** The objective needs three frequencies. A screening run's 49 000 time steps,
+  shared between three 13 M-unknown systems with one matrix-vector product costing roughly one time step,
+  are a budget of about 16 000 Krylov iterations per frequency.
+  - That is reachable only with a good preconditioner for an open, PML-terminated, lossy problem, which is a
+    research project in itself.
+  - It would remove the high-Q ringing that sets the physical time.
+  - Not recommended as the next step.
+- **Local time stepping or subgridding of the protected regions** has a measured upper bound of about 2.1×
+  on screening runs.
+  - It is the largest single factor left, and it compounds with stages 2–3.
+  - It needs a stable interface between grids (the proposal's caveat), so it is substantial work.
+  - The full-fidelity run has 0.05 mm cells throughout its ROI, so subgridding only the feed would not help
+    there.
+- **Late-time extrapolation** of the objective, fitting the decaying resonances (as Harminv does) to stop
+  before the beat settles, is cheaper to try. The 150 000-step history of Stage 2 is the test case: the
+  standard stop fires at 55 k steps, 0.005 dB from the beat centre. An extrapolation that is right to
+  0.05 dB at 25–30 k steps would halve every run.
+
+**Recommendation:**
+1. **Late-time extrapolation** first: an offline experiment on the saved objective histories, then a stop
+   rule. It is small, and it halves the step count of every run if it holds.
+2. **Then subgridding** of protected features for screening (up to 2.1×).
+3. **Adjoint** only if free-form geometry becomes a goal.
+4. **No frequency-domain backend** for now.
+
+None of these is implemented here.
+
 ## Follow-ups
 
-- **Re-calibrate with the model corrections** from `fieldsolve-adaptive-mesh` (edge singularity, conformal
-  metal), switched on per level via `fidelity.set`. Then decide whether `refined` earns its place, and drop
-  its window to 4 periods.
-- **Stage 3, surrogate-assisted outer search:** screening runs as the cheap model in a geometry search, with
-  full runs for the shortlist. The ±1.2 dB screening uncertainty sets the shortlist width.
-- **Stage 4:** adjoint sensitivities, or other solver backends (MoM or FEM for small structures).
+- **Re-calibrate with the model corrections** from `fieldsolve-adaptive-mesh` (`make_specs.py --edges`),
+  then decide whether `refined` earns its place and drop its window to 4 periods.
+- **Mesh convergence of the widened-ROI MTH model** (a 0.035 mm run, or the corrections on), before
+  geometry results are compared with measurements.
+- **MTH geometry:**
+  - widen the `arm` and `clr` ranges;
+  - check fabrication tolerance (±0.1 mm) at the best point;
+  - take a 7-port extraction of it for `tune`, so the ladder is retuned for the new geometry.
+- **Late-time extrapolation** of the objective (Stage 4), offline on the saved histories first.
+- **Subgridding or local time stepping** of protected features (up to 2.1× on screening).
 - **A single-feed screening option for multiport tuning extractions**, since all-port screening saves only
-  1.8 × in cells × steps.
-- **A screening-level bias correction:** subtracting a per-board offset measured from one screening/full pair
-  (base: −0.41 dB) would centre the error. The sign depends on which band edge is worst, though, so a
-  frequency-shift correction is the better model.
+  1.8× in cells × steps.

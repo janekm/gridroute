@@ -17,6 +17,7 @@ mod fidelity;
 mod sim;
 mod lines;
 mod tune;
+mod optimise;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;
 
@@ -370,6 +371,33 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "optimise" | "optimize" => {
+            let Some(space) = args.get(2) else {
+                eprintln!("usage: fieldsolve optimise SPACE.json [--method surrogate|pattern] [--budget N] [--out DIR] [--backend cpu|metal|auto]");
+                std::process::exit(2);
+            };
+            let be = backend(&args);
+            let run = |p: &model::Problem, s: &fdtd::RunSpec| be(p, s);
+            if let Err(e) = optimise::run(std::path::Path::new(space), &args[3..], &run) {
+                eprintln!("fieldsolve optimise: {e}");
+                std::process::exit(1);
+            }
+        }
+        "optimise-bench" => {
+            // surrogate vs compass search vs full-fidelity-only search on the synthetic two-fidelity problem
+            let seeds = arg(&args, "--seeds").and_then(|s| s.parse().ok()).unwrap_or(50);
+            let mut o = optimise::Opts::default();
+            if let Some(v) = arg(&args, "--promote-every").and_then(|s| s.parse().ok()) {
+                o.promote_every = v;
+            }
+            if let Some(v) = arg(&args, "--final").and_then(|s| s.parse().ok()) {
+                o.final_n = v;
+            }
+            let r = optimise::bench(seeds, &o);
+            if let Some(o) = arg(&args, "--json") {
+                std::fs::write(&o, serde_json::to_string_pretty(&r).unwrap()).unwrap();
+            }
+        }
         "radmatrix" => {
             // the radiation-matrix form against Pattern::combine + p_rad on a saved far field
             let Some(ff) = args.get(2) else {
@@ -391,7 +419,7 @@ fn main() {
             gerber::render_svg(&b, std::path::Path::new(args.get(3).map(|s| s.as_str()).unwrap_or("board.svg")));
         }
         _ => {
-            eprintln!("usage:\n  fieldsolve run SPEC.json [--fast | --fidelity screening|refined|validated] [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve tune CONFIG.json [--restarts N] [--exhaustive 0|1|2] [--no-outputs]\n  fieldsolve radmatrix RUN/farfield.json [candidates]\n  fieldsolve svg GERBER_DIR OUT.svg");
+            eprintln!("usage:\n  fieldsolve run SPEC.json [--fast | --fidelity screening|refined|validated] [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve tune CONFIG.json [--restarts N] [--exhaustive 0|1|2] [--no-outputs]\n  fieldsolve radmatrix RUN/farfield.json [candidates]\n  fieldsolve optimise SPACE.json [--method surrogate|pattern] [--budget N] [--out DIR]\n  fieldsolve optimise-bench [--seeds N] [--promote-every N] [--final N] [--json OUT]\n  fieldsolve svg GERBER_DIR OUT.svg");
         }
     }
 }

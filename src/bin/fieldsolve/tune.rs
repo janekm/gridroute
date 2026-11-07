@@ -574,6 +574,10 @@ impl Rng {
     pub fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
+    /// Uniform in [0, 1).
+    pub fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
 }
 
 /// The best few distinct candidates by a ranking key.

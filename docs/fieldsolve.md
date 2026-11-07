@@ -120,6 +120,8 @@ target/release/fieldsolve cosim cosim.json         # parts on the EM N-port (see
 target/release/fieldsolve tune tune.json           # search part values on a saved EM result (no new EM run)
 target/release/fieldsolve run spec.json --fast     # screening fidelity; --fidelity refined|validated
 target/release/fieldsolve radmatrix run/farfield.json   # radiation matrix against combine + p_rad
+target/release/fieldsolve optimise space.json     # geometry search: screening, space mapping, promoted full solves
+target/release/fieldsolve optimise-bench          # search methods on a synthetic two-fidelity problem
 target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
 target/release/fieldsolve connect spec.json [reps]  # time the mesh connectivity check, print the shorts it finds
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
@@ -541,10 +543,12 @@ its default 0.1–100 units turns millimetre fog into blocks.
 
 ## Fast iteration
 
-Component retuning reuses one EM extraction (`fieldsolve tune`); geometry candidates get coarse
-`--fast` runs with a measured error budget, `--fidelity refined` and `validated` for promising candidates.
-Both, with the benchmarks and the calibration on twelve MTH antenna geometries, are in
-[fieldsolve-fast-mode.md](fieldsolve-fast-mode.md).
+Component retuning reuses one EM extraction (`fieldsolve tune`). Geometry candidates get coarse `--fast`
+runs with a measured error budget, and `--fidelity refined` and `validated` serve promising candidates.
+`fieldsolve optimise` searches a few geometry parameters on screening runs and maps them onto full fidelity
+from a few promoted full runs. All of this is in [fieldsolve-fast-mode.md](fieldsolve-fast-mode.md): the
+benchmarks, the calibration on twelve MTH antenna geometries, the MTH geometry search, and a profile of
+what is left to speed up.
 
 ## Performance
 
@@ -617,6 +621,7 @@ The code is in `src/bin/fieldsolve/`.
 | `cosim.rs` | Touchstone reader, part models, port termination, ideal ladder, renormalisation, radiated vs conducted |
 | `tune.rs` | component search on a saved extraction: cached part reflections, radiation matrices, descent, exhaustive changes |
 | `fidelity.rs` | `--fast` / `--fidelity` policies: mesh coarsening with protected features, outputs, objective stop |
+| `optimise.rs` | geometry search: spec expressions, Gaussian-process surrogate, space mapping to full fidelity, promotion, solve cache |
 | `nf2ff.rs` | near-to-far-field transform: box plan, face currents, patterns, power, polar plots |
 | `disp.rs` | wideband dielectric: Debye pole fit to a flat tan δ, plane copper loss, update constants |
 | `cond.rs` | conductor loss: copper surface impedance (skin effect, thickness, roughness), Foster fit, sheet edges |

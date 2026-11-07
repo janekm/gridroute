@@ -2,10 +2,12 @@
 alone at the feed (port C20, R70 and the ladder left open), whole board, roi widened to cover the radiator's
 open end. Writes one spec per candidate into the current directory.
 
-    python3 make_specs.py MTH_7PORT_SPEC.json GERBER_DIR
+    python3 make_specs.py MTH_7PORT_SPEC.json GERBER_DIR [--edges]
 
 MTH_7PORT_SPEC is the all-port MTH run spec of docs/mth-antenna-findings.md; GERBER_DIR is relative to the
-output directory."""
+output directory. --edges switches on the edge-singularity and conformal-metal corrections of the
+fieldsolve-adaptive-mesh branch per level ("edges" spec key; needs that branch merged): screening without the
+dt stability check, refined and validated with the defaults, and the full ("spec") reference with them too."""
 import json, copy, sys
 base = json.load(open(sys.argv[1]))
 base['gerbers'] = sys.argv[2]
@@ -16,6 +18,9 @@ base['farfield'] = {"freqs": [2.40e9, 2.44e9, 2.48e9], "step_deg": 5, "gap": 3, 
 base['objective'] = {"port": "C20", "band": [2.40e9, 2.44e9, 2.48e9]}
 # feed, feed-to-short gap and the short's junction with the ground edge keep the full resolution
 base['fidelity'] = {"protect": [[153.8, 75.4, 156.3, 77.0]]}
+if '--edges' in sys.argv:
+    base['edges'] = True
+    base['fidelity']['set'] = {"screening": {"edges": {"dt_check": False}}, "refined": {"edges": True}, "validated": {"edges": True}}
 F, B = 'F.Cu', 'B.Cu'
 def ed(layer, op, r): return {"layer": layer, "op": op, "rect": r, "net": "GND"}
 def feed(dx):
