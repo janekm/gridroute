@@ -43,6 +43,156 @@ pub struct RunSpec {
     pub gather_metric: Option<GatherMetric>,
     pub gather_tol: f64,
     pub gather_lag: usize,
+    /// Objective components (dB, e.g. a band's |S_kj|^2 and radiated power per watt incident), evaluated
+    /// at every energy check and kept in [`RunResult::objective`]. With `objective_stop` the run also ends
+    /// once every component has stayed within a spread of `objective_tol_db` over the last `objective_window` steps,
+    /// the source is off and at least `min_steps` have run (the minimum settling time).
+    pub objective: Option<ObjectiveMetric>,
+    pub objective_stop: bool,
+    pub objective_tol_db: f64,
+    pub objective_window: usize,
+    pub min_steps: usize,
+    /// Late-time extrapolation of the objective (`extrap`): recorded at every check after the source, and
+    /// with its `stop` (and `objective_stop`) the run ends once the extrapolated objective is stable; the
+    /// result then carries the extrapolated port voltages and gathered DFT.
+    pub extrap: Option<crate::extrap::Opts>,
+}
+
+/// Objective components from (steps so far, port voltages, gathered DFT).
+#[derive(Clone)]
+pub struct ObjectiveMetric(pub std::sync::Arc<dyn Fn(usize, &[Vec<f32>], &[[Vec<f32>; 6]]) -> Vec<f64> + Send + Sync>);
+
+impl std::fmt::Debug for ObjectiveMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObjectiveMetric")
+    }
+}
+
+/// Largest max - min of any objective component over the checks covering the last `window` steps; `None`
+/// until the history reaches back a full window.
+pub fn objective_spread(hist: &[(usize, Vec<f64>)], window: usize) -> Option<f64> {
+    let now = hist.last()?.0;
+    let start = now.checked_sub(window)?;
+    let first = hist.iter().rposition(|h| h.0 <= start)?;
+    let w = &hist[first..];
+    let mut spread = 0.0f64;
+    for c in 0..w[0].1.len() {
+        let (lo, hi) = w.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), h| (lo.min(h.1[c]), hi.max(h.1[c])));
+        spread = spread.max(hi - lo);
+    }
+    Some(spread)
+}
+
+/// Settling estimate from two consecutive windows of `window` steps: per component, the change over the last
+/// window d2 and over the one before d1, r = |d2| / |d1|, and the change still to come if the approach is
+/// geometric, |d2| r / (1 - r). For r >= 0.9 (not visibly decaying, or changes at noise level where the
+/// ratio means nothing) the projection is 10 |d2|, so such a component counts as settled only once its
+/// change is a tenth of the tolerance. Returns the largest last-window change and the largest projected
+/// remaining change over the components (dB); `None` until the history covers two windows.
+pub fn objective_tail(hist: &[(usize, Vec<f64>)], window: usize) -> Option<(f64, f64)> {
+    let now = hist.last()?.0;
+    let at = |t: usize| hist.iter().rposition(|h| h.0 <= t).map(|i| &hist[i].1);
+    let (x2, x1, x0) = (&hist.last()?.1, at(now.checked_sub(window)?)?, at(now.checked_sub(2 * window)?)?);
+    if hist[0].0 > now - 2 * window {
+        return None;
+    }
+    let (mut last, mut tail) = (0.0f64, 0.0f64);
+    for c in 0..x2.len() {
+        let (d2, d1) = ((x2[c] - x1[c]).abs(), (x1[c] - x0[c]).abs());
+        last = last.max(d2);
+        let r = if d1 > 0.0 { d2 / d1 } else if d2 > 0.0 { f64::INFINITY } else { 0.0 };
+        tail = tail.max(if r >= 0.9 { 10.0 * d2 } else { d2 * r / (1.0 - r) });
+    }
+    Some((last, tail))
+}
+
+/// The stopping rules, evaluated at each energy check (shared by the CPU and Metal backends).
+#[derive(Default)]
+pub struct StopState {
+    peak: f64,
+    port_peak: f64,
+    ghist: Vec<Vec<f64>>,
+    pub ohist: Vec<(usize, Vec<f64>)>,
+    /// With the objective stop: the first check at which the energy/port rules would have ended the run.
+    pub standard: Option<(usize, &'static str)>,
+    /// Late-time extrapolation state and the extrapolated objective at each check where it was available.
+    pub x: crate::extrap::State,
+    pub xhist: Vec<(usize, Vec<f64>)>,
+}
+
+impl StopState {
+    /// Whether the gathered DFT is needed at this check.
+    pub fn wants_gathered(spec: &RunSpec) -> bool {
+        spec.gather_metric.is_some() || spec.objective.is_some()
+    }
+
+    /// The reason to stop now, if any: "objective", "energy" or "ports".
+    pub fn check(&mut self, spec: &RunSpec, steps: usize, en: f64, v: &[Vec<f32>], gathered: &[[Vec<f32>; 6]]) -> Option<&'static str> {
+        self.peak = self.peak.max(en);
+        // a configured gathered-field metric (e.g. the far field) gates the energy and port exits
+        let gs = match &spec.gather_metric {
+            Some(m) => {
+                self.ghist.push((m.0)(gathered));
+                gather_settled(&self.ghist, spec.gather_lag, spec.gather_tol)
+            }
+            None => true,
+        };
+        let src_off = steps > spec.exc.len();
+        if let Some(m) = &spec.objective {
+            self.ohist.push((steps, (m.0)(steps, v, gathered)));
+            if let (Some(xo), Some(port)) = (&spec.extrap, spec.excite) {
+                if self.x.update(xo, steps, spec.exc.len(), port, v, gathered, &spec.gather_freqs, spec.dft_every) {
+                    let (vx, gx) = self.x.last.as_ref().unwrap();
+                    self.xhist.push((steps, (m.0)(steps, vx, gx)));
+                }
+            }
+        }
+        let standard = if gs && src_off && en <= self.peak * 10f64.powf(spec.end_db / 10.0) {
+            Some("energy")
+        } else if spec.port_stop && ports_decayed(v, spec.check_every, spec.end_db, &mut self.port_peak) && src_off && gs {
+            Some("ports")
+        } else {
+            None
+        };
+        // the objective rule replaces the decay rules (port signals can be gone long before the radiated
+        // power through the far-field box has settled); where those would have stopped is recorded
+        if spec.objective.is_some() && spec.objective_stop {
+            if self.standard.is_none() {
+                self.standard = standard.map(|r| (steps, r));
+            }
+            // extrapolated: a full set of snapshots and the last few extrapolations agree
+            if let Some(xo) = spec.extrap.as_ref().filter(|x| x.stop) {
+                let n = self.xhist.len();
+                if src_off && self.x.snapshots() >= xo.snapshots && n >= xo.stable_checks && self.xhist.last().is_some_and(|h| h.0 == steps) {
+                    let w = &self.xhist[n - xo.stable_checks..];
+                    let spread = (0..w[0].1.len()).map(|c| w.iter().map(|h| h.1[c]).fold(f64::NEG_INFINITY, f64::max) - w.iter().map(|h| h.1[c]).fold(f64::INFINITY, f64::min)).fold(0.0, f64::max);
+                    if spread <= xo.tol_db {
+                        return Some("extrapolated");
+                    }
+                }
+            }
+            // settled: every component within the tolerance over the whole window. The window must span
+            // the slow parts of the approach: a geometric creep (the remaining change is below the
+            // window's) and a beat against a slowly decaying resonance near the band (the window's spread
+            // is twice the beat's amplitude, which bounds the distance to its centre)
+            let settled = src_off && steps >= spec.min_steps && objective_spread(&self.ohist, spec.objective_window).is_some_and(|sp| sp <= spec.objective_tol_db);
+            return settled.then_some("objective");
+        }
+        standard
+    }
+}
+
+impl StopState {
+    /// After a run stopped on the extrapolated objective: hand over the extrapolated port voltages and
+    /// gathered DFT, so that everything computed from the result uses them.
+    pub fn finish(&mut self, reason: &str, v: &mut Vec<Vec<f32>>, gathered: &mut Vec<[Vec<f32>; 6]>) {
+        if reason == "extrapolated" {
+            if let Some((vx, gx)) = self.x.last.take() {
+                *v = vx;
+                *gathered = gx;
+            }
+        }
+    }
 }
 
 /// A per-frequency scalar of the gathered DFT, evaluated at the energy checks.
@@ -120,7 +270,17 @@ pub struct RunResult {
     pub energy: Vec<(usize, f64)>,
     pub snaps: Vec<Snap>,
     pub seconds: f64,
+    /// Of `seconds`, the time before the first step (buffers, material tables, kernel set-up).
+    pub setup_seconds: f64,
     pub backend: String,
+    /// Why the run ended: "energy", "ports", "objective" or "max_steps" (not converged).
+    pub stop: String,
+    /// Objective components at each check (step, values), when `RunSpec::objective` is set.
+    pub objective: Vec<(usize, Vec<f64>)>,
+    /// With the objective stop: where the energy/port rules alone would have stopped (step, rule).
+    pub standard_stop: Option<(usize, String)>,
+    /// With `RunSpec::extrap`: the extrapolated objective at each check where it was available.
+    pub objective_extrap: Vec<(usize, Vec<f64>)>,
 }
 
 /// Gaussian pulse as openEMS's `SetGaussExcite(f0, fc)`: centre `f0`, 20 dB half bandwidth `fc`.
@@ -505,12 +665,12 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
         data: spec.dft_freqs.iter().map(|_| std::array::from_fn(|_| vec![0.0f32; 2 * p.n()])).collect(),
     });
     let mut gathered: Vec<[Vec<f32>; 6]> = spec.gather_freqs.iter().map(|_| std::array::from_fn(|c| vec![0.0f32; 2 * spec.gather[c].len()])).collect();
-    let mut peak = 0.0f64;
-    let mut port_peak = 0.0f64;
-    let mut ghist: Vec<Vec<f64>> = Vec::new();
+    let mut stop = StopState::default();
+    let mut reason = "max_steps";
     let mut ehist: Vec<(usize, f64)> = Vec::new();
     let mut steps = 0;
     let mut snaps = Vec::new();
+    let setup_seconds = t0.elapsed().as_secs_f64();
     for n in 0..spec.max_steps {
         update_h(p, &mut s);
         pml_h(p, &mut s);
@@ -551,28 +711,15 @@ pub fn run_cpu(p: &Problem, spec: &RunSpec) -> RunResult {
         if steps % spec.check_every == 0 {
             let en = energy(&s);
             ehist.push((steps, en));
-            peak = peak.max(en);
-            // a configured gathered-field metric (e.g. the far field) gates every convergence exit, energy-
-            // and port-based alike; only max_steps ends a run without it
-            let gs = match &spec.gather_metric {
-                Some(m) => {
-                    ghist.push((m.0)(&gathered));
-                    gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
-                }
-                None => true,
-            };
-            if gs && steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
+            if let Some(r) = stop.check(spec, steps, en, &v, &gathered) {
+                reason = r;
                 break;
-            }
-            if spec.port_stop {
-                let pd = ports_decayed(&v, spec.check_every, spec.end_db, &mut port_peak) && steps > spec.exc.len();
-                if pd && gs {
-                    break;
-                }
             }
         }
     }
-    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), backend: "cpu".into() }
+    let (mut v, mut gathered) = (v, gathered);
+    stop.finish(reason, &mut v, &mut gathered);
+    RunResult { steps, v, probes: pv, fields: fd, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: "cpu".into(), stop: reason.into(), standard_stop: stop.standard.map(|(s, r)| (s, r.to_string())), objective: stop.ohist, objective_extrap: stop.xhist }
 }
 
 #[allow(unused)]
