@@ -51,6 +51,14 @@ pub struct Refine {
 /// Lines covering `[lo, hi]`, through every `fixed` line inside it. `min_cells` optionally forces a
 /// minimum cell count in given intervals (e.g. at least two cells across each dielectric layer).
 pub fn lines_1d(lo: f64, hi: f64, fixed: &[f64], refine: &[Refine], ratio: f64, hmax: f64, min_cells: &[(f64, f64, usize)]) -> Vec<f64> {
+    lines_1d_slack(lo, hi, fixed, refine, ratio, hmax, min_cells, 0.0)
+}
+
+/// [`lines_1d`] with a rounding slack: an interval between fixed lines gets ceil(n - slack) cells instead of
+/// ceil(n), where n is its length in target cells. With slack 0.35 an interval 1.02 cells long becomes one
+/// cell 2 % over the target instead of two 0.51-cell slivers (which set the time step). A cell can then be
+/// up to `slack` over the target (an interval just under 1 + slack cells becomes one cell).
+pub fn lines_1d_slack(lo: f64, hi: f64, fixed: &[f64], refine: &[Refine], ratio: f64, hmax: f64, min_cells: &[(f64, f64, usize)], slack: f64) -> Vec<f64> {
     let size = |x: f64| -> f64 {
         let mut s = hmax;
         for r in refine {
@@ -78,7 +86,7 @@ pub fn lines_1d(lo: f64, hi: f64, fixed: &[f64], refine: &[Refine], ratio: f64, 
             let xm = a + (s as f64 + 0.5) * dx;
             cum[s + 1] = cum[s] + dx / size(xm);
         }
-        let mut n = cum[M].ceil().max(1.0) as usize;
+        let mut n = (cum[M] - slack).ceil().max(1.0) as usize;
         for &(c0, c1, m) in min_cells {
             if a >= c0 - tol && b <= c1 + tol {
                 // the interval lies inside a min-cells range: give it its share

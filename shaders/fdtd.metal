@@ -338,6 +338,27 @@ kernel void cond_e(device float* ex [[buffer(0)]], device float* ey [[buffer(1)]
     if (a == 0) ex[id] = e; else ey[id] = e;
 }
 
+// Sub-cell copper edge corrections of H (edge.rs): after the H update, H -= fac * kmu * curl E on the listed
+// components (ids: index | component << 30), so their update is divided by kappa. p.slab_len = count.
+kernel void hcorr(device float* hx [[buffer(0)]], device float* hy [[buffer(1)]], device float* hz [[buffer(2)]],
+                  device const float* ex [[buffer(3)]], device const float* ey [[buffer(4)]], device const float* ez [[buffer(5)]],
+                  device const float* inv_d [[buffer(6)]], constant P& p [[buffer(7)]],
+                  device const uint* ids [[buffer(8)]], device const float* fac [[buffer(9)]],
+                  uint t [[thread_position_in_grid]]) {
+    if (t >= p.slab_len) return;
+    uint w = ids[t];
+    uint a = w >> 30, id = w & 0x3fffffffu;
+    uint sy = p.nx, sz = p.nx * p.ny;
+    uint i = id % p.nx, j = (id / p.nx) % p.ny, k = id / sz;
+    device const float* idx = inv_d;
+    device const float* idy = inv_d + p.nx;
+    device const float* idz = inv_d + p.nx + p.ny;
+    float f = fac[t];
+    if (a == 0) hx[id] -= f * (p.kmu * ((ez[id + sy] - ez[id]) * idy[j] - (ey[id + sz] - ey[id]) * idz[k]));
+    else if (a == 1) hy[id] -= f * (p.kmu * ((ex[id + sz] - ex[id]) * idz[k] - (ez[id + 1] - ez[id]) * idx[i]));
+    else hz[id] -= f * (p.kmu * ((ey[id + 1] - ey[id]) * idx[i] - (ex[id + sy] - ex[id]) * idy[j]));
+}
+
 // The fused E kernel has already updated the Debye currents from E_new - E_old; the source's share of the
 // E change is added here to E and, on dispersive edges, to the currents (J_p += b_p dE), which equals
 // injecting the source before the current update (as the CPU reference does).

@@ -22,7 +22,7 @@
 use crate::fdtd::{gauss_excite, RunResult, RunSpec};
 use crate::geom::{BBox, Prim, Shape, P2};
 use crate::gerber::{Board, StackKind};
-use crate::mesh::{lines_1d, Grid, Refine};
+use crate::mesh::{Grid, Refine};
 use crate::model::{build, BuildOpts, Barrel, Layout, Lumped, Problem, Sheet, Slab, C0};
 use crate::post::{fit_rl, linspace, port_spectra, s_column, write_touchstone, Cx};
 use serde_json::{json, Value};
@@ -479,10 +479,16 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             refined.push(([p.x.min(q.x), p.y.min(q.y), p.x.max(q.x), p.y.max(q.y)], h, what));
         }
     }
-    let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &rx, 1.3, hmax, &[]);
-    let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &ry, 1.3, hmax, &[]);
+    // "mesh": static refinement from the layout (meshpol.rs): no slivers, z grading, copper-edge bands
+    let mp = crate::meshpol::MeshPolicy::from_spec(&sp);
+    let (bx, by) = mp.copper_bands(&sheets, &fine);
+    rx.extend(bx);
+    ry.extend(by);
+    let mut gx = crate::mesh::lines_1d_slack(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &rx, 1.3, hmax, &[], mp.slack());
+    let mut gy = crate::mesh::lines_1d_slack(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &ry, 1.3, hmax, &[], mp.slack());
     let mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
-    let gz = lines_1d(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &[Refine { a: zlo, b: zhi, h: cell_z }], 1.3, hmax, &mc);
+    let zref = mp.z_refine(zlo, zhi, &fz, cell_z);
+    let gz = crate::mesh::lines_1d_slack(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &zref, 1.3, hmax, &mc, mp.slack());
     // keep only fixed lines that fall inside the domain
     gx.dedup();
     gy.dedup();
@@ -701,6 +707,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                     .collect();
                 crate::cond::Conductor { metals, f_lo: o("f_lo").unwrap_or(fmin.max(0.1e9)), f_hi: o("f_hi").unwrap_or(fmax) }
             }),
+            // "edges": true or {"conformal": .., "singular": .., ...}: sub-cell copper edges (edge.rs)
+            edge: sp.get("edges").and_then(crate::edge::EdgeOpts::from_json),
         },
         freqs: linspace(fmin, fmax, nf),
         fmax,

@@ -38,6 +38,7 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   node for holes thinner than a cell. Copper is only rasterised inside the fine-meshed copper window (ROI
   plus `air`). Outside it, whatever crosses the window's edge continues straight out to the grid boundary,
   so a cropped plane or track runs into the absorbing layer instead of ending inside the domain.
+  With `"edges"` the copper edges are sub-cell instead (see [Sub-cell copper edges](#sub-cell-copper-edges)).
 - **Net-aware raster.** Every metal edge remembers the Gerber net (X2 `.N`) of the copper that painted
   it. Wherever two nets' edges would share a mesh node (a gap of about a cell or less), the minority net's
   edges at that node are dropped. Wherever a via barrel's nodes touch another net's copper (an antipad too
@@ -125,6 +126,10 @@ target/release/fieldsolve optimise-bench          # search methods on a syntheti
 target/release/fieldsolve bench spec.json [steps]  # Metal kernel variants and threadgroup shapes on a real problem
 target/release/fieldsolve connect spec.json [reps]  # time the mesh connectivity check, print the shorts it finds
 target/release/fieldsolve raster spec.json F.Cu x0 y0 x1 y1   # ASCII view of the metal edges as meshed
+target/release/fieldsolve edge-check line|line45|gap [w,h,er] [cells] [insets|gaps] [variants]  # sub-cell edges
+target/release/fieldsolve amr-check [h_mm] [steps] [absorb_mm]  # 2-D dynamic-resolution prototype
+target/release/fieldsolve octree-count spec.json   # cells per axis, and what an octree would need
+target/release/fieldsolve octree-check [hc] [nz] [insets] [grading] [smax]  # octree prototype, microstrip
 target/release/fieldsolve prims board.GTL > prims.json        # a Gerber's primitives (shape, polarity, net)
 ```
 
@@ -162,6 +167,11 @@ Ports and elements come in two forms:
   between the pads would otherwise short the element). With edges on the full width, the outermost ones
   could have no metal at one end: they carried source and probe without being in the circuit, which read
   as a flat 2-14 % "loss" in the port.
+
+`"edges": true` (or an object, see [Sub-cell copper edges](#sub-cell-copper-edges)) turns on the
+conformal and edge-singularity corrections of the copper edges. `"mesh": {"no_slivers": true, "z_grade":
+3.0, "copper_bands": {...}}` refines the mesh from the layout (`meshpol.rs`; measured in
+[fieldsolve-resolution.md](fieldsolve-resolution.md#implemented-and-measured-static-refinement-and-an-octree-nov-2026)).
 
 `kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
@@ -442,6 +452,193 @@ openEMS took 37-44 min per excitation on the M3 Max CPU (380 Mcell/s); fieldsolv
 `openEMS-Project` with `update_openEMS.sh ~/opt/openEMS --python --disable-GUI`. The Homebrew formula is no
 longer maintained.
 
+### Sub-cell copper edges
+
+With the midpoint rule a copper edge snaps to the mesh, and the zero-thickness strip's edge field (which
+varies as r^-1/2) is sampled as if it were uniform over a cell. `"edges"` corrects both (`edge.rs`):
+
+```json
+"edges": true
+"edges": {"conformal": true, "singular": true, "ss": 8, "min_open": 0.15, "reach": 1.0, "dt_check": true}
+```
+
+Both corrections are written in the integral (FIT) form of the Yee scheme. Faraday's and Ampère's laws are
+exact for edge voltages and face fluxes; the discretisation sits only in the constitutive factors that
+turn an edge voltage into a dual-face flux (ε A'/L) and a dual-edge current into a face flux (μ A/L'). Next
+to a copper edge those factors come from an assumed local field instead of a uniform one:
+
+- **Conformal** (Dey and Mittra, IEEE MGWL 7(9), 1997). The field is uniform on the open part of an edge or
+  face and zero on the metal. A partly covered in-plane E edge gets permittivity ε·L/l_open, and a
+  partly covered face of the sheet plane gets its H update divided by A_open/A. Edge fractions are sampled
+  32 times per cell and faces 8×8 (or from the two crossed edges, exactly, where a straight edge crosses a
+  face). Two raster fixes come with it:
+  - **Pendant stubs are opened.** The midpoint rule makes every edge that is more than half covered metal.
+    Where a strip edge lies in the outer half of a cell this leaves a comb of metal stubs reaching the next
+    mesh line, which carry no current along it. It made a strip act up to 18 % high in εeff (below). A
+    metal edge whose outer node lies outside the copper and has no other metal edge, via, port or element
+    becomes open, with its conformal factor. Staircase corners (outer nodes with two metal edges) stay
+    metal: on an oblique edge they are the current path along the boundary, and opening them raised a 45°
+    line's inductance by 8 %. A connectivity check (union-find over the raster, against a flood of the
+    supersampled copper) keeps an edge only if the copper itself joins the pieces it connects. Bridges the
+    midpoint rule made across a sub-cell gap open, and a thin diagonal trace stays in one piece.
+  - **Slivers are closed.** A face with less than `min_open` open area and three metal sides gets the
+    fourth side as metal too. The three sides already join its nodes, so no nets merge.
+- **Singular** (static-field incorporation, Shorthouse and Railton, IEEE MTT 40(5), 1992). Near a straight
+  copper edge (fitted locally from the supersampled copper: normal from the centroids, position from the
+  covered area; a misfit over 5 % such as a corner falls back to conformal) the field is taken as the
+  static field of a conducting half-plane, φ + iψ = √(u + iw). For each E edge and H face within one cell of
+  the edge on the open side the factor is κ = (field flux through the face) · L / (A · line integral), the
+  ratio of the singular field's face and edge averages (1 for a uniform field). Line integrals are
+  potential differences. Fluxes integrate a potential analytically along one face direction and by Gauss
+  quadrature along the other. Corrected: in-plane E and the sheet-plane H faces, the vertical E edges just
+  above and below, and the H half a cell above and below.
+  - The half-plane field ignores the ground. Components sampled over the metal keep the conformal factors:
+    there the half-plane field made the line 5-10 % off. And the factors have full weight only where the
+    nearest copper of another layer (or a PEC wall) is at least 4 in-plane cells away (`plane_cells`),
+    fading to none at 2. On 75 µm prepreg at 0.05 mm cells that leaves conformal alone, which there did as
+    well as both together.
+- **Backends.** The E factors go into the edge's permittivity, conductivity and Debye weights, quantised in
+  0.4 % steps so that the Metal material table stays small. The H factors are a sparse list (`HCorr`)
+  applied right after the H update, on the CPU and in a small Metal kernel (`hcorr`). CPU and Metal agree
+  to 1e-4 of the port voltage peak (`cpu_and_gpu_agree_with_edge_corrections`).
+- **Stability.** Dividing an H update by a small open fraction stiffens the scheme. Open fractions are
+  floored at `min_open` and singular factors clamped to [0.25, 4]. `dt_check` estimates the largest
+  eigenvalue of the corrected update operator by power iteration (150 iterations of the CPU kernels,
+  without loss or CPML). It lowers the time step if dt²λ exceeds 4·cfl², the margin of the plain mesh. On
+  the nRF52840 DK at 0.1 mm the corrected operator had dt²λ = 3.99 at the plain time step (the leapfrog
+  limit is 4; an earlier version of the rules reached 4.38), and the check lowered dt by 6 %. At 0.05 and
+  0.025 mm it found 2.33 and 2.43 and left dt alone. A lossless PEC box with corrections keeps its energy over 60 000 steps
+  (`edge_corrections_stay_stable_in_a_closed_box`).
+
+**Microstrip** (w ≈ 3 mm, h = 1.6 mm, εr 4.3; the width is adjusted so that both edges lie at a chosen
+inset, the distance from the edge to the nearest mesh line inside the metal, as a fraction of the cell).
+Errors against Hammerstad-Jensen over seven insets (0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95), as max / rms:
+
+| cell (cells across h) | | none | conformal | both |
+|---|---|---|---|---|
+| 0.4 mm (4) | εeff | 18.1 / 12.1 % | 1.5 / 1.1 % | 0.73 / 0.59 % |
+| | Z0 | 5.9 / 3.6 % | 7.0 / 4.4 % | 3.7 / 2.0 % |
+| | C per length | 15.4 / 9.1 % | 8.3 / 5.3 % | 4.2 / 2.3 % |
+| 0.2 mm (8) | εeff | 8.8 / 5.9 % | 0.95 / 0.76 % | 0.57 / 0.50 % |
+| | Z0 | 2.7 / 1.5 % | 3.7 / 2.3 % | 2.0 / 1.1 % |
+| | C per length | 4.5 / 2.8 % | 4.4 / 2.8 % | 2.3 / 1.3 % |
+| 0.1 mm (16) | εeff | 4.9 / 3.3 % | 0.68 / 0.59 % | 0.48 / 0.45 % |
+| | Z0 | 4.4 / 2.8 % | 2.0 / 1.3 % | 1.0 / 0.56 % |
+| | C per length | 7.1 / 4.6 % | 2.4 / 1.7 % | 1.2 / 0.77 % |
+
+- **The staircase's error is mostly the stubs.** Without corrections, insets up to 0.35 are within 0.6 % in
+  εeff at every cell size (that is the thirds rule). From 0.5 on, the stubs add 9-18 % at 4 cells and 4.8 %
+  even at 16. The board raster has edges at every inset.
+- **Conformal** removes the stub error (εeff within 1.5 %), but it is biased: C is 1-8 % high, falling with
+  the cell. That is the uniform-field assumption underestimating how the field crowds at the edge.
+- **Both** halve the remaining error and converge cleanly, about first order, from 4.2 % (max, C) at 4
+  cells to 1.2 % at 16. The constant +0.45 % in εeff is common to all settings at fine cells (the probe method and
+  Hammerstad-Jensen's own accuracy).
+- The worst remaining cases are insets 0.65-0.8, where the open part of the boundary cell is small and its
+  components are sampled over the metal (conformal factors). A field model including the ground plane
+  (the Maxwell plate edge, a conformal map) would be the next step.
+- `"singular"` without `"conformal"` (corrections on the staircase) is erratic: the stubs it leaves
+  contradict the edge line it assumes (εeff −0.4 to +25 % over insets at 0.4 mm, Z0 up to +13 % at
+  0.1 mm). Use both.
+- On the plain mesh, an edge exactly on a mesh line is ambiguous for the midpoint rule: the polygon's
+  scanline counts the lower edge as copper and the upper one not. The tables avoid exact insets of 0.
+
+**Narrow line on a thin substrate** (w ≈ 0.3 mm, h = 0.2 mm, εr 4.3; 0.05 mm cells, 4 across h; 7 insets):
+
+| | none | conformal | both |
+|---|---|---|---|
+| εeff, max | 21.7 % | 1.0 % | 0.27 % |
+| Z0, range | −5.2 to +8.5 % | −7.0 to −1.8 % | −2.8 to +3.2 % |
+| C per length, range | −2.9 to +15.9 % | +2.0 to +8.1 % | −3.3 to +2.8 % |
+
+**DK-like substrate** (w ≈ 0.3 mm on 75 µm, εr 4.4; 0.05 mm cells, 1.5 across h; 4 insets). Here the
+ground plane is closer than the singular factors' fade distance, so "both" equals conformal:
+
+| | none | conformal (= both) |
+|---|---|---|
+| εeff, max | 30.2 % | 1.5 % |
+| Z0, range | −5.2 to +47.9 % | −7.5 to +8.0 % |
+| C per length, range | −23.3 to +6.1 % | −7.4 to +8.9 % |
+
+With 1.5 cells across the substrate the line's capacitance is set by a strip only 6 cells wide: the
+corrections remove the stub error (εeff, and Z0 from +48 % to within 8 %), but ±8 % in C remains. RF traces
+on thin prepreg need finer cells across the strip, not only better edges.
+
+**45° line** (the same 3 mm line as the first table, turned by 45° on the axis-aligned mesh, so its edges cross
+the cells at every offset along the line):
+
+| cell | none: Z0 / εeff / C | both: Z0 / εeff / C |
+|---|---|---|
+| 0.4 mm | +1.1 / +19.4 / +8.1 % | +1.3 / −2.4 / −2.5 % |
+| 0.2 mm | −2.7 / +3.9 / +4.8 % | −2.6 / +4.9 / +5.1 % |
+| 0.1 mm | +0.6 / +1.2 / 0.0 % | +0.5 / +0.4 / −0.3 % |
+
+The corrections remove the coarse-mesh error but not the 0.2 mm one. On an oblique edge the current
+flows along the staircase of metal edges, and an edge either carries current (metal) or not: a partly
+covered edge cannot carry its share. Opening the staircase corners as well (`"open_corners": true`) made
+the capacitance right but the inductance 8 % high (εeff +12 % at 0.2 mm), so corners stay metal by default.
+
+**Series gap** in a 0.3 mm line on 0.2 mm (εr 4.3): C_gap = −Im(Y21)/ω over 0.5-2 GHz, fF. The mesh is
+uniform through the gap, so its edges fall where they fall:
+
+| gap | cell | none | both | Garg-Bahl |
+|---|---|---|---|---|
+| 0.10 mm | 0.1 / 0.05 / 0.025 / 0.0125 mm | shorted / 8.77 / 6.95 / 6.22 | 8.29 / 7.12 / 6.04 / 5.73 | 4.98 |
+| 0.13 mm | | 4.52 / 7.45 / 4.69 / 5.01 | 6.70 / 4.88 / 4.55 / 4.61 | 4.04 |
+| 0.17 mm | | 4.52 / 4.04 / 4.45 / 3.56 | 5.60 / 3.66 / 3.54 / 3.43 | 3.12 |
+
+- With the corrections C_gap converges monotonically: at 0.025 mm it is within −1 to +5 % of the 0.0125 mm
+  value, at 0.05 mm within +6 to +24 %. Without them it jumps with the mesh (+62 % then +2 % for the 0.13 mm
+  gap) and the two wider gaps are identical at 0.1 mm (both snap to the same raster).
+- At 0.1 mm the 0.10 mm gap is closed by the midpoint rule (both of its edges sit exactly on edge midpoints),
+  a short. The conformal rule opens such raster bridges: the copper connectivity check sees two pieces of
+  copper on the two sides.
+- Garg and Bahl's closed form (1978; as given in Gupta, Garg, Bahl and Bhartia, *Microstrip Lines and
+  Slotlines*) is 9-13 % below the finest values: its fit accuracy and the extraction (which includes the
+  ports' 2 mm stubs) both enter at that level.
+  The convergence, not the absolute value, is the test here.
+
+
+**nRF52840 DK, configuration 1, against Nordic's measured network.** The open validation gap (see
+[1bp-rf-findings.md](1bp-rf-findings.md)): on the DK layout with the 2018 parts (GRM 1.0 pF / LQP15MN
+3.9 nH / GRM 1.0 pF) the model's in-band S21 was about 1 dB low and its roll-off 5-9 % low, as if each
+shunt node carried too much capacitance. The whole board was re-run at 0.05 and 0.025 mm with and
+without `"edges"` (18.8 M and 42.9 M cells, five excitations each). Then a shunt ΔC was added to both
+capacitor models in `fieldsolve cosim`, and the ΔC that best fits the measurement was found by the
+−3 / −10 / −20 dB edges of |S21| and by the rms dB error of S11, S21 and S22 over 1-6 GHz (`dc_fit.py`):
+
+| EM model | S11 / S21 at 2.44 GHz | \|S21\| edges −3 / −10 / −20 dB | rms 1-6 GHz | best ΔC (edges / rms) |
+|---|---|---|---|---|
+| measured | −7.8 / −1.5 dB | 2.73 / 3.38 / 4.15 GHz | | |
+| plain, 0.05 mm | −4.28 / −2.64 dB | 2.48 / 3.12 / 3.79 | 3.36 dB | −0.33 / −0.32 pF |
+| plain, 0.025 mm | −4.38 / −2.54 dB | 2.49 / 3.16 / 3.85 | 2.89 dB | −0.28 / −0.27 pF |
+| plain, first-order extrapolation | | | | ≈ −0.24 / −0.23 pF |
+| edges, 0.05 mm | −4.49 / −2.51 dB | 2.50 / 3.20 / 3.93 | 2.42 dB | −0.24 / −0.22 pF |
+| edges, 0.025 mm | −4.54 / −2.47 dB | 2.51 / 3.20 / 3.91 | 2.54 dB | −0.25 / −0.23 pF |
+
+- **The excess shrinks by about a quarter, and the rest is not the mesh.** The plain model moves by
+  0.05 pF per node between 0.05 and 0.025 mm, towards the value the corrected models already have at
+  0.05 mm. Extrapolated to zero cell size, the plain model lands on the corrected one. The corrected
+  0.05 and 0.025 mm S-matrices agree to 0.016 below 3 GHz; the plain ones to 0.027, and the plain
+  0.05 mm one is 0.055 from the corrected 0.025 mm one. So about 0.09 pF per
+  node was a discretisation error of the zero-thickness copper, and about 0.24 pF per node remains.
+- **It is not the zero thickness either.** Real 35 µm copper has side walls: it adds fringe capacitance,
+  so it would make the model's shunt C larger, not smaller.
+- The measure here is a parallel ΔC on the 1.0 pF part model (its ESL and ESR kept). The earlier finding
+  ("about 0.2 pF less at each shunt position") swapped in smaller parts instead. Both fit the same
+  roll-off; their numbers differ by method, so compare within the last column.
+- What is left points at the parts and their mounting (pad, solder, the capacitor body's own field over the
+  pads, which the bar model of a part does not have) or at the measurement set-up, as discussed in
+  [1bp-rf-findings.md](1bp-rf-findings.md).
+- One run of each kind ended with a late-time energy plateau or slow rise after the ports had rung down
+  (`late-time field energy ... GROWING`): the plain 0.025 mm OUT excitation (+6.9 dB/ns) and, with an
+  earlier version of the corrections that also opened staircase corners, the 0.05 mm CHIP and C4
+  excitations. The ports had decayed 60 dB, so the S-parameters are unaffected. The 0.025 mm run with the
+  final corrections decays at −9 to −29 dB/ns on every port. The cause of the plain run's plateau is open.
+- The DK runs with corrections used the code before the last rule (opening raster bridges across sub-cell
+  gaps, commit 6e258c0). That rule changes only copper of one net that the midpoint rule bridged across a
+  gap; between nets the net-aware raster had already removed such bridges.
+
 ## Fields and Blender
 
 `fields/` holds, per snapshot frequency:
@@ -601,6 +798,20 @@ order. `dense_traversal_matches_the_reference` checks this on a test board with 
 `real_board_matches_the_reference` (ignored; `FIELDSOLVE_CONNECT_SPEC=spec.json`) checks real boards, and
 it passed on MTH, 1BP and 1BP at 0.3 mm cells.
 
+**Sub-cell copper edges.** `fieldsolve edge-bench spec.json 2000 3` builds a board with and without
+`"edges"` and alternates fixed-length Metal runs (2000 steps, three rounds each). On the nRF52840 DK at
+0.05 mm (18.8 M cells), with another session's long run sharing the GPU:
+
+| | plain | edges |
+|---|---|---|
+| step rate | 653 / 655 / 660 Mcell/s | 631 / 618 / 627 Mcell/s (−4.5 %) |
+| build | 2.4 s | 115 s, of which 109 s is the stability check (150 power iterations on the CPU) |
+| GPU memory | 639 MB | 640 MB (89 373 H corrections, the E factors are material-table entries) |
+
+The step cost is the separate `hcorr` dispatch and its scattered reads; folding it into the fused H kernel
+would remove the extra pass. The stability check converged to four digits within 50 iterations on this
+board (`FS_DEBUG=1` prints its progress); `"dt_check": false` skips it for repeated runs of one board.
+
 ## Code map
 
 The code is in `src/bin/fieldsolve/`.
@@ -625,6 +836,11 @@ The code is in `src/bin/fieldsolve/`.
 | `nf2ff.rs` | near-to-far-field transform: box plan, face currents, patterns, power, polar plots |
 | `disp.rs` | wideband dielectric: Debye pole fit to a flat tan δ, plane copper loss, update constants |
 | `cond.rs` | conductor loss: copper surface impedance (skin effect, thickness, roughness), Foster fit, sheet edges |
+| `edge.rs` | sub-cell copper edges: coverage, local edge fit, conformal fractions, half-plane static-field factors, stability check |
+| `edge_cases.rs`, `edge_tests.rs` | microstrip / 45° line / gap cases for the edge corrections; their tests |
+| `meshpol.rs` | static mesh refinement from the layout: no slivers, z grading, copper-edge bands |
+| `octree.rs` | 3-D octree FIT prototype (hanging-edge constraints), microstrip check |
+| `amr2d.rs` | 2-D dynamic-resolution prototype (quadtree LC network) and the octree cell estimate, see [fieldsolve-resolution.md](fieldsolve-resolution.md) |
 | `tools/blender_frames.py` | time-domain current animation |
 | `tools/blender_farfield.py`, `tools/render_farfield_panels.py` | far-field patterns over the board, panel comparisons |
 | `cases.rs` | analytic validation cases |
@@ -646,9 +862,11 @@ The plan for radio frontends (EXT balun, nRF54 filters, u.FL) and antennas (free
   instead of the bar inductance correction.
 - **Antennas.** The near-to-far-field transform is in place and validated on dipoles. Next: chip and trace
   antennas on a board, and an enclosure.
-- **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins); the thirds rule
-  applied in the rasteriser (shrink copper by 1/3 cell at edges) instead of relying on random edge
-  positions. (Against Nordic's measured network, modelled on the nRF52840 DK layout with the 2018 DK's thin-film
+- **Ports and meshing.** Ports from net names (all VDD pins of a part to its GND pins). Sub-cell copper
+  edges are in place (`"edges"`); still open there: an edge field model that includes the nearby ground
+  plane (the half-plane field fades out within 4 cells of other copper), partial-current edges for oblique
+  traces, and a two-edge (slot) field for gaps narrower than the fit disc. Where to put resolution, and
+  why not a dynamic or unstructured mesh: [fieldsolve-resolution.md](fieldsolve-resolution.md). (Against Nordic's measured network, modelled on the nRF52840 DK layout with the 2018 DK's thin-film
   inductor, the model's in-band S21 is about 1 dB low and its roll-off 5-9 % low. openEMS on the same
   raster agrees with fieldsolve, the mesh is converged in band and the stack-up barely matters, so the
   cause is not the solver or the cell size: see [1bp-rf-findings.md](1bp-rf-findings.md).)

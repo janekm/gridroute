@@ -53,6 +53,7 @@ struct Pipes {
     gather: ComputePipelineState,
     energy: ComputePipelineState,
     cond: ComputePipelineState,
+    hc: ComputePipelineState,
 }
 
 fn buf_f32(dev: &Device, v: &[f32]) -> Buffer {
@@ -151,6 +152,10 @@ fn fingerprint(p: &Problem, fused: bool) -> u64 {
         }
         None => h = mix(h, 0),
     }
+    match &p.hcorr {
+        Some(c) => h = f32s(words(mix(h, 1), &c.ids), &c.fac),
+        None => h = mix(h, 0),
+    }
     h
 }
 
@@ -205,6 +210,10 @@ pub struct Prepared {
     ccib: Buffer,
     ctabb: Buffer,
     cdecb: Buffer,
+    /// sub-cell edge H corrections (edge.rs)
+    nhc: usize,
+    hcidb: Buffer,
+    hcfacb: Buffer,
 }
 
 const BATCH: usize = 256;
@@ -224,7 +233,7 @@ impl Prepared {
         if let Some((m, t)) = &self.mat {
             all.extend(m.iter().chain([t]));
         }
-        all.extend([&self.inv_d, &self.inv_dd, &self.startb, &self.tcb, &self.tib, &self.twb, &self.dbb, &self.khb, &self.cidb, &self.cfacb, &self.clayb, &self.ctabb, &self.cdecb]);
+        all.extend([&self.inv_d, &self.inv_dd, &self.startb, &self.tcb, &self.tib, &self.twb, &self.dbb, &self.khb, &self.cidb, &self.cfacb, &self.clayb, &self.ctabb, &self.cdecb, &self.hcidb, &self.hcfacb]);
         for p in &self.pml {
             all.extend([&p.slab, &p.be, &p.ce, &p.bh, &p.ch, &p.map]);
         }
@@ -277,7 +286,7 @@ impl Gpu {
             let f = lib.get_function(name, None).map_err(|e| e.to_string())?;
             dev.new_compute_pipeline_state_with_function(&f).map_err(|e| e.to_string())
         };
-        let pp = Pipes { h: pipe("update_h")?, e: pipe("update_e")?, ei: pipe("update_e_idx")?, hf: pipe("update_h_f")?, ef: pipe("update_e_f")?, ph: pipe("pml_h")?, pe: pipe("pml_e")?, src: pipe("add_src")?, probe: pipe("probe")?, dft: pipe("dft")?, gather: pipe("dft_gather")?, energy: pipe("energy")?, cond: pipe("cond_e")? };
+        let pp = Pipes { h: pipe("update_h")?, e: pipe("update_e")?, ei: pipe("update_e_idx")?, hf: pipe("update_h_f")?, ef: pipe("update_e_f")?, ph: pipe("pml_h")?, pe: pipe("pml_e")?, src: pipe("add_src")?, probe: pipe("probe")?, dft: pipe("dft")?, gather: pipe("dft_gather")?, energy: pipe("energy")?, cond: pipe("cond_e")?, hc: pipe("hcorr")? };
         let queue = dev.new_command_queue();
         Ok(Gpu { dev, pp, queue })
     }
@@ -349,6 +358,11 @@ impl Gpu {
             Some(c) if ncond > 0 => (buf_u32(dev, &c.ids), buf_f32(dev, &c.fac), buf_u32(dev, &c.layer), state(dev, ncond * c.nb), buf_f32(dev, &c.tab), buf_f32(dev, &c.dec), c.nb),
             _ => (zeros(dev, 1), zeros(dev, 1), zeros(dev, 1), state(dev, 1), zeros(dev, 1), zeros(dev, 1), 0),
         };
+        let nhc = p.hcorr.as_ref().map(|c| c.ids.len()).unwrap_or(0);
+        let (hcidb, hcfacb) = match &p.hcorr {
+            Some(c) if nhc > 0 => (buf_u32(dev, &c.ids), buf_f32(dev, &c.fac)),
+            _ => (zeros(dev, 1), zeros(dev, 1)),
+        };
         Ok(Prepared {
             key: key.unwrap_or_else(|| fingerprint(p, want_fused)),
             fused,
@@ -379,6 +393,9 @@ impl Gpu {
             ccib,
             ctabb,
             cdecb,
+            nhc,
+            hcidb,
+            hcfacb,
         })
     }
 
@@ -438,6 +455,25 @@ impl Gpu {
         let mut steps = 0usize;
         let mut done = false;
         let mut snaps = Vec::new();
+        // sub-cell edge corrections of H, right after the main H update (as on the CPU)
+        let (nhc, hcidb, hcfacb) = (pr.nhc, &pr.hcidb, &pr.hcfacb);
+        let hcorr = |enc: &metal::ComputeCommandEncoderRef| {
+            if nhc == 0 {
+                return;
+            }
+            enc.set_compute_pipeline_state(&pp.hc);
+            for c in 0..3 {
+                enc.set_buffer(c as u64, Some(&h[c]), 0);
+                enc.set_buffer(3 + c as u64, Some(&e[c]), 0);
+            }
+            enc.set_buffer(6, Some(inv_d), 0);
+            enc.set_buffer(8, Some(hcidb), 0);
+            enc.set_buffer(9, Some(hcfacb), 0);
+            let mut q = prm;
+            q.slab_len = nhc as u32;
+            enc.set_bytes(7, psz, &q as *const P as *const c_void);
+            enc.dispatch_threads(MTLSize { width: nhc as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+        };
         let setup_seconds = t0.elapsed().as_secs_f64();
         while !done && steps < spec.max_steps {
             let mut nb = BATCH.min(spec.max_steps - steps);
@@ -468,6 +504,7 @@ impl Gpu {
                         enc.set_buffer(base + 4, Some(&pm.psi[3]), 0);
                     }
                     enc.dispatch_threads(grid3, tg3);
+                    hcorr(enc);
                     enc.set_compute_pipeline_state(&pp.ef);
                     for c in 0..3 {
                         enc.set_buffer(c as u64, Some(&e[c]), 0);
@@ -500,6 +537,7 @@ impl Gpu {
                 enc.set_buffer(6, Some(&inv_d), 0);
                 set_p(&prm);
                 enc.dispatch_threads(grid3, tg3);
+                hcorr(enc);
                 for a in 0..3 {
                     let pm = &pml[a];
                     if pm.len == 0 {
