@@ -234,6 +234,30 @@ fn main() {
                 .collect();
             println!("{}", serde_json::to_string(&out).unwrap());
         }
+        "connect" => {
+            // time the mesh connectivity check on a spec's board and print its report
+            let Some(spec) = args.get(2) else {
+                eprintln!("usage: fieldsolve connect SPEC.json [repeats]");
+                std::process::exit(2);
+            };
+            let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5).max(1);
+            let (mut cx, _) = sim::load(std::path::Path::new(spec)).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let (g, lay) = (&st.grid, &st.layout);
+            println!("{} x {} x {} = {:.2} M nodes", g.nx(), g.ny(), g.nz(), g.n() as f64 * 1e-6);
+            let mut times = Vec::new();
+            let mut bridges = Vec::new();
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                bridges = connect::check(g, lay);
+                times.push(t.elapsed().as_secs_f64());
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("connect::check: median {:.1} ms, min {:.1} ms, max {:.1} ms over {reps} runs", times[reps / 2] * 1e3, times[0] * 1e3, times[reps - 1] * 1e3);
+            for l in connect::describe(&bridges, cx.kicad) {
+                println!("{l}");
+            }
+        }
         "raster" => {
             // ASCII view of the rasterised model on one copper layer: metal edges and lumped edges
             let (Some(spec), Some(layer)) = (args.get(2), args.get(3)) else {

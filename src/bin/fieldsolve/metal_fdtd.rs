@@ -221,6 +221,7 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
     let mut steps = 0usize;
     let mut done = false;
     let mut snaps = Vec::new();
+    let setup_seconds = t0.elapsed().as_secs_f64();
     while !done && steps < spec.max_steps {
         let mut nb = BATCH.min(spec.max_steps - steps);
         if spec.snap_every > 0 && (spec.snap_until == 0 || steps < spec.snap_until) {
@@ -521,5 +522,5 @@ pub fn run_metal(p: &Problem, spec: &RunSpec) -> Result<RunResult, String> {
         data: dftb.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * n))).collect(),
     });
     let gathered = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
-    Ok(RunResult { steps, v, probes: pv, fields, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), backend: format!("metal ({})", dev.name()) })
+    Ok(RunResult { steps, v, probes: pv, fields, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: format!("metal ({})", dev.name()) })
 }
