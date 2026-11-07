@@ -432,9 +432,8 @@ impl Gpu {
         let grid3 = MTLSize { width: nx as u64, height: ny as u64, depth: nz as u64 };
         let mut v: Vec<Vec<f32>> = vec![vec![0.0]; p.ports.len()];
         let mut pv: Vec<Vec<f32>> = vec![vec![0.0]; p.probes.len()];
-        let mut peak = 0.0f64;
-        let mut port_peak = 0.0f64;
-        let mut ghist: Vec<Vec<f64>> = Vec::new();
+        let mut stop = crate::fdtd::StopState::default();
+        let mut reason = "max_steps";
         let mut ehist: Vec<(usize, f64)> = Vec::new();
         let mut steps = 0usize;
         let mut done = false;
@@ -710,28 +709,14 @@ impl Gpu {
             if check {
                 let en: f64 = read(&eout, ny * nz).iter().map(|&x| x as f64).sum();
                 ehist.push((steps, en));
-                peak = peak.max(en);
                 if !en.is_finite() {
                     return Err(format!("fields diverged at step {steps}"));
                 }
-                // as on the CPU: a configured gathered-field metric gates every convergence exit
-                let gs = match &spec.gather_metric {
-                    Some(m) => {
-                        // unified memory: read the accumulators in place
-                        let cur: Vec<[Vec<f32>; 6]> = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
-                        ghist.push((m.0)(&cur));
-                        crate::fdtd::gather_settled(&ghist, spec.gather_lag, spec.gather_tol)
-                    }
-                    None => true,
-                };
-                if gs && steps > spec.exc.len() && en <= peak * 10f64.powf(spec.end_db / 10.0) {
+                // unified memory: read the accumulators in place, only when a stopping rule needs them
+                let cur: Vec<[Vec<f32>; 6]> = if crate::fdtd::StopState::wants_gathered(spec) { gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect() } else { Vec::new() };
+                if let Some(r) = stop.check(spec, steps, en, &v, &cur) {
+                    reason = r;
                     done = true;
-                }
-                if spec.port_stop {
-                    let pd = crate::fdtd::ports_decayed(&v, spec.check_every, spec.end_db, &mut port_peak) && steps > spec.exc.len();
-                    if pd && gs {
-                        done = true;
-                    }
                 }
             }
         }
@@ -740,7 +725,7 @@ impl Gpu {
             data: dftb.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * n))).collect(),
         });
         let gathered = gacc.iter().map(|bs| std::array::from_fn(|c| read(&bs[c], 2 * spec.gather[c].len()))).collect();
-        Ok(RunResult { steps, v, probes: pv, fields, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: format!("metal ({})", dev.name()) })
+        Ok(RunResult { steps, v, probes: pv, fields, gathered, energy: ehist, snaps, seconds: t0.elapsed().as_secs_f64(), setup_seconds, backend: format!("metal ({})", dev.name()), stop: reason.into(), standard_stop: stop.standard.map(|(s, r)| (s, r.to_string())), objective: stop.ohist })
     }
 }
 

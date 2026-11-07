@@ -13,8 +13,11 @@ mod disp;
 mod cond;
 mod post;
 mod export;
+mod fidelity;
 mod sim;
 mod lines;
+mod tune;
+mod optimise;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;
 
@@ -288,7 +291,7 @@ fn main() {
         }
         "run" => {
             let Some(spec) = args.get(2) else {
-                eprintln!("usage: fieldsolve run SPEC.json [--out DIR] [--backend cpu|metal|auto]");
+                eprintln!("usage: fieldsolve run SPEC.json [--fast | --fidelity screening|refined|validated] [--out DIR] [--backend cpu|metal|auto]");
                 std::process::exit(2);
             };
             let (mut cx, mut out) = match sim::load(std::path::Path::new(spec)) {
@@ -300,6 +303,18 @@ fn main() {
             };
             if let Some(o) = arg(&args, "--out") {
                 out = o.into();
+            }
+            // fidelity: --fast is the screening policy; a plain run is the spec as given ("spec")
+            let level = if args.iter().any(|a| a == "--fast") { "screening".to_string() } else { arg(&args, "--fidelity").unwrap_or_else(|| "spec".into()) };
+            match fidelity::resolve(&cx.spec, &level) {
+                Ok(s) => cx.spec = s,
+                Err(e) => {
+                    eprintln!("fieldsolve: {e}");
+                    std::process::exit(2);
+                }
+            }
+            for o in cx.spec["fidelity_record"]["overrides"].as_array().cloned().unwrap_or_default() {
+                eprintln!("fieldsolve: {level}: {} {} -> {} ({})", o["key"].as_str().unwrap_or(""), o["from"], o["to"], o["why"].as_str().unwrap_or(""));
             }
             let be = backend(&args);
             let run = |p: &model::Problem, s: &fdtd::RunSpec| be(p, s);
@@ -346,19 +361,74 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "tune" => {
+            let Some(cfg) = args.get(2) else {
+                eprintln!("usage: fieldsolve tune CONFIG.json [--restarts N] [--rounds N] [--exhaustive 0|1|2] [--top N] [--no-outputs]");
+                std::process::exit(2);
+            };
+            if let Err(e) = tune::run(std::path::Path::new(cfg), &args[3..]) {
+                eprintln!("fieldsolve tune: {e}");
+                std::process::exit(1);
+            }
+        }
+        "optimise" | "optimize" => {
+            let Some(space) = args.get(2) else {
+                eprintln!("usage: fieldsolve optimise SPACE.json [--method surrogate|pattern] [--budget N] [--out DIR] [--backend cpu|metal|auto]");
+                std::process::exit(2);
+            };
+            let be = backend(&args);
+            let run = |p: &model::Problem, s: &fdtd::RunSpec| be(p, s);
+            if let Err(e) = optimise::run(std::path::Path::new(space), &args[3..], &run) {
+                eprintln!("fieldsolve optimise: {e}");
+                std::process::exit(1);
+            }
+        }
+        "optimise-bench" => {
+            // surrogate vs compass search vs full-fidelity-only search on the synthetic two-fidelity problem
+            let seeds = arg(&args, "--seeds").and_then(|s| s.parse().ok()).unwrap_or(50);
+            let mut o = optimise::Opts::default();
+            if let Some(v) = arg(&args, "--promote-every").and_then(|s| s.parse().ok()) {
+                o.promote_every = v;
+            }
+            if let Some(v) = arg(&args, "--final").and_then(|s| s.parse().ok()) {
+                o.final_n = v;
+            }
+            let r = optimise::bench(seeds, &o);
+            if let Some(o) = arg(&args, "--json") {
+                std::fs::write(&o, serde_json::to_string_pretty(&r).unwrap()).unwrap();
+            }
+        }
+        "radmatrix" => {
+            // the radiation-matrix form against Pattern::combine + p_rad on a saved far field
+            let Some(ff) = args.get(2) else {
+                eprintln!("usage: fieldsolve radmatrix RUN/farfield.json [candidates]");
+                std::process::exit(2);
+            };
+            let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
+            match tune::check_radiation_matrix(std::path::Path::new(ff), n) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                Err(e) => {
+                    eprintln!("fieldsolve radmatrix: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "svg" => {
             let dir = args.get(2).expect("usage: fieldsolve svg GERBER_DIR OUT.svg");
             let b = gerber::load_dir(std::path::Path::new(dir)).unwrap_or_else(|e| panic!("{e}"));
             gerber::render_svg(&b, std::path::Path::new(args.get(3).map(|s| s.as_str()).unwrap_or("board.svg")));
         }
         _ => {
-            eprintln!("usage:\n  fieldsolve run SPEC.json [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve svg GERBER_DIR OUT.svg");
+            eprintln!("usage:\n  fieldsolve run SPEC.json [--fast | --fidelity screening|refined|validated] [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve tune CONFIG.json [--restarts N] [--exhaustive 0|1|2] [--no-outputs]\n  fieldsolve radmatrix RUN/farfield.json [candidates]\n  fieldsolve optimise SPACE.json [--method surrogate|pattern] [--budget N] [--out DIR]\n  fieldsolve optimise-bench [--seeds N] [--promote-every N] [--final N] [--json OUT]\n  fieldsolve svg GERBER_DIR OUT.svg");
         }
     }
 }
 
 #[cfg(test)]
 mod review_tests;
+
+#[cfg(test)]
+mod fast_tests;
 
 #[cfg(test)]
 mod tests {
