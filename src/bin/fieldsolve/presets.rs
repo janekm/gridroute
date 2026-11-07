@@ -350,4 +350,21 @@ mod tests {
         let roi2 = BBox { x0: -5.0, y0: 0.0, x1: 10.0, y1: 10.0 };
         assert!(coarse_copper(&sheets, &gx, &gy, &roi2, &dom, 0.05, 0.125, 1.0, 8.0).is_empty());
     }
+
+    #[test]
+    fn late_time_peak_finds_the_ringing_mode() {
+        // a 2.47 GHz mode with Q 75 left ringing after a broadband transient that has died away
+        let dt = 9e-14;
+        let f = 2.47e9;
+        let v: Vec<f32> = (0..60_000)
+            .map(|n| {
+                let t = n as f64 * dt;
+                let ring = (-std::f64::consts::PI * f * t / 75.0).exp() * (2.0 * std::f64::consts::PI * f * t).sin();
+                let pulse = (-(t - 2e-10).powi(2) / 1e-21).exp();
+                (ring + 5.0 * pulse) as f32
+            })
+            .collect();
+        let got = crate::sim::late_time_peak(&v, dt, 1e8, 8e9).unwrap();
+        assert!((got - f).abs() < 0.02e9, "{got}");
+    }
 }

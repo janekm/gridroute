@@ -185,10 +185,15 @@ candidates in about a minute.
 - **The mesh isn't fully converged.**
   - From 0.05 to 0.035 mm, the antenna's resistance rises by about 6 Ω and its radiated share at
     2.40 GHz by up to 8 points.
-  - The efficiency difference appears only with the edge corrections on: at 0.05 mm without them, the
-    antenna reads 91 / 89 / 87 %, the same as 0.035 mm with them. So the edge-corrected 0.05 mm run may
-    overstate copper loss near the antenna. The absolute scores above may then be 0.3-0.5 dB
-    pessimistic.
+  - The efficiency difference is a solver artefact, since found:
+    - In the edge-corrected 0.05 mm run, the conformal fractions on coarse graded cells just outside the
+      ROI moved a narrow, lossy board mode (Q 70-80, about 0.05 GHz wide) onto 2.40 GHz.
+    - Without edges, the same mode sits at 2.25 GHz, and 2.40 GHz reads 89-90 %.
+    - A fix is on the edge-corrections branch, not merged yet.
+    - The 2.40 GHz efficiency and scores above are therefore 0.3-0.5 dB pessimistic. 2.44 and 2.48 GHz
+      are much less affected.
+  - Single-frequency values can land on such a dip. A re-run should use a dense far-field grid
+    (0.02-0.05 GHz) and band averages ([fieldsolve-settings.md](fieldsolve-settings.md)).
   - The ranking of the ladder options is the same on both meshes.
 - **Copper loss used the plane-pair stand-in, not the surface-impedance model** (see Model). Re-run with
   `"preset": "antenna"` before quoting absolute efficiencies.

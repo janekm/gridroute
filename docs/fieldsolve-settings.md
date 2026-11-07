@@ -48,6 +48,7 @@ then start the long run.
 | `far-field run with the domain cropped to "roi"` | The board's ground beyond the window is missing, and on a small board it is part of the antenna. | `"extent": "board"` |
 | `far-field run without "edges"` | Copper edges are staircased. | `"edges": true` |
 | `narrow copper ... in cells coarser than ...` | Traces, meanders or antenna arms outside the fine region sit in cells several times larger than `cell`. Their length and coupling are then wrong. | Extend `roi` over anything that carries RF current. After you have checked the rest, list it in `"coarse_copper_ok"`. |
+| `a high-Q mode is still ringing at the stop` (far-field runs) | When the run stopped, the field energy was still falling slower than 5 dB/ns, so a board mode with a Q above about 30 is still ringing. The warning gives the mode's frequency and Q. Efficiency within about f/Q of that frequency depends on the mesh. | List far-field frequencies 0.02-0.05 GHz apart across the band, quote band averages rather than single frequencies, and refine the mesh (`max_cell`, a `"refine"` box) where the mode lives. A field export at its frequency shows where that is. |
 | `port X reached max_steps before any stop rule` | The run was cut off before it converged, so the S-parameters are an estimate. | Raise `max_steps`, or loosen `end_db` |
 | `power balance ... check the port's placement` (on a full run) | The port's energy does not add up. The port bridge may miss a pad, or short the port. | Check the printed nets under each port, and `fieldsolve raster` |
 
@@ -91,9 +92,14 @@ then start the long run.
   and `tune` can place any part without a new EM run. Check the printed nets under each port. A
   rotated-part port gets a staircase bridge, and both pads must be reached.
 - **Band:** `fmax` at least 3.2× the operating frequency if you want H2 and H3. `nf` 300-400.
-- **Far field:** list the frequencies you need, including harmonics.
+- **Far field:** list frequencies on a dense grid across the band, 0.02-0.05 GHz apart, plus the
+  harmonics. A board can carry a narrow, lossy resonance about 0.05 GHz wide that removes 5-12 points of
+  efficiency at one frequency and moves between meshes. Three spot frequencies (2.40 / 2.44 / 2.48 GHz) can
+  land on such a dip, or miss it, by chance. Quote band averages.
 - **Stopping:** `"end_db": -60` with the default port stop is the usual choice. A weakly coupled board
-  resonance can make one port wait 2-4× longer: that is expected, not a fault. For searches,
+  resonance can make one port wait 2-4× longer: that is expected, not a fault. Stopping on field energy
+  instead (`"stop": "energy"`) took 3.3× the steps on the MTH board, but moved broadband efficiency by only
+  0.3-0.5 points. It sharpens a narrow mode's dip rather than removing it, so it isn't the default. For searches,
   `"objective": {..., "extrapolate": true}` with `"stop": "objective"` stops as soon as the extrapolated
   objective is stable ([fieldsolve-fast-mode.md](fieldsolve-fast-mode.md)).
 - **Fidelity levels:** `--fast` (screening) is for searches only. Report final numbers from a plain or
@@ -110,8 +116,11 @@ then start the long run.
 
 ## Known open issues
 
-- **On the MTH PIFA, `"edges"` at 0.05 mm gave about 8 points lower radiation efficiency at 2.40 GHz than
-  0.035 mm with edges, or 0.05 mm without them.** Those runs used the plane-pair stand-in, not
-  `"conductor"`, so the cause is still being investigated (Nov 2026). Treat absolute efficiencies from
-  edge-corrected runs at 0.05 mm as uncertain by about 0.4 dB until this is resolved; rankings were not
-  affected.
+- **`"edges"` at 0.05 mm cut the MTH PIFA's efficiency at 2.40 GHz by about 8 points.**
+  - **Cause:** conformal fractions on the coarse (about 1.5 mm) graded cells just outside the ROI, at
+    ground-pour edges. Those fractions also moved a narrow, lossy board mode (Q 70-80) by about 150 MHz,
+    onto 2.40 GHz.
+  - **Fix:** don't apply the edge factors to edges longer than 2.5× the fine cell. It is on the edge
+    session's branch and not yet merged (Nov 2026).
+  - **Until it lands:** check edge-corrected far-field runs against a run without `"edges"`, on a dense
+    frequency grid.

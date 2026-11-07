@@ -1040,6 +1040,24 @@ pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> 
     run_setup(&st, out, backend, &RunOpts::from_spec(&cx.spec))
 }
 
+/// Frequency of the strongest component in the last third of a port signal, between `f0` and `f1` (the
+/// mode still ringing when a run stops); `None` when the tail is too short or silent.
+pub fn late_time_peak(v: &[f32], dt: f64, f0: f64, f1: f64) -> Option<f64> {
+    let n = v.len();
+    if n < 300 || f1 <= f0 {
+        return None;
+    }
+    let tail: Vec<f64> = v[n - n / 3..].iter().map(|&x| x as f64).collect();
+    let mean = tail.iter().sum::<f64>() / tail.len() as f64;
+    let tail: Vec<f64> = tail.iter().map(|x| x - mean).collect();
+    // resolve to a quarter of the tail's frequency resolution, at most 2000 points
+    let df = (1.0 / (tail.len() as f64 * dt) / 4.0).max((f1 - f0) / 2000.0);
+    let freqs: Vec<f64> = (0..).map(|k| f0 + k as f64 * df).take_while(|&f| f <= f1).collect();
+    let spec = crate::post::dft(&tail, dt, 0.0, &freqs);
+    let (k, m) = spec.iter().enumerate().map(|(k, c)| (k, c.abs())).fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+    (m > 0.0).then(|| freqs[k])
+}
+
 /// Z = Z0 (I + S)(I - S)^-1 for an N-port at one frequency.
 pub fn z_from_s(s: &[Vec<Cx>], z0: f64) -> Option<Vec<Vec<Cx>>> {
     let n = s.len();
@@ -1140,6 +1158,8 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     let mut vall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut iall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut runs = Vec::new();
+    // warnings found while running (a high-Q mode still ringing at the stop of a far-field run)
+    let mut run_checks: Vec<String> = Vec::new();
     // objective stop: window and minimum settling time in periods of the band's lowest frequency
     let obj_stop = ro.objective.as_ref().is_some_and(|o| o.stop);
     let period_steps = |n: f64| ro.objective.as_ref().map(|o| (n / o.band.iter().cloned().fold(f64::INFINITY, f64::min) / p.dt).ceil() as usize).unwrap_or(0);
@@ -1177,12 +1197,37 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
         };
         let r = backend(&p, &spec);
         eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s (set-up {:.2} s) on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.setup_seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
-        if let Some((rate, q)) = crate::fdtd::energy_decay(&r.energy, p.dt, st.fmax / 3.0) {
+        if let Some((rate, _)) = crate::fdtd::energy_decay(&r.energy, p.dt, st.fmax / 3.0) {
+            // the ringing mode's frequency: the peak of the excited port's late-time signal (last third)
+            let f_ring = late_time_peak(&r.v[j], p.dt, st.freqs.first().copied().unwrap_or(0.0).max(1e8), st.fmax);
+            let q_at = |f: f64| -10.0 * std::f64::consts::LOG10_E * 2.0 * std::f64::consts::PI * f * 1e-9 / rate;
             eprintln!(
                 "fieldsolve:   late-time field energy {:+.2} dB/ns{}",
                 rate,
-                if rate >= 0.0 { " (GROWING: numerical instability, not ringing)".to_string() } else { format!(" (Q {:.0} if at {:.2} GHz)", q, st.fmax / 3e9) }
+                if rate >= 0.0 {
+                    " (GROWING: numerical instability, not ringing)".to_string()
+                } else {
+                    match f_ring {
+                        Some(f) => format!(" (strongest late-time signal near {:.3} GHz: Q about {:.0})", f / 1e9, q_at(f)),
+                        None => format!(" (Q {:.0} if at {:.2} GHz)", q_at(st.fmax / 3.0), st.fmax / 3e9),
+                    }
+                }
             );
+            // far-field runs: a mode still ringing at the stop makes efficiency within about f/Q of it
+            // mesh-sensitive (MTH PIFA, Nov 2026: a Q 70-80 board mode, about 0.05 GHz wide, moved 150 MHz
+            // between meshes and cut efficiency by up to 12 points at single frequencies)
+            if far.is_some() && rate < 0.0 && rate > -5.0 {
+                let f = f_ring.unwrap_or(st.fmax / 3.0);
+                let q = q_at(f);
+                let msg = format!(
+                    "port {}: a high-Q mode is still ringing at the stop (field energy {:+.2} dB/ns; late-time signal near {:.3} GHz, Q about {:.0}). \
+                     Efficiency within about f/Q ({:.0} MHz) of it is mesh-sensitive: list far-field frequencies 0.02-0.05 GHz apart \
+                     around the band to see narrow dips, prefer band averages to single frequencies, and refine max_cell where the mode lives.",
+                    names[j], rate, f / 1e9, q, f / q / 1e6
+                );
+                eprintln!("fieldsolve: WARNING: {msg}");
+                run_checks.push(msg);
+            }
         }
         let mut vs = Vec::new();
         let mut is = Vec::new();
@@ -1333,7 +1378,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     });
     let mut res = res;
     res["settings"] = ro.settings.clone();
-    res["checks"] = json!(st.checks);
+    res["checks"] = json!(st.checks.iter().chain(&run_checks).collect::<Vec<_>>());
     res["fidelity"] = crate::fidelity::finish_record(&ro.fidelity, &res);
     if let Some(f) = res["fidelity"].as_object() {
         eprintln!("fieldsolve: fidelity {} ({} cells, dt {:.3e} s, stops {:?}), objective worst {:.2} dB, stability {:?} dB",
