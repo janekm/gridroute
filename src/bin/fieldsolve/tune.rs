@@ -1189,7 +1189,7 @@ mod tests {
         assert!(r["evaluations"].as_u64().unwrap() > 100);
         // re-scoring on the same extraction changes nothing
         let cmp = &r["compare"];
-        assert_eq!(cmp["candidates"], 12);
+        assert_eq!(cmp["candidates"], 13, "as built plus compare_top");
         assert_eq!(cmp["diff_max_abs_db"], 0.0);
         assert_eq!(cmp["spearman"], 1.0);
         // detailed files exist only for the selected candidates

@@ -12,8 +12,9 @@
 //!   objective's band (plus `objective.harmonics`);
 //! - stops each excitation when the objective's components have stayed within a spread of `tol_db` over
 //!   `window_periods` periods of the band's lowest frequency, after the source and a minimum settling time
-//!   of `min_settle_periods` periods (the energy/port decay rules still apply if they come first; a run that
-//!   reaches `max_steps` is reported as incomplete).
+//!   of `min_settle_periods` periods. The energy/port decay rule is then only recorded (`standard_rule_step`),
+//!   since on a resonant antenna it can fire while the radiated power still creeps; a run that reaches
+//!   `max_steps` is reported as incomplete.
 //!
 //! Every override is recorded (`"fidelity"` in result.json) together with the actual mesh, time step,
 //! excitation count, stop reasons and objective stability. Policy numbers can be overridden in the spec's
