@@ -48,6 +48,9 @@ pub struct EdgeOpts {
     /// smallest open fraction used for an E edge (1/f is capped at 1/min_open); a metal edge with less open is
     /// kept metal, and a sheet face with less open area is closed (its H never changes)
     pub min_open: f64,
+    /// open only pendant stubs (a node outside the copper with one metal edge); with `open_corners` also
+    /// the corner nodes of a staircase (two metal edges), which on oblique edges carry the edge current
+    pub open_corners: bool,
     /// singular factors are clamped to [kmin, kmax]
     pub kmin: f64,
     pub kmax: f64,
@@ -75,7 +78,7 @@ pub struct EdgeOpts {
 
 impl Default for EdgeOpts {
     fn default() -> Self {
-        EdgeOpts { conformal: true, singular: true, ss: 8, min_open: 0.15, kmin: 0.25, kmax: 4.0, reach: 1.0, taper: 0.0, over_metal: false, over_metal_h: false, plane_cells: 4.0, fit_r: 1.25, fit_tol: 0.05, dt_check: true, dt_iters: 150, quant: 0.004 }
+        EdgeOpts { conformal: true, singular: true, ss: 8, min_open: 0.15, open_corners: false, kmin: 0.25, kmax: 4.0, reach: 1.0, taper: 0.0, over_metal: false, over_metal_h: false, plane_cells: 4.0, fit_r: 1.25, fit_tol: 0.05, dt_check: true, dt_iters: 150, quant: 0.004 }
     }
 }
 
@@ -100,6 +103,7 @@ impl EdgeOpts {
             o.reach = f("reach", o.reach);
             o.taper = f("taper", o.taper);
             o.over_metal = b("over_metal", o.over_metal);
+            o.open_corners = b("open_corners", o.open_corners);
             o.over_metal_h = b("over_metal_h", o.over_metal_h);
             o.plane_cells = f("plane_cells", o.plane_cells);
             o.fit_r = f("fit_r", o.fit_r);
@@ -662,18 +666,18 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
             if pl.node_in[n] || att[n] {
                 return false;
             }
-            let mut any = false;
+            let mut deg = 0;
             for (x, q) in inc(i, j) {
                 if let Some(q) = q {
                     if metal(x, q) {
                         if !cand(x, q) {
                             return false;
                         }
-                        any = true;
+                        deg += 1;
                     }
                 }
             }
-            any
+            deg == 1 || (deg > 1 && o.open_corners)
         })
         .collect();
     // connectivity without the fringe nodes' edges
@@ -696,6 +700,46 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
             }
         }
     }
+    // connectivity of the true copper, on the supersampled raster (4-neighbour flood): a fringe node is only
+    // kept when the neighbours it joins are one piece of copper (not two pieces the midpoint rule bridged
+    // across a sub-cell gap)
+    let s = pl.s;
+    let (wf, hf) = (pl.wf, pl.yf.len());
+    let mut lab = vec![u32::MAX; wf * hf];
+    let mut nlab = 0u32;
+    let mut stack: Vec<usize> = Vec::new();
+    for q0 in 0..wf * hf {
+        if !pl.cov[q0] || lab[q0] != u32::MAX {
+            continue;
+        }
+        lab[q0] = nlab;
+        stack.push(q0);
+        while let Some(q) = stack.pop() {
+            let (x, y) = (q % wf, q / wf);
+            let nb4 = [(x > 0).then(|| q - 1), (x + 1 < wf).then(|| q + 1), (y > 0).then(|| q - wf), (y + 1 < hf).then(|| q + wf)];
+            for r in nb4.into_iter().flatten() {
+                if pl.cov[r] && lab[r] == u32::MAX {
+                    lab[r] = nlab;
+                    stack.push(r);
+                }
+            }
+        }
+        nlab += 1;
+    }
+    // copper label of a node: any covered fine sample touching its corner
+    let node_lab = |n: usize| -> u32 {
+        let (i, j) = (n % nx, n / nx);
+        for (di, dj) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            if i * s < di || j * s < dj {
+                continue;
+            }
+            let (x, y) = (i * s - di, j * s - dj);
+            if x < wf && y < hf && pl.cov[y * wf + x] {
+                return lab[y * wf + x];
+            }
+        }
+        u32::MAX
+    };
     let mut keep = vec![false; nx * ny];
     let mut kept = 0;
     for n in 0..nx * ny {
@@ -715,8 +759,19 @@ fn openable(g: &Grid, m: &SheetMask, pl: &Plane, att: &[bool], o: &EdgeOpts) -> 
                 }
             }
         }
-        let r0 = uf.find(nb[0]);
-        let split = (1..c).any(|t| uf.find(nb[t]) != r0);
+        // split: two neighbours in different raster components that the copper joins
+        let mut split = false;
+        for a in 0..c {
+            for b in a + 1..c {
+                if uf.find(nb[a]) != uf.find(nb[b]) {
+                    let (la, lb) = (node_lab(nb[a] as usize), node_lab(nb[b] as usize));
+                    // unknown labels (a neighbour outside the copper too) keep the old, safe answer
+                    if la == u32::MAX || lb == u32::MAX || la == lb {
+                        split = true;
+                    }
+                }
+            }
+        }
         if split {
             keep[n] = true;
             kept += 1;
@@ -884,7 +939,8 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
                 }
             }
         }
-        let hloc = |i: usize, j: usize| 0.5 * (d(&xmm, i.min(nx - 2)) + d(&ymm, j.min(ny - 2)));
+        // the resolution across an edge: the finer of the two in-plane cells (cells along a line may be long)
+        let hloc = |i: usize, j: usize| d(&xmm, i.min(nx - 2)).min(d(&ymm, j.min(ny - 2)));
         // the singular fit at an in-plane point; None: no edge near, Some(None): fit rejected
         let mut rejected = 0usize;
         let mut line_at = |px: f64, py: f64, h: f64| -> Option<Option<(Line, f64)>> {
