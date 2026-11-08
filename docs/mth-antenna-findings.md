@@ -74,8 +74,9 @@ RF path, as populated:
   with real copper gives 4-5 points lower efficiency (see Caveats), so the efficiencies and scores below
   are about 0.2-0.3 dB optimistic. The ladder ranking doesn't change. See
   [fieldsolve-settings.md](fieldsolve-settings.md).
-- **Ports:** the chip pin (H23 to the F23 ground ball), each ladder part, R70 and the C20 pads. Twelve
-  decoupling capacitors near the chip are modelled as shorts. `fieldsolve cosim` places measured parts
+- **Ports:** the chip pin (H23 to the F23 ground ball), each ladder part, R70 and the C20 pads. The
+  decoupling capacitors near the chip are modelled as shorts: twelve in the earlier runs, nine (the
+  fitted ones) since the BOM check. `fieldsolve cosim` places measured parts
   on the ports: Murata GRM1555 for the Fenghua capacitors, which have no published data, and the exact
   LQG15HS inductors.
 - **Mesh check:** a one-port run at C20 at 0.035 mm (24.3 M cells), and the same at 0.05 mm.
@@ -208,6 +209,7 @@ candidates in about a minute.
     |---|---|---|---|---|---|---|---|
     | U12 pins open | 84.0 | 82.4 | 83.9 | 84.8 | 82.8 | 81.3 % | 83.8 % |
     | U12 signal pins loaded, 3 pF | 88.0 | 88.9 | 89.0 | 83.4 | 81.4 | 81.2 % | 82.4 % |
+    | U12 signal pins loaded, C6/C7/C23 not fitted (BOM) | 88.1 | 88.8 | 89.0 | 83.5 | 81.4 | 81.3 % | 82.5 % |
     | *all 71 pins loaded (artefact, see below)* | *87.3* | *86.7* | *87.7* | *87.2* | *84.7* | *82.5 %* | *85.9 %* |
 
     - Loading the decoupled pins too closed tiny LC loops (pad, decoupling short, vias, 3 pF) that rang at
@@ -229,6 +231,46 @@ candidates in about a minute.
   examined in [1bp-rf-findings.md](1bp-rf-findings.md).
 - **The harmonic levels** are per watt into a 50 Ω port. The chip's real harmonic source impedance is
   unknown, and the model's levels near the nulls are mesh-sensitive by a few dB.
+
+## DEC5 against Nordic's layout
+
+DEC5 is pin N24 of the nRF52840. It is the pin next to the antenna pin along that edge of the chip.
+
+- **Fitting.**
+  - **Nordic's DK (PCA10056):** C9 on DEC5 was 820 pF up to DK 2.0.1, and is "N.C., not mounted" from
+    2.1.0 onwards (2.1.0, 3.0.0-3.0.3). Nordic's reference layout keeps the C9 footprint.
+  - **MTH R7A:** the footprint is C23. The KiCad conversion values it at 100 pF, but the production BOM
+    doesn't fit it.
+  - So MTH leaves DEC5 unfitted, as the current DK does. Check Nordic's product specification or errata
+    for whether the change depends on silicon revision.
+- **Placement.**
+  - **MTH:** DEC5 leaves the 45°-rotated chip as a 0.15 mm track, about 1.6 mm long, to C23's empty pad.
+    That stub runs about 0.9 mm (centre to centre) from C59's antenna-side pad, right at the RF pin.
+  - **DK:** C9 sits 2.4 mm out from the chip edge, on the far side of the chip's centre line from the RF
+    trace, about 3.3 mm from it.
+  - With C23 unfitted, the MTH stub is a small floating piece of copper beside the antenna node. Fitted,
+    its ground return would land right next to the RF pin.
+- **The BOM also leaves out C6 (DEC4, 100 pF) and C7 (DEC2, 100 pF).** DEC4 keeps C12 (47 nF) and C15
+  (1 µF).
+
+![DEC5 top copper: MTH R7A (C23 footprint, not fitted) and nRF52840 DK 3.0.3 (C9, not mounted)](img/mth7_dec5_vs_dk.jpg)
+
+**Effect on the model.** The earlier runs shorted C6, C7 and C23 as decoupling. Rerunning with only the
+fitted parts shorted (DEC2 and DEC5 then get the 3 pF pin load) changes little:
+
+- antenna efficiency within 0.2 points at every frequency, and feed impedance within 0.2 Ω;
+- around C6, the top-copper current falls by 15 % driven (2.44 GHz) and by 45 % in the late-time ringing;
+- along the DEC5 track, it falls by 6-10 %;
+- at C7, C23 and the antenna node (C59), it changes by under 2 %.
+
+The DEC areas carry little current compared with the 3.3 V copper near C16, the antenna feed and the
+tracks below the chip.
+
+![Top copper current around the DEC capacitors, before (C6, C7, C23 shorted) and after (not fitted): driven at 2.44 GHz (left), late-time ringing (right)](img/mth7_dec_loops_FCu.jpg)
+
+![The same on the bottom copper](img/mth7_dec_loops_BCu.jpg)
+
+![The earlier artefact model (all 71 pins loaded, DNP parts shorted) against the current one: the late-time loop along the DEC5 track to C23 is gone](img/mth7_dec_loops_artefact.jpg)
 
 ## Superseded results (coarse open end)
 
@@ -261,7 +303,9 @@ replaces it, and it reached the same recommended direction.
     the chip are open-ended stubs), and far-field frequencies every 0.05 GHz over the band;
   - ports `CHIP` U12.H23→U12.F23, `C59` .2→.1, `L4` .1→.2, `C60` .2→.1, `L5` .1→.2, `R70` .2→.1,
     `C20` .1→.2;
-  - decoupling shorts on C5-C8, C12, C15, C16, C23, C24, C29, C30, C40;
+  - decoupling shorts on the fitted capacitors only: C5, C8, C12, C15, C16, C24, C29, C30, C40. The R7A
+    BOM leaves out C6 (DEC4), C7 (DEC2) and C23 (DEC5). The runs above before the BOM check also shorted
+    those three (see "DEC5 against Nordic's layout");
   - far field at 2.40/2.44/2.48/4.88/7.32 GHz.
 - **Cosim:** `keep` `["CHIP"]` with `"target": "nordic_ref_network.s2p"` and `"farfield": true`. For the
   antenna alone, keep `["C20"]` with R70 and CHIP open.

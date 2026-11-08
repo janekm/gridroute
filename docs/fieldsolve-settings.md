@@ -85,7 +85,9 @@ then start the long run.
 - **Solder mask** (`"solder_mask": true`) lowers an antenna's resonance. Leave it out only when comparing
   with a model that also leaves it out.
 - **Decoupling capacitors near the RF section:** model them as `"elements"` shorts. Without them, the
-  supply copper floats at RF.
+  supply copper floats at RF. Short only parts the production BOM fits: a footprint with a value in
+  KiCad may be unfitted. On MTH R7A, C6, C7 and C23 have values but aren't fitted, and the first MTH specs
+  shorted them anyway.
 - **Tracks to unmodelled ICs:** a track ending at a chip pin is open-ended in the model, which makes it a
   resonant stub (a quarter wave is about 17 mm at 2.4 GHz on FR4 microstrip). Near an antenna, such a
   stub can take efficiency in a narrow band, as on MTH. Load the chip's pins:
