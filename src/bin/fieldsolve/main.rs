@@ -25,6 +25,7 @@ mod tune;
 mod extrap;
 mod optimise;
 mod presets;
+mod bodies;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;
 
@@ -642,6 +643,7 @@ mod tests {
             barrels: vec![model::Barrel { c: P2::new(9.0, 5.0), r: 0.15, z0: 0.0, z1: 0.4 }],
             outline: vec![vec![P2::new(-2.0, -2.0), P2::new(12.0, -2.0), P2::new(12.0, 8.0), P2::new(-2.0, 8.0)]],
             copper_window: None,
+            bodies: vec![],
         };
         let port = model::Lumped { name: "P1".into(), axis: 2, lo: [1.0, 1.0, 0.0], hi: [1.0, 1.0, 0.4], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
         model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband, conductor, edge: None })

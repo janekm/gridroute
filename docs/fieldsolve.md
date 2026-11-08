@@ -183,6 +183,28 @@ with `"snap": true` sits on the nearest mesh node instead of adding mesh lines. 
 running to it aren't open-ended stubs ([fieldsolve-settings.md](fieldsolve-settings.md)). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
 
+**Enclosures and off-board antennas** (`bodies.rs`, Nov 2026; the first step of roadmap item A2):
+
+- `"bodies"`: 3-D dielectric objects and metal posts, voxelised by cell centre. A body replaces the board's
+  slab material in the cells it fills, and later bodies win where they overlap. Loss is a constant
+  conductivity from `tand` at `"f_loss"`: set `f_loss` to the band centre, because bodies don't use the
+  wideband model.
+  - `{"name": "cover", "stl": "build/asm-cover.stl", "frame": "y_up", "offset": [0, 0, 0], "eps": 2.9,
+    "tand": 0.008}` takes a closed (watertight) mesh, filled by vertical ray parity per cell column. The path
+    is relative to the spec. With `"y_up"` (the default, the CAD convention), STL y is −(KiCad y); with
+    `"kicad"`, it is KiCad's y. z is up from the board underside, where the bottom copper sits.
+  - `{"box": [x0, y0, z0, x1, y1, z1], "eps", "tand"}` is in spec coordinates, for example an FPC's carrier.
+  - `{"cylinder": [x, y, r, z0, z1], "metal": true}` is a vertical metal post (a screw, a cable shield's
+    riser), added as a barrel. It connects to any copper sheet it crosses.
+  - Meshing: cells of at most `"body_cell"` (default 0.4 mm, a third of a 1.2 mm moulded wall) over each
+    body. A box gets fixed lines at its z faces, and two cells across it if it is thinner than four body
+    cells. Each body prints the number of cells it fills, with a warning if that is zero.
+- `"layers"`: copper sheets outside the board's stack-up, for example an FPC antenna in a lid:
+  `[{"name": "FPC", "z": 9.0, "net": "ANT", "rects": [[x0, y0, x1, y1] | {"rect": [..], "net": ".."}],
+  "polygons": [[[x, y], ..] | {"poly": [..], "net": ".."}]}]`. They are meshed, rasterised and lossy like
+  board copper, and carry ports (`"layer": "FPC"`, `"pos"`/`"neg"` as `[x, y]`, `"width"`). Vias never
+  reach them; metal posts do. The domain's z range grows to include them and the bodies.
+
 The run prints the net under each port terminal (`port CHIP: + ANT (F.Cu) / - GND (F.Cu)`). It warns when
 neither end of a vertical port is on a net whose name contains `GND`. Check the reference before a long
 run. An inner layer is often a power plane, not ground. In the window, a power plane connects to nothing
@@ -845,6 +867,7 @@ The code is in `src/bin/fieldsolve/`.
 | `geom.rs` | shapes and inside tests |
 | `mesh.rs` | graded 1-D line generation with fixed lines |
 | `model.rs` | layout → per-edge coefficients, metal, barrels, lumped elements, CPML tables, probes |
+| `bodies.rs` | 3-D dielectric bodies (STL, boxes): reading and cell-centre voxelisation |
 | `fdtd.rs` | CPU reference stepping |
 | `metal_fdtd.rs` + `shaders/fdtd.metal` | GPU stepping |
 | `post.rs` | DFT, Z, power-wave S, R/L fit, Touchstone |

@@ -221,7 +221,95 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     if mask && !slabs.iter().any(|s| s.z1 <= 1e-9 || s.z0 >= zs.iter().map(|z| z.1).fold(f64::MIN, f64::max) - 1e-9) {
         eprintln!("fieldsolve: WARNING: \"solder_mask\": true, but the stack-up has no solder mask layers; none is modelled");
     }
+    // "layers": copper sheets outside the board's stack-up, such as an FPC antenna in an enclosure's lid:
+    // [{"name": "FPC", "z": 8.95, "net": "ANT", "rects": [[x0, y0, x1, y1] | {"rect": [..], "net": ".."}],
+    //   "polygons": [[[x, y], ..] | {"poly": [[x, y], ..], "net": ".."}]}] in spec coordinates. They are meshed
+    // and rasterised like board copper and can carry ports ("layer": "FPC", "pos": [x, y]); vias never reach
+    // them. Bodies give them a substrate.
+    let n_stack_cu = zs.len();
+    let mut zs = zs;
+    for el in sp.get("layers").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let name = el.get("name").and_then(|v| v.as_str()).ok_or("an extra layer needs \"name\"")?.to_string();
+        let z = el.get("z").and_then(|v| v.as_f64()).ok_or_else(|| format!("layer {name} needs \"z\" (mm, board underside 0)"))?;
+        if zs.iter().any(|(n, _)| n == &name) {
+            return Err(format!("layer {name} already exists"));
+        }
+        let net0 = el.get("net").and_then(|v| v.as_str()).map(String::from);
+        let mut prims = Vec::new();
+        let mut bbox = BBox::empty();
+        let net_of = |v: &Value| v.get("net").and_then(|n| n.as_str()).map(String::from).or_else(|| net0.clone());
+        for r in el.get("rects").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let a = r.get("rect").unwrap_or(&r).as_array().cloned().unwrap_or_default();
+            let v: Vec<f64> = a.iter().filter_map(|x| x.as_f64()).collect();
+            if v.len() != 4 {
+                return Err(format!("layer {name}: a rect is [x0, y0, x1, y1]"));
+            }
+            let (p, q) = (cx.pt(v[0], v[1]), cx.pt(v[2], v[3]));
+            let shape = Shape::Polygon(vec![P2::new(p.x, p.y), P2::new(q.x, p.y), P2::new(q.x, q.y), P2::new(p.x, q.y)]);
+            bbox.union(&shape.bbox());
+            prims.push(Prim { shape, dark: true, net: net_of(&r), pad: None });
+        }
+        for r in el.get("polygons").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let a = r.get("poly").unwrap_or(&r).as_array().cloned().unwrap_or_default();
+            let pts: Vec<P2> = a.iter().filter_map(|p| Some(cx.pt(p.get(0)?.as_f64()?, p.get(1)?.as_f64()?))).collect();
+            if pts.len() < 3 {
+                return Err(format!("layer {name}: a polygon needs 3 or more [x, y] points"));
+            }
+            let shape = Shape::Polygon(pts);
+            bbox.union(&shape.bbox());
+            prims.push(Prim { shape, dark: true, net: net_of(&r), pad: None });
+        }
+        eprintln!("fieldsolve: extra copper layer {name} at z {z} mm: {} shapes", prims.len());
+        cx.board.layers.push(crate::gerber::CopperLayer { name: name.clone(), index: 0, prims, bbox });
+        zs.push((name, z));
+    }
     cx.zs = zs.clone();
+    // "bodies": 3-D dielectric objects and metal posts: [{"name", "stl": path, "frame": "y_up" | "kicad",
+    // "offset": [dx, dy, dz], "eps", "tand"} | {"box": [x0, y0, z0, x1, y1, z1], "eps", "tand"} |
+    // {"cylinder": [x, y, r, z0, z1], "metal": true}]. Box and cylinder x/y are spec coordinates. An STL in
+    // "y_up" (the default, CAD convention) has y = -(KiCad y); "kicad" has KiCad's y. z is up from the board
+    // underside in both. Metal cylinders become barrels (screws, posts).
+    let mut bodies: Vec<crate::bodies::Body> = Vec::new();
+    let mut posts: Vec<Barrel> = Vec::new();
+    for (bi, b) in sp.get("bodies").and_then(|v| v.as_array()).cloned().unwrap_or_default().iter().enumerate() {
+        let name = b.get("name").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| format!("body{bi}"));
+        let nums = |k: &str| -> Option<Vec<f64>> { b.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()) };
+        if let Some(c) = nums("cylinder") {
+            if c.len() != 5 {
+                return Err(format!("body {name}: \"cylinder\" is [x, y, r, z0, z1]"));
+            }
+            if !b.get("metal").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(format!("body {name}: only metal cylinders are supported (\"metal\": true)"));
+            }
+            posts.push(Barrel { c: cx.pt(c[0], c[1]), r: c[2], z0: c[3].min(c[4]), z1: c[3].max(c[4]) });
+            continue;
+        }
+        let eps = b.get("eps").and_then(|v| v.as_f64()).ok_or_else(|| format!("body {name} needs \"eps\""))?;
+        let tand = num(b, "tand", 0.0);
+        let shape = if let Some(v) = nums("box") {
+            if v.len() != 6 {
+                return Err(format!("body {name}: \"box\" is [x0, y0, z0, x1, y1, z1]"));
+            }
+            let (p, q) = (cx.pt(v[0], v[1]), cx.pt(v[3], v[4]));
+            crate::bodies::BodyShape::Box { lo: [p.x.min(q.x), p.y.min(q.y), v[2].min(v[5])], hi: [p.x.max(q.x), p.y.max(q.y), v[2].max(v[5])] }
+        } else if let Some(path) = b.get("stl").and_then(|v| v.as_str()) {
+            let off = nums("offset").unwrap_or_else(|| vec![0.0; 3]);
+            let flip = match b.get("frame").and_then(|v| v.as_str()).unwrap_or("y_up") {
+                "y_up" => false,
+                "kicad" => true,
+                f => return Err(format!("body {name}: frame {f:?}: use \"y_up\" or \"kicad\"")),
+            };
+            // internal frame: x, y up (= -KiCad y with kicad coordinates), z
+            let tris = crate::bodies::read_stl(Path::new(path), |p| {
+                let (x, y, z) = (p[0] + off[0], p[1] + off[1], p[2] + off.get(2).copied().unwrap_or(0.0));
+                [x, if flip { -y } else { y }, z]
+            })?;
+            crate::bodies::BodyShape::Mesh { tris }
+        } else {
+            return Err(format!("body {name} needs \"box\", \"stl\" or \"cylinder\""));
+        };
+        bodies.push(crate::bodies::Body { name, eps, tand, shape });
+    }
     let cell = num(&sp, "cell", 0.1);
     let fmax = num(&sp, "fmax", 3e9);
     let air = num(&sp, "air", 3.0);
@@ -550,9 +638,24 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     }
 
     // mesh
-    let board_t = zs.iter().map(|x| x.1).fold(0.0, f64::max);
+    let board_t = zs[..n_stack_cu].iter().map(|x| x.1).fold(0.0, f64::max);
     let zlo = slabs.iter().map(|s| s.z0).fold(0.0, f64::min);
     let zhi = slabs.iter().map(|s| s.z1).fold(board_t, f64::max);
+    // the domain's z range also takes in the bodies, metal posts and extra copper layers
+    let (mut ext_lo, mut ext_hi) = (zlo, zhi);
+    for (_, z) in &zs[n_stack_cu..] {
+        ext_lo = ext_lo.min(*z);
+        ext_hi = ext_hi.max(*z);
+    }
+    let body_bounds: Vec<([f64; 3], [f64; 3])> = bodies.iter().map(|b| b.bounds()).collect();
+    for (lo, hi) in &body_bounds {
+        ext_lo = ext_lo.min(lo[2]);
+        ext_hi = ext_hi.max(hi[2]);
+    }
+    for p in &posts {
+        ext_lo = ext_lo.min(p.z0);
+        ext_hi = ext_hi.max(p.z1);
+    }
     let cell_z = num(&sp, "cell_z", cell.min(slabs.iter().map(|s| s.z1 - s.z0).fold(f64::INFINITY, f64::min) / 2.0));
     let min_layer = num(&sp, "min_cells_layer", 2.0) as usize;
     // the absorbing layer's cells are graded up to hmax: with a whole-board domain give it its full width
@@ -618,11 +721,35 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let (bx, by) = mp.copper_bands(&sheets, &fine);
     rx.extend(bx);
     ry.extend(by);
+    // bodies: cells of at most "body_cell" (default 0.4 mm, a third of a 1.2 mm moulded wall) over each body,
+    // fixed lines at box faces, and two cells across boxes thinner than four body cells (an FPC substrate)
+    let body_cell = num(&sp, "body_cell", 0.4_f64.min(hmax));
+    let mut fz = fz;
+    let mut zref_b: Vec<Refine> = Vec::new();
+    let mut mc_b: Vec<(f64, f64, usize)> = Vec::new();
+    for (b, (lo, hi)) in bodies.iter().zip(&body_bounds) {
+        rx.push(Refine { a: lo[0], b: hi[0], h: body_cell });
+        ry.push(Refine { a: lo[1], b: hi[1], h: body_cell });
+        zref_b.push(Refine { a: lo[2], b: hi[2], h: body_cell });
+        if let crate::bodies::BodyShape::Box { .. } = b.shape {
+            for z in [lo[2], hi[2]] {
+                if !fz.iter().any(|&f| (f - z).abs() < 0.75 * cell) {
+                    fz.push(z);
+                }
+            }
+            if hi[2] - lo[2] < 4.0 * body_cell {
+                mc_b.push((lo[2], hi[2], 2));
+                zref_b.push(Refine { a: lo[2], b: hi[2], h: ((hi[2] - lo[2]) / 2.0).max(1e-3) });
+            }
+        }
+    }
     let mut gx = crate::mesh::lines_1d_slack(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &rx, 1.3, hmax, &[], mp.slack());
     let mut gy = crate::mesh::lines_1d_slack(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &ry, 1.3, hmax, &[], mp.slack());
-    let mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
-    let zref = mp.z_refine(zlo, zhi, &fz, cell_z);
-    let gz = crate::mesh::lines_1d_slack(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &zref, 1.3, hmax, &mc, mp.slack());
+    let mut mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
+    mc.extend(mc_b);
+    let mut zref = mp.z_refine(zlo, zhi, &fz, cell_z);
+    zref.extend(zref_b);
+    let gz = crate::mesh::lines_1d_slack(ext_lo - air_z - pml_w, ext_hi + air_z + pml_w, &fz, &zref, 1.3, hmax, &mc, mp.slack());
     // keep only fixed lines that fall inside the domain
     gx.dedup();
     gy.dedup();
@@ -852,7 +979,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     }
 
     // vias and pins within the domain
-    let ncu = zs.len();
+    let ncu = n_stack_cu;
     let mut barrels = Vec::new();
     for h in &cx.board.holes {
         if !h.plated || !dom.grow(0.5).contains(h.c) {
@@ -867,7 +994,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             barrels.push(Barrel { c: e, r: h.d / 2.0, z0: za.min(zb), z1: za.max(zb) });
         }
     }
-    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) } };
+    barrels.extend(posts);
+    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) }, bodies };
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
     let sheet_names: Vec<String> = layout.sheets.iter().map(|s| s.name.clone()).collect();
@@ -1539,8 +1667,16 @@ pub fn load(spec_path: &Path) -> Result<(Ctx, PathBuf), String> {
     let txt = std::fs::read_to_string(spec_path).map_err(|e| format!("{}: {e}", spec_path.display()))?;
     let spec: Value = serde_json::from_str(&txt).map_err(|e| format!("{}: {e}", spec_path.display()))?;
     // "preset": "rf" | "antenna" fills the recommended model settings the spec leaves out (presets.rs)
-    let spec = crate::presets::apply(spec)?;
+    let mut spec = crate::presets::apply(spec)?;
     let base = spec_path.parent().unwrap_or(Path::new("."));
+    // body STL paths are relative to the spec
+    if let Some(bs) = spec.get_mut("bodies").and_then(|v| v.as_array_mut()) {
+        for b in bs {
+            if let Some(p) = b.get("stl").and_then(|v| v.as_str()).map(String::from) {
+                b["stl"] = Value::from(base.join(p).to_string_lossy().to_string());
+            }
+        }
+    }
     let gdir = base.join(spec.get("gerbers").and_then(|v| v.as_str()).ok_or("spec needs \"gerbers\"")?);
     let out = base.join(spec.get("out").and_then(|v| v.as_str()).unwrap_or("fieldsolve-out"));
     let mut board = crate::gerber::load_dir(&gdir)?;

@@ -116,6 +116,18 @@ then start the long run.
   - The loads sit on the nearest mesh node, so they add no mesh lines.
   - The run prints how many pins were loaded, and how many land on no ground copper (those loads float).
   - Use the chip's pad capacitance from its datasheet: about 3 pF for nRF52840 GPIOs.
+- **Enclosures and off-board antennas** (`"bodies"`, `"layers"`; see [fieldsolve.md](fieldsolve.md#usage)):
+  - Set `"f_loss"` to the band centre (e.g. 2.44e9). Bodies take a constant conductivity from `tand` at
+    `f_loss`, not the wideband model.
+  - Use the enclosure's STL in the board's frame and check the frame first: with `"y_up"`, the CAD default,
+    STL y is −(KiCad y). Each body prints how many cells it fills, so a zero or a surprising count means
+    a wrong frame or offset. Plot a section through the model before a long run.
+  - Write down where εr and tan δ came from. Plastic datasheets usually quote 1 MHz values.
+  - Model the board under an off-board antenna fully: decoupling shorts, pin loads and acknowledged open
+    nets, as for a PCB antenna. Run the antenna in free space, with the enclosure only, and with the board
+    only, as well as installed, so the cause of any detuning or loss is visible.
+  - An antenna's cable matters. Model the shield's outer surface (posts plus a strip on an extra layer)
+    and compare with a run without it.
 
 ## Ports, band and stopping
 

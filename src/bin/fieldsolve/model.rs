@@ -51,6 +51,9 @@ pub struct Layout {
     /// Copper is rasterised only inside this box (mm): the fine-meshed region. Copper outside it would land
     /// on graded coarse cells and merge across gaps.
     pub copper_window: Option<BBox>,
+    /// 3-D dielectric objects (enclosure, FPC substrate): they replace the slab material in the cells they
+    /// fill, later ones winning (bodies.rs).
+    pub bodies: Vec<crate::bodies::Body>,
 }
 
 impl Layout {
@@ -678,9 +681,24 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         })
         .collect();
     // (eps_r or eps_inf, sigma, slab index for the poles) of cell (i,j,k); out-of-range cells are air
+    let body_of = crate::bodies::body_cells(g, &lay.bodies);
+    for (bi, b) in lay.bodies.iter().enumerate() {
+        let n = body_of.iter().filter(|&&v| v as usize == bi + 1).count();
+        eprintln!("fieldsolve: body {}: eps {} tan d {} in {n} cells", b.name, b.eps, b.tand);
+        if n == 0 {
+            eprintln!("fieldsolve: WARNING: body {} fills no cells (outside the domain, or thinner than a cell)", b.name);
+        }
+    }
     let cell = |i: isize, j: isize, k: isize| -> (f64, f64, Option<usize>) {
         if i < 0 || j < 0 || k < 0 || i >= nx as isize - 1 || j >= ny as isize - 1 || k >= nz as isize - 1 {
             return (1.0, 0.0, None);
+        }
+        if !lay.bodies.is_empty() {
+            let b = body_of[(k as usize * (ny - 1) + j as usize) * (nx - 1) + i as usize];
+            if b > 0 {
+                let b = &lay.bodies[b as usize - 1];
+                return (b.eps, w_loss * EPS0 * b.eps * b.tand, None);
+            }
         }
         match slab_of_k[k as usize] {
             Some(si) if inside[j as usize * nx + i as usize] => {
