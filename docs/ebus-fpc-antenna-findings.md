@@ -15,8 +15,12 @@ cable plugs into J3.
 - **On the side wall beside J3, the YL1439 itself radiates 69-81 % without the cable.** But it is detuned to
   2-4 Ω, and the modelled cable route drags it down to 17-27 %. It needs a retune and a controlled cable
   route; see [the side wall](#the-yl1439-bt-v1-on-the-side-wall). The result is from a single mesh.
-- **Johanson's 2450AT42E chip antenna** measures 21 % on a 50 × 30 mm evaluation board. It needs In1/In2
-  cleared under it on this 4-layer board; see [the chip antenna](#a-chip-antenna-on-the-board).
+- **Johanson's 2450AT42E chip antenna** measures 21 % on a 50 × 30 mm evaluation board. A calibrated
+  stand-in at the J3 spot radiates about 35 % with In1/In2 cleared under it and 13-16 % without. The track
+  bus there would have to move; see [the chip antenna](#a-chip-antenna-on-the-board).
+- **A printed inverted-F in the board's free top-right strip** (2 mm deep) radiates about 43 % but sees only
+  3-4 Ω. A good printed antenna needs about 4-5 mm of clearance, which means moving parts; see
+  [the printed antenna](#a-printed-antenna-in-the-boards-free-area).
 - The rest of this summary is about the stand-in dipole first modelled for the "Molex 146153 class" part.
 - **The pocket puts the FPC about 8.3 mm above the board's ground, parallel to it, and that wrecks it.**
   - The board is 50 × 28 mm, a 4-layer 0.8 mm board with ground on the inner layers, and it fills the
@@ -214,10 +218,70 @@ measurements.
     bottom of that table.
   - Clearing In1 and In2 under the chip moves the nearest metal to B.Cu, about 0.67 mm down, which is the
     29 % case.
-- **It can't be modelled from first principles here.** The internal LTCC structure isn't published. A
-  stand-in would have to be a lumped resonator on the pads, calibrated against the evaluation board's S11 and
-  21 % efficiency, and that only transfers the board and enclosure effects. Johanson offers its CAD layout
-  and tuning support on request.
+- **It can't be modelled from first principles here.** The internal LTCC structure isn't published, so the
+  model uses a calibrated stand-in (below). Johanson offers its CAD layout and tuning support on request.
+
+### Calibrated stand-in
+
+`tools/jti_chip_eval.py` writes the evaluation board (50 × 30 mm, assumed 0.8 mm FR4, the datasheet
+footprint) and the stand-in.
+- **A lumped element across the pads doesn't work.** A series R-L-C from pad 1 to pad 4 at board level
+  radiates 0.4 % before any loss: a 1 mm loop flat on the ground has no radiation resistance.
+- **The stand-in is a shorted patch inside the 5.0 × 2.0 × 1.5 mm body:**
+  - a plate 1.4 mm up (metal box), with a post from the feed pad 1 and a post from the GND pad 4;
+  - a ceramic body of εr 10, tan δ 0.002;
+  - a LOAD port from pad 3 up to the plate's far end, terminated in co-simulation by a series C (setting the
+    resonance) and R (the internal loss);
+  - the feed port from pad 1 to the ground below the zone.
+- **Calibration:** C = 0.69 pF and R = 2.3 Ω, with an ideal two-element match at 2.44 GHz.
+  - On the evaluation board this gives 22.5 % radiated (Johanson measures 21 % on average).
+  - The matched S11 is −6.2 / −6.3 dB at 2.40 / 2.48 GHz (Johanson measures −5.7 / −5.7 dB).
+  - Only R was fitted to the efficiency. The bandwidth came out right on its own, which supports the stand-in.
+- **On the eBus board,** the chip sits at the centre of the top edge in place of J3 (zone x 21.9-28.2,
+  y 0-3), inside the enclosure, with the same C and R and an ideal match:
+
+  | | 2.40 | 2.44 | 2.48 GHz | matched S11 at 2.40 / 2.48 |
+  |---|---|---|---|---|
+  | In1 and In2 cleared under the chip (nearest metal B.Cu, 0.67 mm down) | 37.0 | 35.4 | 35.4 % | −7.3 / −7.3 dB |
+  | In1 ground left under it (0.21 mm down) | 15.7 | 14.2 | 12.7 % | −6.1 / −7.5 dB |
+
+  - **The keep-out is necessary.** The stand-in probably understates the drop without it: Johanson's own
+    simulation goes from 29 % at 0.7 mm to 2 % at 0.12 mm.
+  - **The zone has to be free.** A bus of tracks (SCL, SDA2, SCL2, SWDIO, SWDCLK, EBUS_EN, V_INT) crosses it
+    on F.Cu, In1 and In2 at y 1.2-2.5, so they would have to be re-routed below y 3.2. The model just clears
+    the zone.
+  - The matching network has to be retuned for the chip.
+  - These efficiencies come from the stand-in, so they are estimates, not predictions for the real part.
+
+## A printed antenna in the board's free area
+
+`tools/ebus_pcb_ifa.py`. Mapping the A.4 layout's free copper (no parts, tracks or signal vias) leaves only
+narrow strips along the edges:
+- along the top edge: 2.2 mm deep at x 1-11, 1.1-1.5 mm at x 11-28 (the track bus), 2-2.9 mm at x 29-40;
+- the top-right corner: 3-7 mm deep at x 41-50, around the H3 screw boss;
+- along the bottom edge: 0.5-3.4 mm.
+
+- **The design:** a printed inverted-F in the top-right area, with a keep-out cleared on all four copper
+  layers (y < 2.0 at x 29.5-46.5, and y < 7.0 at x > 46.5).
+  - A 0.5 mm arm runs along the top edge at y 0.5-1.0, from the short at x 30.0 to x 47.
+  - It steps round the rounded corner and runs 1 mm down the right edge.
+  - The feed is 2 mm from the short.
+- **The result (0.05 mm mesh, enclosure, no cable):** resonance at 2.38 GHz. It radiates 42.4 / 43.0 / 43.7 %
+  at 2.40 / 2.44 / 2.48 GHz, but its resistance is only 3-4 Ω (3 + j5 Ω at 2.44 GHz).
+  - A 3 Ω antenna needs a steep match, which costs loss and bandwidth.
+  - Moving the feed farther from the short (5 and 8 mm) didn't raise the resistance; it detuned the antenna
+    upwards.
+  - With 1 mm between the arm and the ground edge, the arm is mostly a transmission line along the edge.
+- **That isn't excellent, and the free area is the limit.** A printed antenna with good efficiency and a
+  usable impedance needs roughly 4-5 mm of ground clearance along an edge, which means moving parts:
+  - D8, R10-R14, U6 and C2 out of the top-right strip, or the track bus off the top edge.
+  - A first try at a 4.5 mm keep-out was invalid. Clearing the parts without re-laying the ground left the
+    short landing on a copper island, so modelling that case properly needs a planned ground edge.
+- **For comparison, in band before any match:**
+  - this printed antenna, about 43 %;
+  - the chip antenna with In1/In2 cleared, about 35 % (stand-in);
+  - the YL1439 on the side wall, 69-81 % bare but 17-27 % with the modelled cable;
+  - the YL1439 in the lid pocket, 26-45 %.
 
 ## Caveats
 
