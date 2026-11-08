@@ -515,31 +515,49 @@ another session's runs for most of it, so the 4 h 35 min wall time says nothing 
 | **(+0.2, +0.30)** | −0.81 | **−0.823** | final |
 | (+0.2, +0.25) | −0.84 | −0.845 | final |
 
-The search model has the same two faults as the 7-port extractions below: C6, C7 and C23 are shorted, and
-U12's pins are open. The values are antenna-alone worst-in-band values, as in the first search. They are not comparable with
-the first search's values (lossless copper, coarse arm tip, a different feed). The optimum sits at the
-upper bound of `raise`: the radiator wants to be further from the ground than the board allows. Once
-`raise` is high enough, the arm length matters little (±0.1 mm changes the value by about 0.02 dB).
-
-**These 7-port extractions short three capacitors the board does not fit** (C6, C7 and C23 are not in the
-R7A production BOM), and they leave U12's pins open. A BOM-correct re-extraction with `pin_loads` is
-queued, and the table below will be replaced with its results.
+The search model shorts C6, C7 and C23, which the R7A production BOM does not fit, and it leaves U12's
+pins open. The values are antenna-alone worst-in-band values, as in the first search. They are not
+comparable with the first search's values (lossless copper, coarse arm tip, a different feed). The
+optimum sits at the upper bound of `raise`: the radiator wants to be further from the ground than the
+board allows. Once `raise` is high enough, the arm length matters little (±0.1 mm changes the value by
+about 0.02 dB). The search was not repeated with the BOM-correct model below.
 
 **7-port extraction and ladder re-tune.** Both geometries were extracted as 7-ports (CHIP and the six
-ladder positions) with the same settings. Then `tune` ran on each with the Stage 1 set-up: CHIP drive, the
-Nordic reference network as target, 2.40/2.44/2.48 GHz, H2 and H3 no worse than as built.
+ladder positions) with the BOM-correct model:
+- only the fitted shorts;
+- `"pin_loads": [{"ref": "U12", "c": 3e-12}]`, which loads 60 pins;
+- `"decouple"` for VCC_S18, which shorts C43 outside the ROI;
+- `"preset": "antenna"`;
+- far field every 0.02 GHz from 2.40 to 2.48 GHz, plus H2 and H3.
 
-| geometry | ladder | 2.40 | 2.44 | 2.48 GHz | worst | H2 / H3 radiated |
-|---|---|---|---|---|---|---|
-| as built | as-built BOM (C59 1p, L4 4.7n, C60 1.2p, L5 2.2n, R70 0R, C20 open) | −1.71 | −2.13 | −3.08 | −3.08 dB | −25.6 / −21.9 dB |
-| as built | re-tuned: C20 0.2p, C59 0.9p, L4 2.2n, C60 0.5p, L5 1.3n, R70 2p series | −1.41 | −1.26 | −1.41 | **−1.41 dB** | −26.3 / −21.9 dB |
-| v2 (+0.2, +0.3) | as-built BOM | −1.83 | −1.82 | −2.34 | −2.34 dB | −25.5 / −21.8 dB |
-| v2 (+0.2, +0.3) | re-tuned: C20 0.2p, C59 open, L4 1n, C60 0.6p, L5 3.9n, R70 0R | −1.19 | −1.15 | −1.24 | **−1.24 dB** | −26.4 / −30.6 dB |
+Each run took 29–30 min (12.9 M cells, 51–60k steps per port, idle GPU). Then `tune` ran on each with the
+Stage 1 set-up: CHIP drive, the Nordic reference network as target, the five band frequencies, and H2 and
+H3 radiated no worse than with the as-built BOM. The values are radiated power per watt available.
 
-- **The ladder is worth far more than the geometry.** Re-tuning gains 1.7 dB on the as-built antenna. The
-  new geometry adds 0.17 dB on top, and it is worth 0.7 dB with the as-built BOM.
-- **The v2 ladder is simpler**: C59 is open, R70 is a 0 Ω link, and H3 drops by 9 dB, because L4 1n and
-  L5 3.9n form a different low-pass than the as-built ladder.
+| geometry | ladder | 2.40 | 2.42 | 2.44 | 2.46 | 2.48 GHz | worst | H2 / H3 radiated |
+|---|---|---|---|---|---|---|---|---|
+| as built | as-built BOM (C59 1p, L4 4.7n, C60 1.2p, L5 2.2n, R70 0R, C20 open) | −1.91 | −1.93 | −2.09 | −2.39 | −2.82 | −2.82 dB | −23.1 / −22.2 dB |
+| as built | re-tuned: C59 open, L4 1n, C60 0.6p, L5 1.2n, R70 1.6n, C20 open | −1.40 | −1.39 | −1.39 | −1.39 | −1.41 | **−1.41 dB** | −23.3 / −29.4 dB |
+| v2 (+0.2, +0.3) | as-built BOM | −2.30 | −2.10 | −2.00 | −2.04 | −2.22 | −2.30 dB | −23.0 / −22.3 dB |
+| v2 (+0.2, +0.3) | re-tuned: C59 open, L4 0R, C60 0.7p, L5 2n, R70 2n, C20 0.5p | −1.23 | −1.18 | −1.17 | −1.19 | −1.28 | **−1.28 dB** | −23.1 / −23.5 dB |
+
+- **The ladder is worth far more than the geometry.** Re-tuning gains 1.41 dB on the as-built antenna.
+  With re-tuned ladders, v2 is 0.13 dB better. That is less than the unproven mesh error of this model, so
+  the geometry change is not shown to help. With the as-built BOM, v2 is 0.52 dB better.
+- **The as-built re-tune is close to Stage 1's answer** (C59 open, L4 1.0n, C60 0.8p, L5 1.5n, R70 0R),
+  and it is flat across the band (−1.39 to −1.41 dB). R70 becomes a 1.6 nH series inductor. H3 drops by
+  7 dB.
+- **The ranks below the top are within 0.02–0.07 dB** of it on both geometries. Pick by part
+  availability and tolerance, not by rank.
+- **These results replace an earlier table** from extractions that shorted C6, C7 and C23 and left U12
+  open. That table had other ladders (as built −1.41 dB with C59 0.9p, L4 2.2n; v2 −1.24 dB with L5 3.9n)
+  and a 9 dB H3 drop on v2 that this model does not show.
+- **H2 is mesh-sensitive.** Both runs ring at a mode near 4.95 GHz (Q about 65–69), 70 MHz from H2. The
+  H2 limit compares values that this mode can move.
+- **The coarse-copper warning was not acknowledged.** It lists 59 F.Cu areas at y 87.75–95.5, below the
+  fine region, in cells up to 1.5 mm. The RF path (CHIP pin at y 83.25 to C20) is inside the fine
+  region; which nets the flagged tracks carry is not checked. The withdrawn extractions did not print
+  this warning.
 - The same caveats hold: the mesh convergence of the widened ROI is not demonstrated, and ±0.1 mm
   tolerances are unchecked. The re-tuned values use the Murata part models of Stage 1.
 
@@ -698,8 +716,11 @@ work are kept with the session notes, not in the tree.
 - **Mesh convergence of the widened-ROI MTH model** (a 0.035 mm run, or the corrections on), before
   geometry results are compared with measurements.
 - **MTH v2 geometry:**
+  - with re-tuned ladders, v2 gains only 0.13 dB over the as-built geometry. A two-mesh check (0.7 ×
+    `cell`) of both 7-ports would show whether that is real;
   - check fabrication tolerance (±0.1 mm on `arm` and `raise`) with the re-tuned ladder;
-  - `raise` is limited by the board edge. More clearance would have to come from the outline.
+  - `raise` is limited by the board edge. More clearance would have to come from the outline;
+  - acknowledge or resolve the coarse-copper warning of the BOM-correct 7-ports.
 - **Subgridding with an energy-stable interface** (above), for up to about 1.9× on screening.
 - **A single-feed screening option for multiport tuning extractions**, since all-port screening saves only
   1.8× in cells × steps.
