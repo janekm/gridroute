@@ -214,7 +214,7 @@ running to it aren't open-ended stubs ([fieldsolve-settings.md](fieldsolve-setti
     join too. These sheets have no conductor loss and no sub-cell edge corrections. A vertical copy of the
     YL1439 FPC on a plate resonated 2.5 % above the horizontal sheet model.
   - Meshing: cells of at most `"body_cell"` (default 0.4 mm, a third of a 1.2 mm moulded wall) over each
-    body. A box gets fixed lines at its z faces, and two cells across it if it is thinner than four body
+    body, or the body's own `"cell"`, for example a chip antenna's body among enclosure shells. A box gets fixed lines at its z faces, and two cells across it if it is thinner than four body
     cells. Each body prints the number of cells it fills, with a warning if that is zero.
 - `"layers"`: copper sheets outside the board's stack-up, for example an FPC antenna in a lid:
   `[{"name": "FPC", "z": 9.0, "net": "ANT", "rects": [[x0, y0, x1, y1] | {"rect": [..], "net": ".."}],

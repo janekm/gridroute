@@ -270,6 +270,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     // "y_up" (the default, CAD convention) has y = -(KiCad y); "kicad" has KiCad's y. z is up from the board
     // underside in both. Metal cylinders become barrels (screws, posts).
     let mut bodies: Vec<crate::bodies::Body> = Vec::new();
+    // per-body "cell" (mm): its own mesh size instead of "body_cell" (e.g. a chip antenna's body among enclosure shells)
+    let mut body_h: Vec<Option<f64>> = Vec::new();
     let mut posts: Vec<Barrel> = Vec::new();
     for (bi, b) in sp.get("bodies").and_then(|v| v.as_array()).cloned().unwrap_or_default().iter().enumerate() {
         let name = b.get("name").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| format!("body{bi}"));
@@ -312,6 +314,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         } else {
             return Err(format!("body {name} needs \"box\", \"stl\" or \"cylinder\""));
         };
+        body_h.push(b.get("cell").and_then(|v| v.as_f64()));
         bodies.push(crate::bodies::Body { name, eps, tand, shape, metal });
     }
     let cell = num(&sp, "cell", 0.1);
@@ -772,7 +775,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let mut fz = fz;
     let mut zref_b: Vec<Refine> = Vec::new();
     let mut mc_b: Vec<(f64, f64, usize)> = Vec::new();
-    for (b, (lo, hi)) in bodies.iter().zip(&body_bounds) {
+    for ((b, (lo, hi)), bh) in bodies.iter().zip(&body_bounds).zip(&body_h) {
+        let body_cell = bh.unwrap_or(body_cell);
         if b.metal {
             // copper standing in a vertical plane: the fine cell over it, and a mesh line on its plane
             rx.push(Refine { a: lo[0], b: hi[0], h: cell });
