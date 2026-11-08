@@ -8,6 +8,11 @@ cable plugs into J3.
 
 ## Summary
 
+- **With the FORCE YL1439-BT-V1, the FPC used on other boards, it is worse:** 26-45 % radiation efficiency
+  in the pocket, and −7.5 to −11.6 dB in total from 50 Ω, depending on the cable. In free space on 1.05 mm of
+  PC/ABS it is 85-89 %. The part appears tuned for about 0.7 mm of plastic. See
+  [the YL1439 section](#the-force-yl1439-bt-v1-the-fpc-used-on-other-boards).
+- The rest of this summary is about the stand-in dipole first modelled for the "Molex 146153 class" part.
 - **The pocket puts the FPC about 8.3 mm above the board's ground, parallel to it, and that wrecks it.**
   - The board is 50 × 28 mm, a 4-layer 0.8 mm board with ground on the inner layers, and it fills the
     enclosure. The FPC's copper sits at z 9.0, and the board's top copper at z 0.67.
@@ -87,6 +92,64 @@ cable plugs into J3.
 
 The conclusion holds on both meshes. The efficiency is mesh-sensitive by about ±3 points, and the
 reactance by about 5 Ω.
+
+## The FORCE YL1439-BT-V1 (the FPC used on other boards)
+
+ShenZhen Powerful Technology's FPCs are marked "FORCE". Two are on file:
+- the YL1439 2.4/5 GHz Wi-Fi V2, 46 × 10 mm and dual band, specified for Modbus_IF in
+  `Revision_6/Modbus_IF/docs/manufacturing/original/KNA-019286R0_YL1439_antenna_spec.pdf`;
+- the single-band **YL1439-BT-V1**, 36 × 10 mm, whose vendor AutoCAD drawing (Oct 2022) shows the copper
+  outline. That drawing is `YL1439-BT天线-FPC.pdf` in Downloads.
+
+The BT part is the logical one for a 2.4 GHz-only design. It is 0.5 × 0.4 mm larger than the pocket drawn for
+the Molex part, so the pocket would grow to about 36.5 × 10.4 mm.
+
+![YL1439-BT-V1: copper as traced (orange) over the vendor drawing; feed port in red](img/ebus_yl1439_trace.jpg)
+
+- **The pattern is a printed inverted-F.**
+  - A 1.25 mm arm runs about 28 mm from an open end at the left (with a tab) to a feed pad.
+  - A 0.5 mm bridge over a diagonal slot shorts the arm to the block where the cable lands.
+  - A 1.4 mm ground strip runs back from that block.
+  - The 1.13 mm cable (63 mm) leaves along the FPC's axis. The model's port spans the slot from the feed pad to
+    the block.
+- **No measurement of this part is on file**, so the model isn't validated. The Wi-Fi V2's report (62-81 %
+  efficiency, 5.0-5.8 dBi peak gain) is a different pattern.
+- **It is tuned for a thin plastic carrier.**
+  - In free air (no cable) it sits at 2.85 GHz.
+  - On a PC/ABS plate, it centres on the band with **about 0.7 mm** of plastic behind it: best match at
+    2.46 GHz, VSWR ≤ 2 from 2.42 to 2.50 GHz.
+  - Under the eBus lid's 1.05 mm (the 1.2 mm wall less the 0.15 mm pocket) it sits at 2.40 GHz. Each further
+    0.5 mm lowers it about 40 MHz.
+  - On the 1.05 mm plate it radiates 85-89 %, with a peak gain of about 1.5 dBi.
+  - These free-space runs agree at 0.1 and 0.07 mm cells: the same best-match frequency (2.397 GHz), with
+    the impedance within 1-3 Ω.
+- **Installed, it radiates only 26-33 %.** These are converged numbers: 0.07 and 0.05 mm agree.
+
+  | 0.05 mm mesh | 2.40 | 2.44 | 2.48 | 2.50 GHz |
+  |---|---|---|---|---|
+  | Z | 7 + j59 | 15 + j79 | 72 + j119 | 169 + j85 Ω |
+  | S11 | −1.0 | −1.5 | −3.0 | −4.1 dB |
+  | radiation efficiency | 32.9 | 31.6 | 28.3 | 27.3 % |
+  | total from 50 Ω | −11.6 | −10.4 | −8.5 | −7.8 dB |
+
+  - The antenna's own resonance moves up to about 2.5-2.55 GHz.
+  - A sharp mode at 1.93-1.96 GHz (Q about 32) is still ringing when the runs stop, and the 0.05 mm run hit
+    its 200 000-step limit.
+  - The 0.1 mm installed run put the resonance near 2.15 GHz instead. **It isn't converged.** The 0.1 mm
+    shortened-arm runs from the same mesh are void too.
+  - The stand-in dipole above did agree between 0.1 and 0.07 mm.
+
+- **The 1.93-1.96 GHz mode belongs to the cable.**
+  - Without the cable shield (0.07 mm), it is gone. The antenna then resonates near 2.3 GHz and sees
+    10 − j24 / 5 − j7 / 4 + j1 / 3 + j4 Ω at 2.40 / 2.44 / 2.48 / 2.50 GHz, radiating 36 / 40 / 40 / 45 %
+    (total −7.5 to −10.1 dB).
+  - That run agrees with the 0.1 mm one (9 − j18 / 5 − j5 Ω at 2.40 / 2.44 GHz), so the cable model is what
+    needed the finer mesh: its strip runs 0.4 mm under the FPC.
+  - The real cable's route sits between those two cases. Either way the YL1439 does worse here than the
+    stand-in dipole (55-62 %). The pocket over the board's ground is still the problem; a thinner lid would
+    only retune it.
+
+![YL1439-BT-V1: |S11| against the plastic thickness in free space (left), and installed on three meshes against free space (right)](img/ebus_yl1439_cases.jpg)
 
 ## Caveats
 
