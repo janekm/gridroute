@@ -297,8 +297,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let y = if cx.kicad { -c.y } else { c.y };
             // "esr": a capacitor's series resistance (ohm) instead of a perfect short
             let el = match d.get("esr").and_then(|v| v.as_f64()) {
-                Some(esr) if esr > 0.0 => json!({"kind": "R", "r": esr, "at": [c.x, y], "from": from, "to": to, "size": "point"}),
-                _ => json!({"kind": "short", "at": [c.x, y], "from": from, "to": to, "size": "point"}),
+                Some(esr) if esr > 0.0 => json!({"kind": "R", "r": esr, "at": [c.x, y], "from": from, "to": to, "size": "point", "snap": true}),
+                _ => json!({"kind": "short", "at": [c.x, y], "from": from, "to": to, "size": "point", "snap": true}),
             };
             pend.push(Pending { name: format!("decouple {r}"), el, port: false });
             added += 1;
@@ -317,6 +317,23 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let used_pads: Vec<String> = pend
         .iter()
         .flat_map(|pd| ["pos", "neg", "at"].into_iter().filter_map(|k| pd.el.get(k).and_then(|v| v.as_str()).map(str::to_string)).collect::<Vec<_>>())
+        .collect();
+    // nets already tied to ground at RF by a modelled short (decoupling capacitors as "short" elements, or
+    // "decouple"): a pin load there would close a tiny LC loop through the short and the vias that rings on
+    // its own (MTH, Nov 2026: about 2.15 GHz, Q 20-35, on the DEC and 3V3 pins), so those pins are skipped
+    let shorted_nets: Vec<String> = pend
+        .iter()
+        .filter(|pd| !pd.port && pd.el.get("kind").and_then(|v| v.as_str()) == Some("short"))
+        .flat_map(|pd| {
+            let layer = pd.el.get("layer").and_then(|v| v.as_str()).unwrap_or("F.Cu").to_string();
+            ["pos", "neg"]
+                .into_iter()
+                .filter_map(|k| pd.el.get(k))
+                .filter_map(|v| cx.locate(v, Some(&layer)).ok())
+                .filter_map(|(c, _)| cx.net_at(c, &layer))
+                .collect::<Vec<_>>()
+        })
+        .filter(|n| { let u = n.to_ascii_uppercase(); !u.contains("GND") && !u.contains("VSS") })
         .collect();
     for d in sp.get("pin_loads").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
         let rf = d.get("ref").and_then(|v| v.as_str()).ok_or("pin_loads entry needs \"ref\"")?.to_string();
@@ -345,7 +362,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             return Err(format!("pin_loads: no pads of {rf} in the Gerber X2 attributes"));
         }
         let gnd = |n: &Option<String>| n.as_deref().is_some_and(|s| { let u = s.to_ascii_uppercase(); u.contains("GND") || u.contains("VSS") });
-        let (mut added, mut skipped_gnd, mut skipped_used, mut no_return) = (0, 0, 0, 0);
+        let (mut added, mut skipped_gnd, mut skipped_used, mut skipped_dec, mut no_return) = (0, 0, 0, 0, 0);
         for (pin, (layer, bb, net)) in &pins {
             if (!only.is_empty() && !only.contains(pin)) || except.contains(pin) {
                 continue;
@@ -356,6 +373,10 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             }
             if used_pads.iter().any(|u| u == &format!("{rf}.{pin}")) {
                 skipped_used += 1;
+                continue;
+            }
+            if !d.get("load_decoupled").and_then(|v| v.as_bool()).unwrap_or(false) && net.as_ref().is_some_and(|n| shorted_nets.contains(n)) {
+                skipped_dec += 1;
                 continue;
             }
             let to = match d.get("to").and_then(|v| v.as_str()) {
@@ -385,7 +406,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             added += 1;
         }
         eprintln!(
-            "fieldsolve: pin_loads {rf}: {added} pins loaded ({}), {skipped_gnd} ground pins and {skipped_used} pins used by ports/elements skipped{}",
+            "fieldsolve: pin_loads {rf}: {added} pins loaded ({}), {skipped_gnd} ground pins, {skipped_dec} pins on nets shorted to ground by an element and {skipped_used} pins used by ports/elements skipped{}",
             match (c > 0.0, r > 0.0) { (true, true) => format!("{:.2} pF || {r} ohm", c * 1e12), (true, false) => format!("{:.2} pF", c * 1e12), _ => format!("{r} ohm") },
             if no_return > 0 { format!("; {no_return} land on no ground copper on the other layer (those loads float)") } else { String::new() }
         );
@@ -1323,9 +1344,11 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             // far-field runs: a mode still ringing at the stop makes efficiency within about f/Q of it
             // mesh-sensitive (MTH PIFA, Nov 2026: a Q 70-80 board mode, about 0.05 GHz wide, moved 150 MHz
             // between meshes and cut efficiency by up to 12 points at single frequencies)
-            if far.is_some() && rate < 0.0 && rate > -5.0 {
-                let f = f_ring.unwrap_or(st.fmax / 3.0);
-                let q = q_at(f);
+            // Q above 30 at the ringing frequency (at 2.4 GHz: energy falling slower than about 2.2 dB/ns); an
+            // antenna's own loaded ringing (Q 10-20) is not flagged
+            let f = f_ring.unwrap_or(st.fmax / 3.0);
+            let q = q_at(f);
+            if far.is_some() && rate < 0.0 && q > 30.0 {
                 let msg = format!(
                     "port {}: a high-Q mode is still ringing at the stop (field energy {:+.2} dB/ns; late-time signal near {:.3} GHz, Q about {:.0}). \
                      Efficiency within about f/Q ({:.0} MHz) of it is mesh-sensitive: list far-field frequencies 0.02-0.05 GHz apart \

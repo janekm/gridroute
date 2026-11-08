@@ -199,20 +199,26 @@ candidates in about a minute.
   - **The board mode near 2.25 GHz** is a resonance of two signal tracks, P1_04 and SWDCLK. They run
     side by side from U12 to header H5 (24.7 mm and about 32 mm), and they are open at the chip end
     because the chip isn't modelled.
-  - **Loading U12's pins removes most of that dip.** The fix is `"pin_loads": [{"ref": "U12", "c":
-    3e-12}]`, nRF52840 pad capacitance on all 71 signal pins. These are antenna-alone runs at C20 with
-    real copper, fixed edges and 21 far-field frequencies:
+  - **Loading U12's pins removes that dip.** The fix is `"pin_loads": [{"ref": "U12", "c": 3e-12}]`, the
+    nRF52840's pad capacitance. It loads 59 signal pins; the 12 DEC and 3V3 pins, already shorted to ground
+    by their decoupling capacitors, are skipped. These are antenna-alone runs at C20 with real copper,
+    fixed edges and 21 far-field frequencies:
 
     | | 2.20 | 2.25 | 2.30 | 2.40 | 2.45 | 2.50 GHz | mean 2.40-2.48 |
     |---|---|---|---|---|---|---|---|
     | U12 pins open | 84.0 | 82.4 | 83.9 | 84.8 | 82.8 | 81.3 % | 83.8 % |
-    | U12 pins loaded, 3 pF | 87.3 | 86.7 | 87.7 | 87.2 | 84.7 | 82.5 % | 85.9 % |
+    | U12 signal pins loaded, 3 pF | 88.0 | 88.9 | 89.0 | 83.4 | 81.4 | 81.2 % | 82.4 % |
+    | *all 71 pins loaded (artefact, see below)* | *87.3* | *86.7* | *87.7* | *87.2* | *84.7* | *82.5 %* | *85.9 %* |
 
-    - The feed impedance moves by under 2 Ω (49.0 → 50.6 Ω real at 2.44 GHz), so the ladder conclusions
+    - Loading the decoupled pins too closed tiny LC loops (pad, decoupling short, vias, 3 pF) that rang at
+      2.15 GHz with a Q of 20-35 and inflated in-band efficiency. `"pin_loads"` now skips those pins.
+    - The feed impedance moves by under 2 Ω (49.0 → 48.8 Ω real at 2.44 GHz), so the ladder conclusions
       stand.
-    - Against the stand-in-copper values above, the loaded model's in-band efficiency is about 3 points
-      lower, about 0.15 dB.
-    - A weaker ringing mode remains near 2.49 GHz (Q about 57).
+    - In band, the efficiency stays within about 1.5 points of the open-pin model. With real copper, the
+      antenna radiates about 81-83 % over 2.40-2.50 GHz.
+    - What still rings is the antenna's own decay (Q about 13-19), plus a weaker component (Q about 25)
+      around the VCC3V3 via beside C30, probably current circulating in that decoupling short's loop
+      (not confirmed). Neither leaves a dip in the efficiency spectrum.
   - Single-frequency values can land on such a dip. A re-run should use a dense far-field grid
     (0.02-0.05 GHz) and band averages ([fieldsolve-settings.md](fieldsolve-settings.md)).
   - The ranking of the ladder options is the same on both meshes.
