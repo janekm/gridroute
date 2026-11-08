@@ -12,6 +12,11 @@ cable plugs into J3.
   in the pocket, and −7.5 to −11.6 dB in total from 50 Ω, depending on the cable. In free space on 1.05 mm of
   PC/ABS it is 85-89 %. The part appears tuned for about 0.7 mm of plastic. See
   [the YL1439 section](#the-force-yl1439-bt-v1-the-fpc-used-on-other-boards).
+- **On the side wall beside J3, the YL1439 itself radiates 69-81 % without the cable.** But it is detuned to
+  2-4 Ω, and the modelled cable route drags it down to 17-27 %. It needs a retune and a controlled cable
+  route; see [the side wall](#the-yl1439-bt-v1-on-the-side-wall). The result is from a single mesh.
+- **Johanson's 2450AT42E chip antenna** measures 21 % on a 50 × 30 mm evaluation board. It needs In1/In2
+  cleared under it on this 4-layer board; see [the chip antenna](#a-chip-antenna-on-the-board).
 - The rest of this summary is about the stand-in dipole first modelled for the "Molex 146153 class" part.
 - **The pocket puts the FPC about 8.3 mm above the board's ground, parallel to it, and that wrecks it.**
   - The board is 50 × 28 mm, a 4-layer 0.8 mm board with ground on the inner layers, and it fills the
@@ -150,6 +155,69 @@ the Molex part, so the pocket would grow to about 36.5 × 10.4 mm.
     only retune it.
 
 ![YL1439-BT-V1: |S11| against the plastic thickness in free space (left), and installed on three meshes against free space (right)](img/ebus_yl1439_cases.jpg)
+
+## The YL1439-BT-V1 on the side wall
+
+- **Placement:** on the cover's inner wall along KiCad y = 0, the J3 side.
+  - The copper faces into the box at y −0.05, about 0.05 mm outside the board's edge plane.
+  - The long axis runs along x from x 4.5. The 3.5 mm copper band is at z 2.9-6.4, so the arm is the part
+    farthest above the board (z 4.8-6.0) and the ground strip the nearest (z 2.9-4.3).
+  - The FPC's blank top margin would bend round the top fillet (inside radius 2.1).
+  - The H1 boss's web (x 19.7) meets this wall, so a real FPC would need a notch in the web or a shift.
+  - The cable shield runs along the FPC from the braid pad to past its end, down to z 3.0 at x 41, then
+    straight to J3.
+- **Model:** the copper is metal boxes standing vertically (`"metal": true`; lossless, no edge corrections),
+  fed by a free-standing port (`"p0"`/`"p1"`) across the slot.
+  - On a vertical 1.05 mm plate in free space this copy resonates about 2.5 % (60 MHz) above the horizontal
+    sheet model. Read the frequencies below with that bias in mind.
+  - Single mesh (0.07 mm), not yet checked on a finer one.
+
+![YL1439-BT-V1 on the side wall, seen from inside](img/ebus_yl1439_wall.jpg)
+
+| 0.07 mm mesh | Z at 2.44 GHz | S11 at 2.40-2.50 | radiation efficiency 2.40 / 2.44 / 2.48 / 2.50 GHz | total from 50 Ω |
+|---|---|---|---|---|
+| lid pocket, cable shield | 26 + j81 Ω | −1.3 to −5.2 dB | 31.5 / 25.6 / 25.7 / 26.3 % | −7.4 to −11.0 dB |
+| lid pocket, no cable | 5 − j7 Ω | −1.1 to −3.0 dB | 36.2 / 39.9 / 39.7 / 44.6 % | −7.5 to −10.1 dB |
+| side wall, cable shield | 8 + j54 Ω | −1.0 to −2.2 dB | 16.7 / 19.3 / 23.5 / 26.6 % | −9.8 to −14.8 dB |
+| side wall, no cable | 3 + j14 Ω | −0.8 to −1.4 dB | 73.7 / 81.3 / 70.8 / 69.0 % | −6.8 to −9.6 dB |
+
+![Lid pocket and side wall, with and without the cable shield: |S11| (left), radiation efficiency and total (right)](img/ebus_yl1439_placements.jpg)
+
+- **On the wall, the FPC itself radiates well: 69-81 % without the cable.** Standing beside the board edge,
+  instead of over the ground plane, it isn't shorted out by its image.
+  - Its resonance falls to about 2.25-2.3 GHz, and in band it sees only 2-4 Ω, so from 50 Ω almost
+    everything reflects.
+  - It would need a retune for this mounting: a shorter arm (the vendor's custom tuning), or a match at the
+    FPC.
+- **The modelled cable route spoils it: 17-27 %, with a cable mode at 1.70 GHz (Q about 26).** The shield
+  runs 2.3 mm over the board from the wall to J3. In both placements the cable's outer surface is part of the
+  antenna, so its route and length decide much of the result. A short, direct route along the wall to J3, or
+  a ferrite or sleeve choke on the cable, are the obvious things to try.
+- **Neither placement gives a usable antenna as the part comes.** The side wall is the better mounting
+  (69-81 % against 36-45 % for the bare FPC) if the FPC is retuned and the cable route controlled.
+
+## A chip antenna on the board
+
+The chip antenna on file in p-hw is Johanson's **2450AT42E0100001E** (`docs/antenna/C17605137/`, LCSC
+C17605137). It is a 5.0 × 2.0 × 1.5 mm "above metal" LTCC part for the centre of a board edge, and it needs no
+ground clearance. The p-hw folder also holds VNA sweeps of it on three board shapes, but no efficiency
+measurements.
+
+- **Johanson's evaluation board is 50 × 30 mm,** about the eBus board's 50 × 28 mm.
+  - Measured average radiated efficiency is **21 %**, average gain −5.0 dBi and peak gain −2.0 dBi.
+  - Return loss is only 4.4 dB minimum over 2.40-2.48 GHz (S11 −5.7 / −11.3 / −5.7 dB at 2.40 / 2.44 /
+    2.48 GHz), so it is narrow even with its match.
+- **Its efficiency depends on the distance H to the metal under it.** Johanson's simulation on a 30 × 50 mm
+  board gives 1.95 % at H = 0.12 mm, 29.2 % at 0.7 mm, 23.3 % at 1.5 mm and 21.6 % at 2.5 mm. A 1.1-2.5 mm
+  variant, 2450AT42E010B001E, reaches 38-42 %.
+  - On the eBus 4-layer board, In1 (ground) is 0.21 mm under the top copper, which would put it near the
+    bottom of that table.
+  - Clearing In1 and In2 under the chip moves the nearest metal to B.Cu, about 0.67 mm down, which is the
+    29 % case.
+- **It can't be modelled from first principles here.** The internal LTCC structure isn't published. A
+  stand-in would have to be a lumped resonator on the pads, calibrated against the evaluation board's S11 and
+  21 % efficiency, and that only transfers the board and enclosure effects. Johanson offers its CAD layout
+  and tuning support on request.
 
 ## Caveats
 

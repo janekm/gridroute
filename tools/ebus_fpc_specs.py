@@ -8,6 +8,7 @@ pocket (centred x 20.0, y 16.4), copper at z 9.00 on a 0.1 mm polyimide carrier 
     python3 ebus_fpc_specs.py free NAME RET [ff] [dry]            FPC on a 1.05 mm PC/ABS plate in free space
     python3 ebus_fpc_specs.py inst NAME RET [ff] [nocable] [dry]  in the enclosure over the board
     ... [yl1439] [air]: the FORCE YL1439-BT-V1 instead of the stand-in (RET ignored); "air" drops the lid plate
+    python3 ebus_fpc_specs.py wall NAME 0 [ff] [nocable] [dry]   the YL1439-BT-V1 on the side wall by J3
 
 Run from a directory holding `gbr/` (the board's Gerbers, exports/fab/gerbers at p-hw 81d5260c) and, for
 "free", `dummy_gbr/` (a 0.2 mm board of air with one 0.02 mm pad, so that only the FPC and plate are
@@ -173,10 +174,73 @@ def use_yl1439(s, installed, cable):
     return s
 
 
+def poly_strips(poly, dv=0.05):
+    """A polygon (FPC frame, v down) as horizontal strips [(u0, u1, v0, v1)], from scanlines at the strip centres."""
+    vs = [y for _, y in poly]
+    out = []
+    v = min(vs)
+    while v < max(vs) - 1e-9:
+        vc = v + dv / 2
+        xs = []
+        n = len(poly)
+        for i in range(n):
+            (x0, y0), (x1, y1) = poly[i], poly[(i + 1) % n]
+            if (y0 <= vc < y1) or (y1 <= vc < y0):
+                xs.append(x0 + (vc - y0) * (x1 - x0) / (y1 - y0))
+        xs.sort()
+        for a, b in zip(xs[0::2], xs[1::2]):
+            out.append((a, b, v, min(v + dv, max(vs))))
+        v += dv
+    return out
+
+
+def side_wall(name, ff, cable=True):
+    """The YL1439-BT-V1 on the cover's inner wall along KiCad y = 0 (the J3 side), copper facing in at y -0.05,
+    long axis along x from x 4.5, copper band at z 2.9..6.44 (its blank top margin would bend round the
+    fillet). The copper is metal boxes (lossless); the 0.1 mm carrier a thin box against the wall."""
+    s = inst(name, 0, ff, cable=False)
+    s['cell'] = 0.07
+    x0, ycu, zt = 4.5, -0.05, 2.9 + 7.93
+    s['layers'] = []
+    boxes = []
+    for kind, g in YL1439:
+        strips = [(g[0], g[2], g[1], g[3])] if kind == 'rect' else poly_strips(g)
+        for (u0, u1, v0, v1) in strips:
+            boxes.append([round(x0 + u0, 4), ycu, round(zt - v1, 4), round(x0 + u1, 4), ycu, round(zt - v0, 4)])
+    s['bodies'] = [b for b in s['bodies'] if b['name'] != 'fpc_carrier']
+    s['bodies'].append({'name': 'fpc_carrier', 'box': [x0, -0.15, zt - 10.0 + 0.0, x0 + YL_W, ycu, min(zt, 7.5)], 'eps': 3.4, 'tand': 0.005})
+    s['bodies'] += [{'name': f'fpc_cu{i}', 'box': b, 'metal': True} for i, b in enumerate(boxes)]
+    (fa, fb) = ((29.58, 6.4), (30.40, 6.4))
+    s['ports'] = [{'name': 'FPC', 'p0': [x0 + fb[0], ycu, zt - fb[1]], 'p1': [x0 + fa[0], ycu, zt - fa[1]], 'r': 50}]
+    s['roi'] = [x0 - 1.0, -1.5, x0 + YL_W + 1.0, 1.5]
+    if cable:
+        # shield: along the FPC from the braid pad past its end (a 1.13 mm square bar against the copper),
+        # down at x_end to z 3.0 above the board, across to J3, and the plug's shell to J3's ground pads
+        zb = zt - YL_BRAID[1]
+        xb, xe = x0 + YL_BRAID[0], x0 + YL_W + 0.6
+        jx, jy = 24.227, 3.72
+        s['bodies'] += [
+            {'name': 'cable along FPC', 'box': [xb, ycu, zb - 0.565, xe + 0.565, ycu + 1.13, zb + 0.565], 'metal': True},
+            {'name': 'cable down', 'cylinder': [xe, ycu + 0.565, 0.56, 3.0, zb], 'metal': True},
+            {'name': 'plug shell L', 'cylinder': [22.757 + 0.3, 3.72, 0.5, 0.5, 3.0], 'metal': True},
+            {'name': 'plug shell R', 'cylinder': [25.697 - 0.3, 3.72, 0.5, 0.5, 3.0], 'metal': True},
+        ]
+        s['layers'] = [{'name': 'CABLE', 'z': 3.0, 'net': 'SHIELD', 'polygons': [strip(xe, ycu + 0.565, jx, jy + 0.6, 1.13)], 'rects': [[jx - 1.6, jy - 0.6, jx + 1.6, jy + 1.6]]}]
+    return s
+
+
 if __name__ == '__main__':
     kind, name, ret = sys.argv[1], sys.argv[2], float(sys.argv[3])
     ff = 'ff' in sys.argv[4:]
     cable = 'nocable' not in sys.argv[4:]
+    if kind == 'wall':
+        s = side_wall(name, ff, cable)
+        if 'dry' in sys.argv[4:]:
+            s['max_steps'] = 20
+            s['scene'] = True
+        json.dump(s, open(name + '.json', 'w'), indent=1)
+        print('wrote', name + '.json')
+        sys.exit()
     s = free(name, ret, ff) if kind == 'free' else inst(name, ret, ff, cable=cable)
     if 'yl1439' in sys.argv[4:]:
         s = use_yl1439(s, kind == 'inst', cable)
