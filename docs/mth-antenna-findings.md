@@ -51,6 +51,12 @@ RF path, as populated:
   1BP as built and −49.3 dB for Nordic's reference layout. C59's ground pad is flooded into the top pour,
   the same deviation found on 1BP ([1bp-rf-findings.md](1bp-rf-findings.md)). The same fix should apply:
   an isolated return to VSS_PA. That fix hasn't been simulated here.
+- **The bottom-layer 3.3 V copper costs about 4 points of efficiency in band.** VCC3V3 is poured on B.Cu as
+  a U-shaped strip along three board edges, with its open ends next to the RF corner, and drops to B.Cu in
+  short jogs beside C30 and C16. With all of it turned into ground, the antenna radiates 86.9 / 85.6 /
+  84.2 % at 2.40 / 2.45 / 2.50 GHz instead of 83.5 / 81.4 / 81.3 %, and its impedance doesn't move.
+  Passing 90 % also needs a lower-loss laminate or less FR4 under the antenna (see
+  [Efficiency](#efficiency-losses-and-the-33-v-ring)).
 - **Retune again after trimming.** The trimmed antenna in the enclosure will present a different feed
   impedance. Re-run the EM model on the trimmed copper, plus the enclosure if there is data, and repeat
   the retune. The retune takes about a minute and the 7-port EM run about 30 minutes.
@@ -219,8 +225,8 @@ candidates in about a minute.
     - In band, the efficiency stays within about 1.5 points of the open-pin model. With real copper, the
       antenna radiates about 81-83 % over 2.40-2.50 GHz.
     - What still rings is the antenna's own decay (Q about 13-19), plus a weaker component (Q about 25)
-      around the VCC3V3 via beside C30, probably current circulating in that decoupling short's loop
-      (not confirmed). Neither leaves a dip in the efficiency spectrum.
+      around the VCC3V3 via beside C30. That component is the bottom-layer 3.3 V copper, and it does take
+      in-band efficiency: see [Efficiency](#efficiency-losses-and-the-33-v-ring).
   - Single-frequency values can land on such a dip. A re-run should use a dense far-field grid
     (0.02-0.05 GHz) and band averages ([fieldsolve-settings.md](fieldsolve-settings.md)).
   - The ranking of the ladder options is the same on both meshes.
@@ -231,6 +237,55 @@ candidates in about a minute.
   examined in [1bp-rf-findings.md](1bp-rf-findings.md).
 - **The harmonic levels** are per watt into a 50 Ω port. The chip's real harmonic source impedance is
   unknown, and the model's levels near the nulls are mesh-sensitive by a few dB.
+
+## Efficiency: losses and the 3.3 V ring
+
+Antenna-alone runs at C20 (`"preset": "antenna"`, fitted decoupling shorts only, U12 pins loaded with 3 pF,
+far field every 0.05 GHz). Efficiency is the radiated share of the power accepted at C20:
+
+| Model | 2.30 | 2.35 | 2.40 | 2.45 | 2.50 | 2.55 GHz | Z at 2.44 GHz |
+|---|---|---|---|---|---|---|---|
+| as built (FR4 tan δ 0.015, real copper) | 89.0 | 86.8 | 83.5 | 81.4 | 81.3 | 81.8 % | 49 − j1 Ω |
+| **B.Cu all GND (no 3.3 V on the bottom layer)** | **88.9** | **88.1** | **86.9** | **85.6** | **84.2** | **82.1 %** | **50 − j1 Ω** |
+| laminate tan δ 0.008 | 92.8 | 90.4 | 86.9 | 85.1 | 85.8 | 87.0 % | 46 − j2 Ω |
+| laminate tan δ 0.004 | 95.2 | 92.7 | 88.8 | 87.3 | 88.9 | 90.3 % | 45 − j3 Ω |
+| solder mask (0.02 mm, εr 3.8, tan δ 0.025, modelled as an equivalent 0.04 mm, εr 2.4 layer) | 87.2 | 87.2 | 85.9 | 82.2 | 78.3 | 76.5 % | 40 + j8 Ω |
+| meander widened to 1.0 mm (not retuned) | 89.0 | 87.6 | 85.5 | 83.8 | 82.9 | 83.0 % | 60 − j33 Ω |
+| lossless copper | 93.1 | 91.6 | 87.7 | 84.5 | 83.8 | 85.4 % | 49 − j4 Ω |
+| lossless FR4 | 97.6 | 95.0 | 90.9 | 89.7 | 91.9 | 93.8 % | 43 − j3 Ω |
+
+- **Where the loss goes.** At 2.40 GHz, the FR4 takes about 7 points and the copper about 4. In the
+  lossless model a board mode near 2.47 GHz keeps ringing with a Q of several hundred, so it hardly
+  radiates. With real losses its Q is about 25: it absorbs power in band, which is why efficiency drops from
+  89 % at 2.30 GHz to 81-83 % in band. Stopping on the field energy instead of the port signal gives the same
+  in-band figure (82.4 against 82.5 %), so the dip isn't an early-stop artefact.
+- **The mode lives on the bottom-layer 3.3 V copper.** B.Cu is a ground pour, but the VCC3V3 zone
+  (priority 500, above GND's 499) is a U-shaped strip about 1.7 mm wide along the left, bottom and right
+  edges. Its open ends sit at y 81.65 (left) and y 86.6 (right), near the RF corner. VCC3V3 also drops to
+  B.Cu in five short jogs: beside C30 under the SWD tracks, two into the left strip near C16 and C8, and two
+  further down. In the as-built run the driven current at 2.45 GHz runs along the strip's edges, through
+  those vias and along the top-layer 3.3 V track to C16. The late-time ringing centres on the via beside C30.
+- **The variant turns all of that copper into ground.** The VCC3V3 zone and jogs become GND pour, and the
+  22 VCC3V3 holes (21 vias and H5 pin 3) are dropped, so nothing shorts 3.3 V to the new ground. It is
+  built by `tools/mth_bcu_gnd_variant.py`. The top-layer 3.3 V copper is unchanged, and the decoupling shorts
+  still ground it locally. The new 3.3 V distribution isn't modelled: top-layer tracks, with any crossings
+  far from the RF corner.
+  - In band, efficiency rises by 3.4 / 4.2 / 2.9 points at 2.40 / 2.45 / 2.50 GHz (mean of 2.40 and
+    2.45 GHz: 82.5 → 86.3 %).
+  - The feed impedance doesn't move, so the ladder retune stands.
+  - The B.Cu ringing at 2.47 GHz is gone. What remains is the antenna's own decay (Q about 12) and the
+    P1_04 / SWDCLK track mode near 2.2 GHz (Q about 15).
+- **To pass 90 % at the antenna,** the 3.3 V change alone isn't enough: 86-87 % is left, mostly FR4 and
+  copper loss. Of the levers above, a lower-loss laminate and keeping fields out of the FR4 under the radiator
+  are the large ones. The meander gain needs a retune of the arm before it counts. None of the
+  combinations has been simulated yet, and the matching network loses another 0.3-0.5 dB before the chip
+  pin.
+
+![Bottom copper: as built, with the VCC3V3 zone and jogs in blue, and the variant with all of it ground](img/mth7_bcu_3v3.jpg)
+
+![Bottom copper current, as built (top) and with B.Cu all ground (bottom): driven at 2.45 GHz (left), late-time ringing (right)](img/mth7_3v3_loops_BCu.jpg)
+
+![The same on the top copper: the current along the 3.3 V track to C16 and around C30 is gone](img/mth7_3v3_loops_FCu.jpg)
 
 ## DEC5 against Nordic's layout
 
