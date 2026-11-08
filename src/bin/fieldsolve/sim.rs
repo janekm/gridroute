@@ -284,7 +284,11 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             posts.push(Barrel { c: cx.pt(c[0], c[1]), r: c[2], z0: c[3].min(c[4]), z1: c[3].max(c[4]) });
             continue;
         }
-        let eps = b.get("eps").and_then(|v| v.as_f64()).ok_or_else(|| format!("body {name} needs \"eps\""))?;
+        let metal = b.get("metal").and_then(|v| v.as_bool()).unwrap_or(false);
+        let eps = if metal { 1.0 } else { b.get("eps").and_then(|v| v.as_f64()).ok_or_else(|| format!("body {name} needs \"eps\""))? };
+        if metal && b.get("box").is_none() {
+            return Err(format!("body {name}: metal bodies are boxes or cylinders"));
+        }
         let tand = num(b, "tand", 0.0);
         let shape = if let Some(v) = nums("box") {
             if v.len() != 6 {
@@ -308,7 +312,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         } else {
             return Err(format!("body {name} needs \"box\", \"stl\" or \"cylinder\""));
         };
-        bodies.push(crate::bodies::Body { name, eps, tand, shape });
+        bodies.push(crate::bodies::Body { name, eps, tand, shape, metal });
     }
     let cell = num(&sp, "cell", 0.1);
     let fmax = num(&sp, "fmax", 3e9);
@@ -525,11 +529,42 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         /// pads not on a common mesh line (a part rotated by e.g. 45°): a one-cell staircase bar along the
         /// mesh from each pad centre to a one-cell gap at the part's midpoint
         Diag { a: P2, b: P2, m: P2, axis: usize, z: f64, layer: String },
+        /// between two 3-D points on one axis line ("p0", "p1"): copper off the sheets (metal boxes)
+        Raw { lo: [f64; 3], hi: [f64; 3], axis: usize, plus_hi: bool },
     }
     let mut geos = Vec::new();
     let mut bars = Vec::new();
     for pd in &pend {
         let e = &pd.el;
+        // "p0"/"p1": [x, y, z] (spec x/y, mm), differing along one axis; the element fills the edges between
+        // them, so put them on the copper edges either side of the gap. The + terminal is at p1.
+        if let (Some(p0), Some(p1)) = (e.get("p0"), e.get("p1")) {
+            let pt3 = |v: &Value| -> Result<[f64; 3], String> {
+                let a: Vec<f64> = v.as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+                if a.len() != 3 {
+                    return Err(format!("{}: p0/p1 are [x, y, z]", pd.name));
+                }
+                let p = cx.pt(a[0], a[1]);
+                Ok([p.x, p.y, a[2]])
+            };
+            let (a, b) = (pt3(p0)?, pt3(p1)?);
+            let diff: Vec<usize> = (0..3).filter(|&k| (a[k] - b[k]).abs() > 1e-9).collect();
+            if diff.len() != 1 {
+                return Err(format!("{}: p0 and p1 must differ along exactly one axis", pd.name));
+            }
+            let axis = diff[0];
+            let (mut lo, mut hi) = (a, a);
+            lo[axis] = a[axis].min(b[axis]);
+            hi[axis] = a[axis].max(b[axis]);
+            for (k, list) in [&mut fx, &mut fy, &mut fz].into_iter().enumerate() {
+                list.insert(0, lo[k]);
+                if k == axis {
+                    list.insert(0, hi[k]);
+                }
+            }
+            geos.push(Geo::Raw { lo, hi, axis, plus_hi: b[axis] > a[axis] });
+            continue;
+        }
         if let Some(at) = e.get("at") {
             let from = e.get("from").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
             let to = e.get("to").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
@@ -673,6 +708,16 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         }
         out
     };
+    // a mesh line on the plane of each metal sheet standing in x or y (bodies)
+    for b in bodies.iter().filter(|b| b.metal) {
+        let (lo, hi) = b.bounds();
+        if hi[0] - lo[0] < 1e-9 {
+            fx.insert(0, lo[0]);
+        }
+        if hi[1] - lo[1] < 1e-9 {
+            fy.insert(0, lo[1]);
+        }
+    }
     let (fx, fy) = (merge(&fx), merge(&fy));
     // "refine": [{"box": [x0, y0, x1, y1]} | {"pads": ["C20.1", ..]} | {"ports": true}, "cell": mm, "margin":
     // mm]: extra fine regions (a coarse fidelity policy protects ports, feeds, gaps and stubs this way). On
@@ -728,6 +773,16 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let mut zref_b: Vec<Refine> = Vec::new();
     let mut mc_b: Vec<(f64, f64, usize)> = Vec::new();
     for (b, (lo, hi)) in bodies.iter().zip(&body_bounds) {
+        if b.metal {
+            // copper standing in a vertical plane: the fine cell over it, and a mesh line on its plane
+            rx.push(Refine { a: lo[0], b: hi[0], h: cell });
+            ry.push(Refine { a: lo[1], b: hi[1], h: cell });
+            zref_b.push(Refine { a: lo[2], b: hi[2], h: cell });
+            if hi[2] - lo[2] < 1e-9 && !fz.iter().any(|&f| (f - lo[2]).abs() < 0.75 * cell) {
+                fz.push(lo[2]);
+            }
+            continue;
+        }
         rx.push(Refine { a: lo[0], b: hi[0], h: body_cell });
         ry.push(Refine { a: lo[1], b: hi[1], h: body_cell });
         zref_b.push(Refine { a: lo[2], b: hi[2], h: body_cell });
@@ -825,6 +880,9 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         let r = num(e, "r", if pd.port { 50.0 } else { 0.0 });
         let c = num(e, "c", 0.0);
         match g {
+            Geo::Raw { lo, hi, axis, plus_hi } => {
+                lumped.push(Lumped { name: pd.name.clone(), axis: *axis, lo: *lo, hi: *hi, plus_at_hi: *plus_hi, r: if kind == "short" { 0.0 } else { r }, c, port: pd.port });
+            }
             Geo::Vert { c: ctr, half, z0, z1, plus_hi } => {
                 lumped.push(Lumped {
                     name: pd.name.clone(),

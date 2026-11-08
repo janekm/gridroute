@@ -172,6 +172,14 @@ Ports and elements come in two forms:
   could have no metal at one end: they carried source and probe without being in the circuit, which read
   as a flat 2-14 % "loss" in the port.
 
+- **Free-standing, between two 3-D points.** `"p0"`/`"p1"`: `[x, y, z]` (spec x/y, z in mm), differing
+  along one axis. The element fills the edges between them, so put the points on the copper edges on either
+  side of the gap. The + terminal is at `p1`. Use this for ports on copper off the sheets, such as metal
+  boxes standing vertically. Mesh lines are added through both points.
+  - Checked on a half-wave dipole of two 29 × 1 mm zero-thickness strips standing in a vertical plane, fed
+    across a 1 mm gap: it resonates at 2.37 GHz with R = 71 Ω (theory about 73 Ω), and its directivity is
+    2.12-2.19 dBi (theory 2.15 dBi).
+
 `"edges": true` (or an object, see [Sub-cell copper edges](#sub-cell-copper-edges)) turns on the
 conformal and edge-singularity corrections of the copper edges. `"mesh": {"no_slivers": true, "z_grade":
 3.0, "copper_bands": {...}}` refines the mesh from the layout (`meshpol.rs`; measured in
@@ -196,6 +204,15 @@ running to it aren't open-ended stubs ([fieldsolve-settings.md](fieldsolve-setti
   - `{"box": [x0, y0, z0, x1, y1, z1], "eps", "tand"}` is in spec coordinates, for example an FPC's carrier.
   - `{"cylinder": [x, y, r, z0, z1], "metal": true}` is a vertical metal post (a screw, a cable shield's
     riser), added as a barrel. It connects to any copper sheet it crosses.
+  - `{"box": [x0, y0, z0, x1, y1, z1], "metal": true}` is a perfect conductor. With zero extent along one
+    axis, it is a sheet on the mesh plane there (a mesh line is added), so copper can stand in a vertical
+    plane, as an FPC on a side wall does. Boxes join wherever they touch:
+    - a node is metal if it lies in any metal box;
+    - an edge is metal if both of its nodes are.
+
+    So a polygon can be given as strips thinner than a cell. Mind that two sheets less than a cell apart
+    join too. These sheets have no conductor loss and no sub-cell edge corrections. A vertical copy of the
+    YL1439 FPC on a plate resonated 2.5 % above the horizontal sheet model.
   - Meshing: cells of at most `"body_cell"` (default 0.4 mm, a third of a 1.2 mm moulded wall) over each
     body. A box gets fixed lines at its z faces, and two cells across it if it is thinner than four body
     cells. Each body prints the number of cells it fills, with a warning if that is zero.

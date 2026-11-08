@@ -682,7 +682,7 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
         .collect();
     // (eps_r or eps_inf, sigma, slab index for the poles) of cell (i,j,k); out-of-range cells are air
     let body_of = crate::bodies::body_cells(g, &lay.bodies);
-    for (bi, b) in lay.bodies.iter().enumerate() {
+    for (bi, b) in lay.bodies.iter().enumerate().filter(|(_, b)| !b.metal) {
         let n = body_of.iter().filter(|&&v| v as usize == bi + 1).count();
         eprintln!("fieldsolve: body {}: eps {} tan d {} in {n} cells", b.name, b.eps, b.tand);
         if n == 0 {
@@ -949,6 +949,11 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
                 cb[2][id] = 0.0;
             }
         }
+    }
+    // metal boxes (sheets in any axis plane, bodies.rs)
+    for (a, id) in crate::bodies::metal_edges(g, &lay.bodies) {
+        ca[a][id] = 0.0;
+        cb[a][id] = 0.0;
     }
     // conformal edges: metal by the midpoint rule, but mostly open
     if let Some(fx) = &efix {

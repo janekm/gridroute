@@ -19,6 +19,10 @@ pub struct Body {
     pub eps: f64,
     pub tand: f64,
     pub shape: BodyShape,
+    /// A perfect conductor instead of a dielectric (boxes only): every E edge whose two end nodes lie in the
+    /// box is metal. A box of zero extent along one axis is a sheet on the mesh plane nearest to it, so copper
+    /// can stand in any axis plane (an FPC antenna on an enclosure's side wall).
+    pub metal: bool,
 }
 
 impl Body {
@@ -94,6 +98,9 @@ pub fn body_cells(g: &Grid, bodies: &[Body]) -> Vec<u16> {
     // cells whose centre lies in [a, b]
     let span = |c: &[f64], a: f64, b: f64| -> (usize, usize) { (c.partition_point(|&x| x < a), c.partition_point(|&x| x <= b)) };
     for (bi, body) in bodies.iter().enumerate() {
+        if body.metal {
+            continue;
+        }
         let tag = (bi + 1).min(u16::MAX as usize) as u16;
         match &body.shape {
             BodyShape::Box { lo, hi } => {
@@ -158,6 +165,55 @@ pub fn body_cells(g: &Grid, bodies: &[Body]) -> Vec<u16> {
     out
 }
 
+/// E edges made metal by the metal boxes: (axis, node index) pairs. A node is metal when it lies in any metal
+/// box (with a 1e-6 mm tolerance; along an axis where the box has zero extent, the nearest node), and an edge is
+/// metal when both its nodes are. Boxes that touch or overlap therefore join even where no mesh line falls on
+/// their shared face, so polygons can be given as strips thinner than a cell; two sheets less than a cell
+/// apart join too.
+pub fn metal_edges(g: &Grid, bodies: &[Body]) -> Vec<(usize, usize)> {
+    let lines: [Vec<f64>; 3] = [g.x.iter().map(|v| v * 1e3).collect(), g.y.iter().map(|v| v * 1e3).collect(), g.z.iter().map(|v| v * 1e3).collect()];
+    let (nx, ny, nz) = (g.nx(), g.ny(), g.nz());
+    let mut on = vec![false; g.n()];
+    let mut nodes = Vec::new();
+    for body in bodies.iter().filter(|b| b.metal) {
+        let BodyShape::Box { lo, hi } = &body.shape else { continue };
+        let mut r = [(0usize, 0usize); 3];
+        for a in 0..3 {
+            let l = &lines[a];
+            r[a] = if hi[a] - lo[a] < 1e-9 {
+                let k = crate::mesh::snap(l, lo[a]);
+                (k, k + 1)
+            } else {
+                (l.partition_point(|&x| x < lo[a] - 1e-6), l.partition_point(|&x| x <= hi[a] + 1e-6))
+            };
+        }
+        for k in r[2].0..r[2].1 {
+            for j in r[1].0..r[1].1 {
+                for i in r[0].0..r[0].1 {
+                    let id = g.idx(i, j, k);
+                    if !on[id] {
+                        on[id] = true;
+                        nodes.push((i, j, k, id));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &(i, j, k, id) in &nodes {
+        if i + 1 < nx && on[g.idx(i + 1, j, k)] {
+            out.push((0, id));
+        }
+        if j + 1 < ny && on[g.idx(i, j + 1, k)] {
+            out.push((1, id));
+        }
+        if k + 1 < nz && on[g.idx(i, j, k + 1)] {
+            out.push((2, id));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,8 +234,8 @@ mod tests {
     fn mesh_box_fills_the_same_cells_as_the_box() {
         let g = grid(20, 0.5);
         let (lo, hi) = ([-2.1, -1.3, -0.7], [1.6, 2.4, 3.1]);
-        let a = body_cells(&g, &[Body { name: "b".into(), eps: 3.0, tand: 0.0, shape: BodyShape::Box { lo, hi } }]);
-        let b = body_cells(&g, &[Body { name: "m".into(), eps: 3.0, tand: 0.0, shape: BodyShape::Mesh { tris: box_mesh(lo, hi) } }]);
+        let a = body_cells(&g, &[Body { name: "b".into(), eps: 3.0, tand: 0.0, shape: BodyShape::Box { lo, hi }, metal: false }]);
+        let b = body_cells(&g, &[Body { name: "m".into(), eps: 3.0, tand: 0.0, shape: BodyShape::Mesh { tris: box_mesh(lo, hi) }, metal: false }]);
         let n = a.iter().filter(|&&v| v > 0).count();
         assert!(n > 0);
         assert_eq!(a, b, "ray parity must reproduce the box");
@@ -191,8 +247,8 @@ mod tests {
         // a closed shell: outer box minus inner box (inner faces reversed do not matter for parity)
         let mut tris = box_mesh([-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]);
         tris.extend(box_mesh([-3.0, -3.0, -3.0], [3.0, 3.0, 3.0]));
-        let fill = Body { name: "core".into(), eps: 2.0, tand: 0.0, shape: BodyShape::Box { lo: [-1.0; 3], hi: [1.0; 3] } };
-        let v = body_cells(&g, &[Body { name: "shell".into(), eps: 3.0, tand: 0.0, shape: BodyShape::Mesh { tris } }, fill]);
+        let fill = Body { name: "core".into(), eps: 2.0, tand: 0.0, shape: BodyShape::Box { lo: [-1.0; 3], hi: [1.0; 3] }, metal: false };
+        let v = body_cells(&g, &[Body { name: "shell".into(), eps: 3.0, tand: 0.0, shape: BodyShape::Mesh { tris }, metal: false }, fill]);
         let (cx, cy) = (24, 24);
         let at = |x: f64, y: f64, z: f64| {
             let i = ((x + 6.0) / 0.5) as usize;
@@ -204,5 +260,51 @@ mod tests {
         assert_eq!(at(2.1, 0.1, 0.1), 0, "in the cavity");
         assert_eq!(at(0.1, 0.1, 0.1), 2, "the later body wins");
         assert_eq!(at(5.6, 0.1, 0.1), 0, "outside");
+    }
+
+    #[test]
+    fn a_zero_thickness_metal_box_is_a_sheet_on_the_nearest_plane() {
+        let g = grid(10, 1.0); // nodes at -5..5 mm
+        let sheet = Body { name: "s".into(), eps: 1.0, tand: 0.0, shape: BodyShape::Box { lo: [-2.0, 0.3, -1.0], hi: [2.0, 0.3, 1.0] }, metal: true };
+        let e = metal_edges(&g, &[sheet]);
+        // nodes x -2..2 (5), y = 0 (the nearest), z -1..1 (3): x edges 4 x 3, z edges 5 x 2, no y edges
+        assert_eq!(e.iter().filter(|(a, _)| *a == 0).count(), 12);
+        assert_eq!(e.iter().filter(|(a, _)| *a == 2).count(), 10);
+        assert_eq!(e.iter().filter(|(a, _)| *a == 1).count(), 0);
+        assert!(body_cells(&g, &[Body { name: "s".into(), eps: 1.0, tand: 0.0, shape: BodyShape::Box { lo: [-2.0; 3], hi: [2.0; 3] }, metal: true }]).iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn abutting_metal_strips_join_off_the_mesh_lines() {
+        let g = grid(10, 1.0); // nodes at -5..5 mm
+        // two strips in the plane y = 0, meeting at x = 0.3 and z = 0.3 where no mesh line lies
+        let a = Body { name: "a".into(), eps: 1.0, tand: 0.0, shape: BodyShape::Box { lo: [-2.0, 0.0, -1.0], hi: [0.3, 0.0, 0.3] }, metal: true };
+        let b = Body { name: "b".into(), eps: 1.0, tand: 0.0, shape: BodyShape::Box { lo: [0.3, 0.0, 0.3], hi: [2.0, 0.0, 1.0] }, metal: true };
+        let e = metal_edges(&g, &[a, b]);
+        let (j0, k0) = (5usize, 5usize); // node indices of y = 0, z = 0
+        let id = |i: usize, k: usize| (k * 11 + j0) * 11 + i;
+        // a holds nodes x -2..0, z -1..0; b holds x 1..2, z 1: the x edge from (0,0) to (1,0) is not metal
+        // (node (1,0) is in neither), but the strips are joined through no common node either way; what
+        // matters is that edges inside each strip exist and none crosses a gap of empty nodes
+        assert!(e.contains(&(0, id(4, k0))), "edge x -1..0 at z 0 inside a");
+        assert!(!e.contains(&(0, id(5, k0))), "edge x 0..1 at z 0: node (1, 0) is outside both");
+        assert!(e.contains(&(0, id(6, k0 + 1))), "edge x 1..2 at z 1 inside b");
+    }
+
+    #[test]
+    fn thin_strips_tiling_a_sheet_give_the_same_metal_as_one_box() {
+        let g = grid(10, 1.0);
+        let one = Body { name: "s".into(), eps: 1.0, tand: 0.0, shape: BodyShape::Box { lo: [-2.0, 0.0, -1.0], hi: [2.0, 0.0, 1.0] }, metal: true };
+        let strips: Vec<Body> = (0..40)
+            .map(|n| {
+                let z0 = -1.0 + 0.05 * n as f64;
+                Body { name: format!("s{n}"), eps: 1.0, tand: 0.0, shape: BodyShape::Box { lo: [-2.0, 0.0, z0], hi: [2.0, 0.0, z0 + 0.05] }, metal: true }
+            })
+            .collect();
+        let mut a = metal_edges(&g, &[one]);
+        let mut b = metal_edges(&g, &strips);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
     }
 }
