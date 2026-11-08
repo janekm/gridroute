@@ -198,8 +198,21 @@ candidates in about a minute.
     unaffected, because it applies equally to all candidates.
   - **The board mode near 2.25 GHz** is a resonance of two signal tracks, P1_04 and SWDCLK. They run
     side by side from U12 to header H5 (24.7 mm and about 32 mm), and they are open at the chip end
-    because the chip isn't modelled. On the real board the pin capacitance shifts the resonance, so the
-    modelled dip is partly an artefact. A re-run should load those pins, with a few pF to ground.
+    because the chip isn't modelled.
+  - **Loading U12's pins removes most of that dip.** The fix is `"pin_loads": [{"ref": "U12", "c":
+    3e-12}]`, nRF52840 pad capacitance on all 71 signal pins. These are antenna-alone runs at C20 with
+    real copper, fixed edges and 21 far-field frequencies:
+
+    | | 2.20 | 2.25 | 2.30 | 2.40 | 2.45 | 2.50 GHz | mean 2.40-2.48 |
+    |---|---|---|---|---|---|---|---|
+    | U12 pins open | 84.0 | 82.4 | 83.9 | 84.8 | 82.8 | 81.3 % | 83.8 % |
+    | U12 pins loaded, 3 pF | 87.3 | 86.7 | 87.7 | 87.2 | 84.7 | 82.5 % | 85.9 % |
+
+    - The feed impedance moves by under 2 Ω (49.0 → 50.6 Ω real at 2.44 GHz), so the ladder conclusions
+      stand.
+    - Against the stand-in-copper values above, the loaded model's in-band efficiency is about 3 points
+      lower, about 0.15 dB.
+    - A weaker ringing mode remains near 2.49 GHz (Q about 57).
   - Single-frequency values can land on such a dip. A re-run should use a dense far-field grid
     (0.02-0.05 GHz) and band averages ([fieldsolve-settings.md](fieldsolve-settings.md)).
   - The ranking of the ladder options is the same on both meshes.
@@ -238,6 +251,8 @@ replaces it, and it reached the same recommended direction.
     board). The runs above predate the preset and used `"edges"`, `"mesh"`, `"extent": "board"` and
     `"loss": {"model": "wideband", "copper": true}`, the plane-pair stand-in;
   - `"dielectrics": [{"t": 0.73, "er": 4.5, "tand": 0.015}]`;
+  - `"pin_loads": [{"ref": "U12", "c": 3e-12}]` (the nRF52840's pad capacitance; without it, the tracks to
+    the chip are open-ended stubs), and far-field frequencies every 0.05 GHz over the band;
   - ports `CHIP` U12.H23→U12.F23, `C59` .2→.1, `L4` .1→.2, `C60` .2→.1, `L5` .1→.2, `R70` .2→.1,
     `C20` .1→.2;
   - decoupling shorts on C5-C8, C12, C15, C16, C23, C24, C29, C30, C40;

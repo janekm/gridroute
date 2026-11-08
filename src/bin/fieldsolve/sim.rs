@@ -309,7 +309,90 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         };
         eprintln!("fieldsolve: decouple {net}: {added} capacitors outside the roi as {from} -> {to} {what}");
     }
+    // "pin_loads": [{"ref": "U12", "c": 3e-12, "r": 0, "to": "B.Cu", "pins": [...], "except": [...]}]: every pin
+    // of an unmodelled IC (not on a GND net, not already used by a port or element) gets a vertical lumped C
+    // (or R) from its pad down to `to` (default: the next copper layer below the pad), standing in for the
+    // chip's pad capacitance. Without it, tracks ending at the chip are open-ended stubs that resonate (MTH,
+    // Nov 2026: P1_04 / SWDCLK between U12 and H5, Q 70-80 near 2.3 GHz).
+    let used_pads: Vec<String> = pend
+        .iter()
+        .flat_map(|pd| ["pos", "neg", "at"].into_iter().filter_map(|k| pd.el.get(k).and_then(|v| v.as_str()).map(str::to_string)).collect::<Vec<_>>())
+        .collect();
+    for d in sp.get("pin_loads").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let rf = d.get("ref").and_then(|v| v.as_str()).ok_or("pin_loads entry needs \"ref\"")?.to_string();
+        let c = num(&d, "c", 0.0);
+        let r = num(&d, "r", 0.0);
+        if c <= 0.0 && r <= 0.0 {
+            return Err(format!("pin_loads {rf}: give \"c\" (F) and/or \"r\" (ohm)"));
+        }
+        let only: Vec<String> = d.get("pins").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let except: Vec<String> = d.get("except").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        // pin -> (layer, bbox, net)
+        let mut pins: std::collections::BTreeMap<String, (String, BBox, Option<String>)> = Default::default();
+        for l in &cx.board.layers {
+            for q in &l.prims {
+                if let (true, Some((a, pin))) = (q.dark, &q.pad) {
+                    if a == &rf {
+                        let e = pins.entry(pin.clone()).or_insert((l.name.clone(), BBox::empty(), q.net.clone()));
+                        if e.0 == l.name {
+                            e.1.union(&q.shape.bbox());
+                        }
+                    }
+                }
+            }
+        }
+        if pins.is_empty() {
+            return Err(format!("pin_loads: no pads of {rf} in the Gerber X2 attributes"));
+        }
+        let gnd = |n: &Option<String>| n.as_deref().is_some_and(|s| { let u = s.to_ascii_uppercase(); u.contains("GND") || u.contains("VSS") });
+        let (mut added, mut skipped_gnd, mut skipped_used, mut no_return) = (0, 0, 0, 0);
+        for (pin, (layer, bb, net)) in &pins {
+            if (!only.is_empty() && !only.contains(pin)) || except.contains(pin) {
+                continue;
+            }
+            if gnd(net) {
+                skipped_gnd += 1;
+                continue;
+            }
+            if used_pads.iter().any(|u| u == &format!("{rf}.{pin}")) {
+                skipped_used += 1;
+                continue;
+            }
+            let to = match d.get("to").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    let k = zs.iter().position(|(n, _)| n == layer).unwrap_or(0);
+                    let below = zs.iter().filter(|(_, z)| *z < zs[k].1).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let above = zs.iter().filter(|(_, z)| *z > zs[k].1).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    match below.or(above) {
+                        Some((n, _)) => n.clone(),
+                        None => return Err(format!("pin_loads {rf}: no other copper layer to load against")),
+                    }
+                }
+            };
+            let ctr = P2::new(0.5 * (bb.x0 + bb.x1), 0.5 * (bb.y0 + bb.y1));
+            if !gnd(&cx.net_at(ctr, &to)) {
+                no_return += 1;
+            }
+            let y = if cx.kicad { -ctr.y } else { ctr.y };
+            // "snap": on the nearest existing mesh node (a pad is several cells wide), so 70 pins don't add 140
+            // fixed mesh lines and slivers that shrink the time step
+            let mut el = json!({"kind": "R", "r": r, "c": c, "at": [ctr.x, y], "from": layer, "to": to, "size": "point", "snap": true});
+            if r <= 0.0 {
+                el["kind"] = json!("C");
+            }
+            pend.push(Pending { name: format!("pin {rf}.{pin}"), el, port: false });
+            added += 1;
+        }
+        eprintln!(
+            "fieldsolve: pin_loads {rf}: {added} pins loaded ({}), {skipped_gnd} ground pins and {skipped_used} pins used by ports/elements skipped{}",
+            match (c > 0.0, r > 0.0) { (true, true) => format!("{:.2} pF || {r} ohm", c * 1e12), (true, false) => format!("{:.2} pF", c * 1e12), _ => format!("{r} ohm") },
+            if no_return > 0 { format!("; {no_return} land on no ground copper on the other layer (those loads float)") } else { String::new() }
+        );
+    }
     // first pass: geometry of each element, so its lines can be fixed before meshing
+    // (and the nets every element touches, for the open-ended track check)
+    let mut term_nets: Vec<String> = Vec::new();
     enum Geo {
         Vert { c: P2, half: [f64; 2], z0: f64, z1: f64, plus_hi: bool },
         Plane { a: P2, b: P2, axis: usize, w: f64, z: f64, layer: String },
@@ -326,6 +409,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let to = e.get("to").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
             let (c, pbb) = cx.locate(at, Some(from))?;
             let (zf, zt) = (cx.z_of(from)?, cx.z_of(to)?);
+            term_nets.extend(cx.net_at(c, from));
+            term_nets.extend(cx.net_at(c, to));
             if pd.port {
                 port_nets(&pd.name, (cx.net_at(c, from), from), (cx.net_at(c, to), to), true);
             }
@@ -338,8 +423,11 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 _ if at.is_string() => [0.8 * (pbb.x1 - pbb.x0), 0.8 * (pbb.y1 - pbb.y0)],
                 _ => [0.0, 0.0],
             };
-            fx.push(c.x);
-            fy.push(c.y);
+            // "snap": true puts a point element on the nearest mesh node instead of adding mesh lines
+            if !e.get("snap").and_then(|v| v.as_bool()).unwrap_or(false) {
+                fx.push(c.x);
+                fy.push(c.y);
+            }
             if size[0] > 0.0 {
                 fx.extend([c.x - size[0] / 2.0, c.x + size[0] / 2.0]);
             }
@@ -351,6 +439,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let layer = e.get("layer").and_then(|v| v.as_str()).unwrap_or("F.Cu").to_string();
             let (a, ba) = cx.locate(e.get("pos").ok_or_else(|| format!("{}: needs pos/neg or at", pd.name))?, Some(&layer))?;
             let (b, bb) = cx.locate(e.get("neg").ok_or_else(|| format!("{}: needs pos/neg or at", pd.name))?, Some(&layer))?;
+            term_nets.extend(cx.net_at(a, &layer));
+            term_nets.extend(cx.net_at(b, &layer));
             if pd.port {
                 port_nets(&pd.name, (cx.net_at(a, &layer), &layer), (cx.net_at(b, &layer), &layer), false);
             }
@@ -536,6 +626,23 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 2.5 * cell,
                 list.join("; "),
                 if found.len() > 6 { format!("; and {} more", found.len() - 6) } else { String::new() }
+            ));
+        }
+    }
+    // far-field runs: long signal tracks near the fine region with nothing modelled on them are open-ended
+    // stubs (an unmodelled chip at one end, often an unconnected pin at the other) and resonate
+    if sp.get("farfield").is_some_and(|v| !v.is_null()) {
+        let ok: Vec<String> = sp.get("open_nets_ok").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let found: Vec<_> = crate::presets::open_tracks(&sheets, &term_nets, &roi, 10.0, 10.0).into_iter().filter(|t| !ok.contains(&t.0)).collect();
+        if !found.is_empty() {
+            let list: Vec<String> = found.iter().take(8).map(|(n, l, _)| format!("{n} {l:.1} mm")).collect();
+            checks.push(format!(
+                "{} signal nets within 10 mm of the fine region carry 10 mm or more of track with nothing modelled on them: {}{}. \
+                 Open at an unmodelled chip, such tracks are resonant stubs that can take antenna efficiency in a narrow band. \
+                 Load the chip's pins with \"pin_loads\" (e.g. {{\"ref\": \"U1\", \"c\": 3e-12}}), or list reviewed nets in \"open_nets_ok\".",
+                found.len(),
+                list.join(", "),
+                if found.len() > 8 { format!(" and {} more", found.len() - 8) } else { String::new() }
             ));
         }
     }

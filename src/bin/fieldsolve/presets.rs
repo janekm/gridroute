@@ -289,6 +289,37 @@ pub fn coarse_copper(
     out
 }
 
+/// Signal nets (not GND or VSS, and touched by no port, element or pin load) with at least `min_len` mm of
+/// track (summed over all layers) and some copper within `reach` mm of `roi`: open-ended stubs when the chip
+/// they run to isn't modelled. Returns (net, track length mm, distance from the roi mm), longest first.
+pub fn open_tracks(sheets: &[crate::model::Sheet], terminated: &[String], roi: &BBox, min_len: f64, reach: f64) -> Vec<(String, f64, f64)> {
+    let gap = |b: &BBox| {
+        let dx = (roi.x0 - b.x1).max(b.x0 - roi.x1).max(0.0);
+        let dy = (roi.y0 - b.y1).max(b.y0 - roi.y1).max(0.0);
+        dx.hypot(dy)
+    };
+    let mut acc: std::collections::BTreeMap<&str, (f64, f64)> = Default::default();
+    for sh in sheets {
+        for p in &sh.prims {
+            let Some(n) = p.net.as_deref().filter(|_| p.dark) else { continue };
+            let u = n.to_ascii_uppercase();
+            if u.contains("GND") || u.contains("VSS") || terminated.iter().any(|t| t == n) {
+                continue;
+            }
+            let len = match &p.shape {
+                crate::geom::Shape::Capsule { a, b, .. } => (b.x - a.x).hypot(b.y - a.y),
+                _ => 0.0,
+            };
+            let e = acc.entry(n).or_insert((0.0, f64::INFINITY));
+            e.0 += len;
+            e.1 = e.1.min(gap(&p.shape.bbox()));
+        }
+    }
+    let mut out: Vec<(String, f64, f64)> = acc.into_iter().filter(|(_, (l, d))| *l >= min_len && *d <= reach).map(|(n, (l, d))| (n.to_string(), l, d)).collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +397,31 @@ mod tests {
             .collect();
         let got = crate::sim::late_time_peak(&v, dt, 1e8, 8e9).unwrap();
         assert!((got - f).abs() < 0.02e9, "{got}");
+    }
+
+    #[test]
+    fn open_tracks_lists_unterminated_signal_nets_only() {
+        let trk = |net: &str, x0: f64, y0: f64, x1: f64, y1: f64| Prim {
+            shape: Shape::Capsule { a: P2::new(x0, y0), b: P2::new(x1, y1), r: 0.075 },
+            dark: true,
+            net: Some(net.into()),
+            pad: None,
+        };
+        let sheets = vec![crate::model::Sheet {
+            name: "F.Cu".into(),
+            z: 0.0,
+            prims: vec![
+                trk("P1_04", 5.0, 5.0, 5.0, -20.0), // 25 mm, starts inside the roi
+                trk("SWDCLK", 6.0, 5.0, 6.0, -26.0),
+                trk("GND", 7.0, 5.0, 7.0, -30.0),   // ground: never a stub
+                trk("ANT", 2.0, 2.0, 2.0, -15.0),   // has a port on it
+                trk("SHORT", 3.0, 3.0, 3.0, -2.0),  // 5 mm: too short
+                trk("FAR", 50.0, 50.0, 50.0, 80.0), // 30 mm but 40 mm away
+            ],
+        }];
+        let roi = BBox { x0: 0.0, y0: 0.0, x1: 10.0, y1: 10.0 };
+        let got = open_tracks(&sheets, &["ANT".to_string()], &roi, 10.0, 10.0);
+        let names: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
+        assert_eq!(names, vec!["SWDCLK", "P1_04"], "{got:?}");
     }
 }

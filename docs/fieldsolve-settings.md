@@ -49,6 +49,7 @@ then start the long run.
 | `far-field run without "edges"` | Copper edges are staircased. | `"edges": true` |
 | `narrow copper ... in cells coarser than ...` | Traces, meanders or antenna arms outside the fine region sit in cells several times larger than `cell`. Their length and coupling are then wrong. | Extend `roi` over anything that carries RF current. After you have checked the rest, list it in `"coarse_copper_ok"`. |
 | `a high-Q mode is still ringing at the stop` (far-field runs) | When the run stopped, the field energy was still falling slower than 5 dB/ns, so a board mode with a Q above about 30 is still ringing. The warning gives the mode's frequency and Q. Efficiency within about f/Q of that frequency depends on the mesh. | List far-field frequencies 0.02-0.05 GHz apart across the band, quote band averages rather than single frequencies, and refine the mesh (`max_cell`, a `"refine"` box) where the mode lives. A field export at its frequency shows where that is. |
+| `N signal nets ... carry 10 mm or more of track with nothing modelled on them` (far-field runs) | Long signal tracks near the fine region end at a chip that isn't modelled. Their far ends are often unconnected pins too, so they are resonant stubs. | `"pin_loads"` on the chip they run to (see The model). Nets you have checked go in `"open_nets_ok"`. |
 | `port X reached max_steps before any stop rule` | The run was cut off before it converged, so the S-parameters are an estimate. | Raise `max_steps`, or loosen `end_db` |
 | `power balance ... check the port's placement` (on a full run) | The port's energy does not add up. The port bridge may miss a pad, or short the port. | Check the printed nets under each port, and `fieldsolve raster` |
 
@@ -85,10 +86,21 @@ then start the long run.
   with a model that also leaves it out.
 - **Decoupling capacitors near the RF section:** model them as `"elements"` shorts. Without them, the
   supply copper floats at RF.
-- **Tracks to unmodelled ICs:** a long track that ends at a chip pin is open-ended in the model, and so a
-  resonant stub (a quarter wave is about 17 mm at 2.4 GHz on FR4 microstrip). Near an antenna it can take
-  efficiency in a narrow band, as on MTH (see Known open issues). Load such pins with `"elements"` (a few
-  pF to ground) when the tracks are longer than about 10 mm and lie within a few cm of the antenna.
+- **Tracks to unmodelled ICs:** a track ending at a chip pin is open-ended in the model, which makes it a
+  resonant stub (a quarter wave is about 17 mm at 2.4 GHz on FR4 microstrip). Near an antenna, such a
+  stub can take efficiency in a narrow band, as on MTH. Load the chip's pins:
+
+  ```json
+  "pin_loads": [{"ref": "U12", "c": 3e-12}]
+  ```
+
+  - Each pin of `ref` gets a lumped capacitor from its pad to the next copper layer below. You can also
+    give `"r"` in ohms, alone or in parallel with the capacitor.
+  - Pins on GND or VSS nets are skipped, and so are pins already used by a port or element.
+  - `"pins"` / `"except"` restrict the set, and `"to"` names the layer to load against.
+  - The loads sit on the nearest mesh node, so they add no mesh lines.
+  - The run prints how many pins were loaded, and how many land on no ground copper (those loads float).
+  - Use the chip's pad capacitance from its datasheet: about 3 pF for nRF52840 GPIOs.
 
 ## Ports, band and stopping
 
@@ -127,9 +139,12 @@ then start the long run.
     of antenna efficiency in a narrow band.
   - The tracks run along y where the y cells are 1.48 mm, so their frequency also depends on the mesh.
   - On the real board, the pin capacitance moves the resonance, so the dip is partly a model artefact.
-  - Not yet automated. For an antenna run, load the pins of unmodelled ICs that long tracks near the
-    antenna lead to, with `"elements"` (a few pF to ground, or an R), or check where the ringing
-    warning's mode lives with a field export at its frequency.
+  - **Now handled:** far-field runs warn about such nets, and `"pin_loads"` loads the chip's pins. On
+    MTH, loading U12's 71 signal pins with 3 pF removed most of the dip. At 2.25 GHz the antenna alone
+    went from 82.4 % to 86.7 %, and the 2.40-2.48 GHz mean from 83.8 % to 85.9 %. The feed impedance moved
+    by under 2 Ω, and the run cost nothing extra.
+  - A weaker mode near 2.49 GHz (Q about 57) still rings after loading. One net, VCC_S18 (15 mm), is
+    still open, to another chip.
 
 ## Fixed issues (keep in mind when reading older results)
 

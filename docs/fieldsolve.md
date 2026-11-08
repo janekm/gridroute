@@ -177,7 +177,10 @@ conformal and edge-singularity corrections of the copper edges. `"mesh": {"no_sl
 3.0, "copper_bands": {...}}` refines the mesh from the layout (`meshpol.rs`; measured in
 [fieldsolve-resolution.md](fieldsolve-resolution.md#implemented-and-measured-static-refinement-and-an-octree-nov-2026)).
 
-`kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). `"excite":
+`kind` is `port` (the default in `ports`), `short`, `R` (`"r"`) or `C` (`"c"`, in parallel). A point element
+with `"snap": true` sits on the nearest mesh node instead of adding mesh lines. `"pin_loads": [{"ref":
+"U12", "c": 3e-12}]` puts such a capacitor on every signal pin of an unmodelled chip, so the tracks
+running to it aren't open-ended stubs ([fieldsolve-settings.md](fieldsolve-settings.md)). `"excite":
 "all"` runs every port and writes the full Touchstone file; by default only the first port is excited.
 
 The run prints the net under each port terminal (`port CHIP: + ANT (F.Cu) / - GND (F.Cu)`). It warns when
