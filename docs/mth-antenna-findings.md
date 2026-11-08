@@ -55,7 +55,8 @@ RF path, as populated:
   a U-shaped strip along three board edges, with its open ends next to the RF corner, and drops to B.Cu in
   short jogs beside C30 and C16. With all of it turned into ground, the antenna radiates 86.9 / 85.6 /
   84.2 % at 2.40 / 2.45 / 2.50 GHz instead of 83.5 / 81.4 / 81.3 %, and its impedance doesn't move.
-  Passing 90 % also needs a lower-loss laminate or less FR4 under the antenna (see
+  Adding a 1 mm meander with a 1.35 mm longer arm gives 88.9 / 87.4 / 85.7 %. On a tan δ 0.008 laminate the
+  same layout reaches 92.2 / 91.7 / 90.5 %, above 90 % across the band (see
   [Efficiency](#efficiency-losses-and-the-33-v-ring)).
 - **Retune again after trimming.** The trimmed antenna in the enclosure will present a different feed
   impedance. Re-run the EM model on the trimmed copper, plus the enclosure if there is data, and repeat
@@ -253,6 +254,10 @@ far field every 0.05 GHz). Efficiency is the radiated share of the power accepte
 | meander widened to 1.0 mm (not retuned) | 89.0 | 87.6 | 85.5 | 83.8 | 82.9 | 83.0 % | 60 − j33 Ω |
 | lossless copper | 93.1 | 91.6 | 87.7 | 84.5 | 83.8 | 85.4 % | 49 − j4 Ω |
 | lossless FR4 | 97.6 | 95.0 | 90.9 | 89.7 | 91.9 | 93.8 % | 43 − j3 Ω |
+| *fine region widened to x 140 (the reference for the next two rows):* | | | | | | | |
+| B.Cu all GND | 89.1 | 88.3 | 87.2 | 86.1 | 84.7 | 82.6 % | 52 − j1 Ω |
+| **B.Cu all GND + meander 1.0 mm, arm 1.35 mm longer** | **89.6** | **89.6** | **88.9** | **87.4** | **85.7** | **84.0 %** | **44 − j15 Ω** |
+| **the same on a tan δ 0.008 laminate** | **92.8** | **92.6** | **92.2** | **91.7** | **90.5** | **88.8 %** | **42 − j15 Ω** |
 
 - **Where the loss goes.** At 2.40 GHz, the FR4 takes about 7 points and the copper about 4. In the
   lossless model a board mode near 2.47 GHz keeps ringing with a Q of several hundred, so it hardly
@@ -275,11 +280,22 @@ far field every 0.05 GHz). Efficiency is the radiated share of the power accepte
   - The feed impedance doesn't move, so the ladder retune stands.
   - The B.Cu ringing at 2.47 GHz is gone. What remains is the antenna's own decay (Q about 12) and the
     P1_04 / SWDCLK track mode near 2.2 GHz (Q about 15).
-- **To pass 90 % at the antenna,** the 3.3 V change alone isn't enough: 86-87 % is left, mostly FR4 and
-  copper loss. Of the levers above, a lower-loss laminate and keeping fields out of the FR4 under the radiator
-  are the large ones. The meander gain needs a retune of the arm before it counts. None of the
-  combinations has been simulated yet, and the matching network loses another 0.3-0.5 dB before the chip
-  pin.
+- **Passing 90 % at the antenna takes three changes together.**
+  - The 3.3 V change alone leaves 86-87 %, mostly FR4 and copper loss.
+  - **Adding the 1 mm meander** adds 1.0-1.7 points on the same mesh: 88.9 / 87.4 / 85.7 % at 2.40 /
+    2.45 / 2.50 GHz.
+    - The widened meander raises the antenna's series crossing from 2.456 to 2.575 GHz.
+    - Lengthening the arm by 1.35 mm, to x 140.3 near the board edge, brings it back to 2.516 GHz.
+    - An extra 2 mm upward leg at the arm's end changed nothing, because the arm length moves the lower,
+      high-resistance resonance (2.30 → 2.28 GHz) more than the crossing.
+    - The feed impedance is then 44 − j15 Ω at 2.44 GHz instead of 50 − j1, so the ladder needs retuning
+      for it.
+  - **On a tan δ 0.008 laminate, the same layout radiates 92.2 / 91.7 / 90.5 %.** That clears 90 % across
+    the band (88.8 % at 2.55 GHz).
+  - None of these changes has been measured. The matching network loses another 0.3-0.5 dB before the
+    chip pin.
+  - These runs widen the fine region to x 140 so the longer arm stays in fine cells. On its own, the wider
+    fine region adds about 0.4 points (the reference row).
 
 ![Bottom copper: as built, with the VCC3V3 zone and jogs in blue, and the variant with all of it ground](img/mth7_bcu_3v3.jpg)
 
