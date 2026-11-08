@@ -201,9 +201,26 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 });
             }
         }
+        // with an explicit stack-up, "solder_mask": true adds a mask layer over each outer copper layer
+        // ("solder_mask_t" mm, "solder_mask_er", "solder_mask_tand"; typical LPI mask 20 um, 3.8, 0.025).
+        // Before Nov 2026 the mask was silently dropped here.
+        if mask {
+            let m = |n: &str| StackLayer {
+                name: n.to_string(),
+                kind: StackKind::SolderMask,
+                thickness_mm: num(&sp, "solder_mask_t", 0.02),
+                eps_r: num(&sp, "solder_mask_er", 3.8),
+                loss_tan: num(&sp, "solder_mask_tand", 0.025),
+            };
+            st.insert(0, m("F.Mask"));
+            st.push(m("B.Mask"));
+        }
         cx.board.stack = st;
     }
     let (zs, slabs) = stack_layout(&cx.board, mask);
+    if mask && !slabs.iter().any(|s| s.z1 <= 1e-9 || s.z0 >= zs.iter().map(|z| z.1).fold(f64::MIN, f64::max) - 1e-9) {
+        eprintln!("fieldsolve: WARNING: \"solder_mask\": true, but the stack-up has no solder mask layers; none is modelled");
+    }
     cx.zs = zs.clone();
     let cell = num(&sp, "cell", 0.1);
     let fmax = num(&sp, "fmax", 3e9);

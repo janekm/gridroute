@@ -84,6 +84,14 @@ then start the long run.
   `"roughness_um"` defaults to 1 µm, which is standard electrodeposited foil.
 - **Solder mask** (`"solder_mask": true`) lowers an antenna's resonance. Leave it out only when comparing
   with a model that also leaves it out.
+  - With an explicit `"dielectrics"` stack-up, the mask used to be silently dropped. It now adds a layer
+    over each outer copper layer: `"solder_mask_t"` (mm, default 0.02), `"solder_mask_er"` (3.8) and
+    `"solder_mask_tand"` (0.025).
+  - A 20 µm layer forces fine z cells and costs about 5× the run time. An equivalent 40 µm layer with
+    `"min_cells_layer": 1` costs about 2.3×. Keep (εr − 1)·t and εr·tan δ·t equal: for 20 µm of 3.8 /
+    0.025, that is 40 µm of 2.4 / 0.0198.
+  - On the MTH PIFA, the mask mostly detunes the antenna (2.44 GHz feed impedance 49 → 40 + j8 Ω); its own
+    loss is small.
 - **Decoupling capacitors near the RF section:** model them as `"elements"` shorts. Without them, the
   supply copper floats at RF. Short only parts the production BOM fits: a footprint with a value in
   KiCad may be unfitted. On MTH R7A, C6, C7 and C23 have values but aren't fitted, and the first MTH specs
