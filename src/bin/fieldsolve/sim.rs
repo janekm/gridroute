@@ -1838,9 +1838,9 @@ pub fn junction_checks(rep: &crate::model::Conflicts, kicad: bool) -> (Vec<Strin
         warn.push(format!(
             "copper of nets {:?} and {:?} touches in the Gerbers on {} at {}{}, but the net-aware raster cut it apart \
              ({} edge(s) at {} mesh node(s)). A net tie or a feed into a shorted antenna is then fed through a gap: \
-             declare it in \"net_ties\" (the component, e.g. \"{}\", or the pair [{:?}, {:?}]). Otherwise it is a short in the layout.",
+             declare it in \"net_ties\" ({}the pair [{:?}, {:?}]). Otherwise it is a short in the layout.",
             j.a, j.b, j.sheet, at(j.at), pads(j), j.edges, j.nodes,
-            j.pads.first().and_then(|p| p.split('.').next()).unwrap_or("AE1"), j.a, j.b
+            j.pads.first().and_then(|p| p.split('.').next()).map(|r| format!("the component \"{r}\", or ")).unwrap_or_default(), j.a, j.b
         ));
     }
     if cut.len() > 8 {
