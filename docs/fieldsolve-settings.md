@@ -52,6 +52,7 @@ then start the long run.
 | `N signal nets ... carry 10 mm or more of track with nothing modelled on them` (far-field runs) | Long signal tracks near the fine region end at a chip that isn't modelled. Their far ends are often unconnected pins too, so they are resonant stubs. | `"pin_loads"` on the chip they run to (see The model). Nets you have checked go in `"open_nets_ok"`. |
 | `port X reached max_steps before any stop rule` | The run was cut off before it converged, so the S-parameters are an estimate. | Raise `max_steps`, or loosen `end_db` |
 | `power balance ... check the port's placement` (on a full run) | The port's energy does not add up. The port bridge may miss a pad, or short the port. | Check the printed nets under each port, and `fieldsolve raster` |
+| `edit ... (net X) overlaps copper of net Y` | An `"add"` edit carries a net and lies on another net's copper. The net-aware raster cuts copper of two nets apart where they touch, so the added copper is **not** connected to it. | Leave `"net"` out of edits that must join existing copper (an inverted-F's short into the ground pour). Net-less copper never conflicts. |
 
 ## Geometry: the fine region
 
@@ -179,6 +180,11 @@ then start the long run.
 
 ## Fixed issues (keep in mind when reading older results)
 
+- **An antenna short drawn with its own net (warned since Nov 2026).** Two eBUS inverted-F studies drew the
+  whole antenna, short included, as `"net": "ANT"` over the GND pour. The raster cut the short off, so the
+  antenna was an open-ended monopole: capacitive below resonance, with 3-9 Ω at a series resonance. An
+  inverted-F with its short connected is inductive below resonance and shows a high-resistance parallel
+  resonance. The edit now warns, and the eBUS results were re-run.
 - **`"edges"` on coarse cells (fixed Nov 2026, 58f602d).** Conformal fractions were applied on the coarse
   graded cells outside the ROI. On the MTH PIFA at 0.05 mm, they moved the track resonance above onto
   2.40 GHz and cut efficiency there by about 8 points. Edge factors now apply only to edges no longer than 2.5×

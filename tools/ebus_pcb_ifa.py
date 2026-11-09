@@ -47,7 +47,8 @@ def spec(name, d, s, ff=False, w=0.5, depth=None):
     keep = [[29.5, -0.5, 46.5, yg], [46.5, -0.5, 50.5, max(7.0, yg)]]
     ed = [{'layer': L, 'op': 'clear', 'rect': r} for L in LAYERS for r in keep]
     rects, port = ifa(d, s, w, yg)
-    ed += [{'layer': 'F.Cu', 'op': 'add', 'net': 'ANT', 'rect': r} for r in rects]
+    # no net: the short joins the GND pour (copper of two nets that touch is cut apart by the net-aware raster)
+    ed += [{'layer': 'F.Cu', 'op': 'add', 'rect': r} for r in rects]
     sp['edits'] = ed
     sp['ports'] = [port]
     sp['roi'] = [29.0, -0.5, 50.5, 7.5]

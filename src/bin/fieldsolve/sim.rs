@@ -1768,13 +1768,53 @@ pub fn apply_edits(board: &mut Board, spec: &Value, kicad: bool) -> Result<(), S
             continue; // empty: lets a parameterised edit vanish (fieldsolve optimise)
         }
         let l = board.layers.iter_mut().find(|l| l.name == layer).ok_or_else(|| format!("edit: no copper layer {layer}"))?;
+        let net = e.get("net").and_then(|v| v.as_str());
+        if let (true, Some(net)) = (dark, net) {
+            let others = edit_net_overlaps(&l.prims, (x0, y0, x1, y1), net);
+            if !others.is_empty() {
+                eprintln!(
+                    "fieldsolve: WARNING: edit {:?} on {layer} (net {net}) overlaps copper of net {}: the net-aware raster cuts copper of \
+                     two nets apart where they touch, so this copper is NOT connected to it. Leave out \"net\" to join it.",
+                    r,
+                    others.join(", ")
+                );
+            }
+        }
         let shape = Shape::Polygon(vec![P2::new(x0, y0), P2::new(x1, y0), P2::new(x1, y1), P2::new(x0, y1)]);
         if dark {
             l.bbox.union(&shape.bbox());
         }
-        l.prims.push(Prim { shape, dark, net: if dark { e.get("net").and_then(|v| v.as_str()).map(String::from) } else { None }, pad: None });
+        l.prims.push(Prim { shape, dark, net: if dark { net.map(String::from) } else { None }, pad: None });
     }
     Ok(())
+}
+
+/// Nets other than `net` whose copper (the last object covering a point decides, as in Gerber) lies under
+/// the rectangle `(x0, y0, x1, y1)`, sampled on a grid of at most 64 x 64 points including its edges.
+/// Net-less copper never conflicts and isn't reported.
+pub fn edit_net_overlaps(prims: &[Prim], (x0, y0, x1, y1): (f64, f64, f64, f64), net: &str) -> Vec<String> {
+    let n = |len: f64| ((len / 0.02).ceil() as usize).clamp(1, 63);
+    let (nx, ny) = (n(x1 - x0), n(y1 - y0));
+    let rect = BBox { x0, y0, x1, y1 };
+    let near: Vec<&Prim> = prims.iter().filter(|q| q.shape.bbox().overlaps(&rect)).collect();
+    let mut out: Vec<String> = Vec::new();
+    for i in 0..=nx {
+        for j in 0..=ny {
+            let p = P2::new(x0 + (x1 - x0) * i as f64 / nx as f64, y0 + (y1 - y0) * j as f64 / ny as f64);
+            let mut at: Option<&str> = None;
+            for q in &near {
+                if q.shape.bbox().contains(p) && q.shape.contains(p) {
+                    at = if q.dark { q.net.as_deref() } else { None };
+                }
+            }
+            if let Some(o) = at {
+                if o != net && !out.iter().any(|x| x == o) {
+                    out.push(o.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// TDR comparison: `tdr.json` and `tdr.svg` (impedance versus distance from the port, two-way time scaled

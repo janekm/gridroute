@@ -18,9 +18,10 @@ cable plugs into J3.
 - **Johanson's 2450AT42E chip antenna** measures 21 % on a 50 × 30 mm evaluation board. A calibrated
   stand-in at the J3 spot radiates about 35 % with In1/In2 cleared under it and 13-16 % without. The track
   bus there would have to move; see [the chip antenna](#a-chip-antenna-on-the-board).
-- **A printed inverted-F in the board's free top-right strip** (2 mm deep) radiates about 43 % but sees only
-  3-4 Ω. A good printed antenna needs about 4-5 mm of clearance, which means moving parts; see
-  [the printed antenna](#a-printed-antenna-in-the-boards-free-area).
+- **A printed inverted-F needs clearance the A.4 layout doesn't have.** In the free 2 mm strip the first
+  result was void (a modelling fault, now warned about). On the board widened by 6 mm at its top edge, an
+  inverted-F radiates 87 % and matches 50 Ω unaided (−0.7 to −0.8 dB in total); see
+  [the widened board](#a-printed-antenna-on-a-widened-board).
 - The rest of this summary is about the stand-in dipole first modelled for the "Molex 146153 class" part.
 - **The pocket puts the FPC about 8.3 mm above the board's ground, parallel to it, and that wrecks it.**
   - The board is 50 × 28 mm, a 4-layer 0.8 mm board with ground on the inner layers, and it fills the
@@ -266,22 +267,31 @@ narrow strips along the edges:
   - A 0.5 mm arm runs along the top edge at y 0.5-1.0, from the short at x 30.0 to x 47.
   - It steps round the rounded corner and runs 1 mm down the right edge.
   - The feed is 2 mm from the short.
-- **The result (0.05 mm mesh, enclosure, no cable):** resonance at 2.38 GHz. It radiates 42.4 / 43.0 / 43.7 %
-  at 2.40 / 2.44 / 2.48 GHz, but its resistance is only 3-4 Ω (3 + j5 Ω at 2.44 GHz).
-  - A 3 Ω antenna needs a steep match, which costs loss and bandwidth.
-  - Moving the feed farther from the short (5 and 8 mm) didn't raise the resistance; it detuned the antenna
-    upwards.
-  - With 1 mm between the arm and the ground edge, the arm is mostly a transmission line along the edge.
-- **That isn't excellent, and the free area is the limit.** A printed antenna with good efficiency and a
-  usable impedance needs roughly 4-5 mm of ground clearance along an edge, which means moving parts:
-  - D8, R10-R14, U6 and C2 out of the top-right strip, or the track bus off the top edge.
-  - A first try at a 4.5 mm keep-out was invalid. Clearing the parts without re-laying the ground left the
-    short landing on a copper island, so modelling that case properly needs a planned ground edge.
-- **For comparison, in band before any match:**
-  - this printed antenna, about 43 %;
-  - the chip antenna with In1/In2 cleared, about 35 % (stand-in);
-  - the YL1439 on the side wall, 69-81 % bare but 17-27 % with the modelled cable;
-  - the YL1439 in the lid pocket, 26-45 %.
+- **The first result here was void.** The antenna was drawn as net `ANT` over the GND pour, and the
+  net-aware raster cut its short off where the two nets touched, so the antenna was an open-ended monopole.
+  That run read 42-44 % at 3-4 Ω; with the short connected, the same geometry reads 0.4 + j39 Ω at 2.44 GHz,
+  i.e. it was tuned against the broken model. fieldsolve now warns about such an edit (see
+  `docs/fieldsolve-settings.md`).
+- **It wasn't re-tuned:** with 1 mm between the arm and the ground edge, the strip is too shallow for a good
+  inverted-F, and widening the board (next section) gives a far better one.
+## A printed antenna on a widened board
+
+`tools/ebus_wide_ifa.py`. The board and the enclosure are stretched by W at KiCad y 1.01: everything above
+moves out, the section there is extruded across the gap, and the old copper stays. The ground pour on all four
+layers already ends in a straight edge at y 0.3, which becomes the antenna's ground edge. A printed inverted-F
+sits in the new strip: a 0.5 mm arm 0.5 mm from the new edge, the short and the feed legs 0.5 mm wide, the feed
+above J3's pin (x 24.2), with five stitching vias. The enclosure ribs at x 19.4 and 29.3 lengthen with it.
+
+| W | feed from short | open end | radiation 2.40 / 2.44 / 2.48 GHz | total from 50 Ω (no match) |
+|---|---|---|---|---|
+| 6 mm | 0.5 mm | x 41.1 | 86.7 / 87.2 / 87.9 % | −0.8 / −0.7 / −0.8 dB |
+| 4 mm | 1.0 mm | x 42.1 | 79.7 / 80.3 / 81.2 % | −1.2 / −1.0 / −1.1 dB |
+
+- **Two-mesh check (0.035 mm against 0.05 mm):** within 1.4 points and 0.1 dB on both.
+- **Both match 50 Ω without a network** (S11 −13 to −19 dB in band); the feed-to-short spacing sets the
+  resistance: 909, 312 and 206 Ω peaks at 3.5, 1.5 and 1.0 mm on the 6 mm strip.
+- **Fed at the antenna:** the line from the matching network and the ladder itself weren't modelled. The study
+  stopped there (2026-11-09): the board is being re-laid out with the antenna on a short edge instead.
 
 ## Caveats
 

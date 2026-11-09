@@ -120,6 +120,22 @@ fn geometry_edits_clear_and_add_copper() {
     assert!(sim::apply_edits(&mut b, &json!({"edits": [{"layer": "In1.Cu", "op": "add", "rect": [0, 0, 1, 1]}]}), true).is_err());
 }
 
+/// An added rectangle with a net, laid over another net's copper, is reported: the net-aware raster would
+/// cut it off (an inverted-F's short drawn as net ANT over the GND pour floated). The same net, no
+/// overlap, or copper cleared first are not reported.
+#[test]
+fn an_edit_over_another_nets_copper_is_reported() {
+    // board frame (no KiCad flip): the pour spans y 0..2
+    let b = ctx(vec![rect(0.0, 0.0, 10.0, 2.0, "GND")], json!({})).board;
+    let over = |r: (f64, f64, f64, f64), net: &str| sim::edit_net_overlaps(&b.layers[0].prims, r, net);
+    assert_eq!(over((4.0, 1.7, 4.5, 2.5), "ANT"), ["GND"], "the short's foot lies in the pour");
+    assert!(over((4.0, 1.7, 4.5, 2.5), "GND").is_empty(), "same net");
+    assert!(over((4.0, 2.3, 4.5, 6.0), "ANT").is_empty(), "clear of the pour");
+    let mut b2 = ctx(vec![rect(0.0, 0.0, 10.0, 2.0, "GND")], json!({})).board;
+    sim::apply_edits(&mut b2, &json!({"edits": [{"layer": "F.Cu", "op": "clear", "rect": [3.0, 1.5, 6.0, 3.0]}]}), false).unwrap();
+    assert!(sim::edit_net_overlaps(&b2.layers[0].prims, (4.0, 1.7, 4.5, 2.5), "ANT").is_empty(), "cleared first");
+}
+
 /// A screening run records its policy, every override, the actual mesh and time step, the excitation
 /// count, each run's stop reason (and where the standard rule would have stopped), the objective with its
 /// stability, and earns its level as status only when every excitation converged.
