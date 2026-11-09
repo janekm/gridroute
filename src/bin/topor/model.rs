@@ -476,6 +476,30 @@ impl Board {
                 holes: r["holes"].as_array().into_iter().flatten().map(|h| ppoly(h)).collect(),
             });
         }
+        // pours on signal layers (e.g. a VDD pour on an inner signal layer under a chip, filled after routing): the
+        // net becomes a plane net of that layer, so its pads drop to vias and a via inside the pour joins it, as
+        // with plane_regions; the layer stays a signal layer and other nets still route across it (the pour fills
+        // round them later). The layer list above is settled first, so the pour does not make it a plane layer.
+        for r in cold["signal_pours"].as_array().into_iter().flatten() {
+            let (net, layer) = match (r["net"].as_str().and_then(|n| net_index.get(n)), layers.iter().position(|l| Some(l.as_str()) == r["layer"].as_str())) {
+                (Some(&n), Some(l)) => (n, l),
+                _ => continue,
+            };
+            if !signal.contains(&layer) {
+                return Err(format!("signal_pours: {} is not a signal layer", layers[layer]));
+            }
+            match nets[net as usize].plane {
+                Some(p) if p != layer => return Err(format!("signal_pours: net {} is already a plane net of {}", nets[net as usize].name, layers[p])),
+                _ => nets[net as usize].plane = Some(layer),
+            }
+            plane_regions.push(PlaneRegion {
+                net,
+                layer,
+                priority: r["priority"].as_i64().unwrap_or(0),
+                poly: ppoly(&r["points"]),
+                holes: r["holes"].as_array().into_iter().flatten().map(|h| ppoly(h)).collect(),
+            });
+        }
         let mut track_clear = vec![0.0; signal.len()];
         if let Some(tc) = cold["track_clearance"].as_object() {
             for (ln, v) in tc {
@@ -933,5 +957,48 @@ fn dedup_hull(pts: &[P2]) -> Vec<P2> {
         convex_hull(&v)
     } else {
         v
+    }
+}
+
+#[cfg(test)]
+mod signal_pour_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn model(pours: serde_json::Value) -> serde_json::Value {
+        json!({
+            "name": "t", "size": [20.0, 20.0], "origin": [0.0, 0.0],
+            "outline": [[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], "outline_holes": [],
+            "layers": ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], "rules": [0.15, 0.15, 0.5, 0.3],
+            "classes": {"Default": [0.15, 0.15, 0.5, 0.3]}, "net_class": {"VDD": "Default", "GND": "Default"},
+            "pads": [
+                {"ref": "C1", "num": "1", "x": 2.0, "y": 2.0, "w": 0.5, "h": 0.5, "rot": 0, "shape": "rect", "layers": "F", "net": "VDD"},
+                {"ref": "C2", "num": "1", "x": 8.0, "y": 8.0, "w": 0.5, "h": 0.5, "rot": 0, "shape": "rect", "layers": "F", "net": "VDD"}
+            ],
+            "zones": [], "rule_areas": [], "routable_nets": 1,
+            "global_rules": {"min_track_width": 0.1, "min_copper_edge_clearance": 0.3},
+            "cold_routing": {"planes": {"GND": "B.Cu"}, "signal_pours": pours}
+        })
+    }
+
+    /// A pour on a signal layer makes its net a plane net of that layer (vias inside join it) while the layer
+    /// stays a signal layer for every other net.
+    #[test]
+    fn a_signal_layer_pour_joins_vias_inside_it_and_keeps_the_layer_routable() {
+        let m = model(json!([{"net": "VDD", "layer": "In2.Cu", "points": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]}]));
+        let b = Board::load(&m).expect("model");
+        let in2 = b.layers.iter().position(|l| l == "In2.Cu").unwrap();
+        assert!(b.signal.contains(&in2), "In2 stays a signal layer");
+        let vdd = b.net_index["VDD"];
+        assert_eq!(b.nets[vdd as usize].plane, Some(in2));
+        assert!(b.in_plane(vdd, p2(5.0, 5.0), 0.3), "a via inside the pour joins it");
+        assert!(!b.in_plane(vdd, p2(15.0, 15.0), 0.3), "outside it does not");
+        assert!(!b.in_plane_on(vdd, p2(5.0, 5.0), 0.25, Some(0)), "an F.Cu pad over it still needs a via");
+    }
+
+    #[test]
+    fn a_signal_pour_on_a_plane_layer_is_refused() {
+        let m = model(json!([{"net": "VDD", "layer": "B.Cu", "points": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]}]));
+        assert!(Board::load(&m).is_err());
     }
 }
