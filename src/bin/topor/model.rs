@@ -97,8 +97,12 @@ pub struct Board {
     pub plane_regions: Vec<PlaneRegion>,
     /// Areas of plane layers kept free of pour (cutouts).
     pub fill_keepouts: Vec<(usize, Vec<P2>)>,
-    /// Rule areas that forbid vias but not tracks (e.g. along an RF line): wires pass, vias stay out.
+    /// Rule areas that forbid vias: those that forbid vias but not tracks (e.g. along an RF line: wires pass, vias
+    /// stay out), and those that forbid both (also keepout objects for the tracks, whose checks reach only near
+    /// their edge).
     pub via_keepouts: Vec<Vec<P2>>,
+    /// Bounding box of each via keepout (lo, hi).
+    pub via_keepout_bb: Vec<(P2, P2)>,
     /// RF frontend nets (bench/pcb/topor_rf.py): each kept on the one layer it starts on, no vias, with why.
     pub rf_nets: Vec<(u32, String)>,
     pub name: String,
@@ -452,10 +456,18 @@ impl Board {
                     mask |= 1 << i;
                 }
             }
+            let no_vias = a["vias"].as_bool().unwrap_or(true);
             for pg in a["polygons"].as_array().into_iter().flatten() {
                 keep(poly(pg), mask, 0.0, Kind::Keepout, "rule_area", &mut objs);
+                // one that forbids vias as well keeps them out wherever they are in it: the keepout object's checks
+                // see only its edge near a via, not a via deep inside a large area
+                if no_vias {
+                    via_keepouts.push(poly(pg));
+                }
             }
         }
+        via_keepouts.retain(|k| k.len() >= 3);
+        let via_keepout_bb = via_keepouts.iter().map(|k| bbox_of(k)).collect();
         let outline = poly(&m["outline"]);
         let outline_holes: Vec<Vec<P2>> = m["outline_holes"].as_array().into_iter().flatten().map(|h| poly(h)).collect();
         // nets with no pads still get an id via net_class (ignored)
@@ -613,6 +625,7 @@ impl Board {
             plane_regions,
             fill_keepouts,
             via_keepouts,
+            via_keepout_bb,
             rf_nets,
             name,
             size,
@@ -715,7 +728,8 @@ impl Board {
     /// of its regions, clear of the region's edge and holes, of higher-priority pours of other nets on
     /// that layer and of fill keepouts (the pour keeps its clearance and needs room for a thermal).
     pub fn via_kept_out(&self, pos: P2, r: f64) -> bool {
-        self.via_keepouts.iter().any(|k| point_in_poly(k, pos) || poly_edge_dist(k, pos) < r + 0.01)
+        let m = r + 0.01;
+        self.via_keepouts.iter().zip(&self.via_keepout_bb).any(|(k, &(lo, hi))| pos.x > lo.x - m && pos.x < hi.x + m && pos.y > lo.y - m && pos.y < hi.y + m && (point_in_poly(k, pos) || poly_edge_dist(k, pos) < m))
     }
 
     pub fn in_plane(&self, net: u32, pos: P2, r: f64) -> bool {
@@ -944,6 +958,12 @@ fn clip_half(poly: &[P2], o: P2, n: P2) -> Vec<P2> {
         }
     }
     dedup_hull(&out)
+}
+
+fn bbox_of(pts: &[P2]) -> (P2, P2) {
+    let lo = pts.iter().fold(p2(f64::INFINITY, f64::INFINITY), |a, q| p2(a.x.min(q.x), a.y.min(q.y)));
+    let hi = pts.iter().fold(p2(f64::NEG_INFINITY, f64::NEG_INFINITY), |a, q| p2(a.x.max(q.x), a.y.max(q.y)));
+    (lo, hi)
 }
 
 fn dedup_hull(pts: &[P2]) -> Vec<P2> {
