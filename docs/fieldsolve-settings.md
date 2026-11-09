@@ -203,6 +203,31 @@ line.
 
 ## Fixed issues (keep in mind when reading older results)
 
+- **A net tie cut by the raster (warned since Nov 2026; `"net_ties"`).** The eBUS_IF B board's printed PIFA
+  AE1 (`WCH_24G_PIFA_10mm_mod`, `net_tie_pad_groups "1,2"`) has its feed pad (RF_ANT) reaching 0.1 mm
+  into its grounded pad. The raster cut the two apart at 12 mesh nodes without any warning, and the
+  antenna was fed through a ~0.85 pF series gap: a constant reactance of about −80 Ω and R peaks of
+  20-50 Ω instead of about 360 Ω. The eBUS B runs since then bridge it with a net-less edit (`TIE` in
+  `tools/ebus_b_rf.py`); `"net_ties": ["AE1"]` does the same job.
+  - **Audit of the earlier specs (186 of them, dry set-up):**
+    - **MTH R7A PIFA: not affected.** In the KiCad conversion's X2 Gerbers, ANT1's pads 1 and 2, R70.1
+      and C20 all carry net GND: the converter merged feed and short into one net, so the raster never
+      had two nets to cut there. What it does flag on MTH is far from the antenna: a few points where
+      the B.Cu GND and VCC3V3 zone fills touch, and U4 pad 3 touching VCC_S18. Cutting these is what the
+      layout means.
+    - **eBUS B:** the two runs without the bridge (`b_free`, `b_dry`) are affected. The runs with it
+      are not.
+    - **Earlier eBUS IFA studies** with `"net": "ANT"` edits over the GND pour: the case above, already
+      warned about and re-run.
+    - **1BP `1bp_gbr_nordic` (the first Nordic-layout transplant):** its ANT pad abuts the GND pour
+      with zero clearance. The cut models the intended gap, and the tidied transplant
+      (`1bp_gbr_nordic2`) is clean.
+    - **Elsewhere on 1BP:** two names for one signal (SCL2 and `/Page 2: .../SCL2`) at U1's pads, and
+      DCC/DEC4 against GND (1-3 edges each). None of it is on the RF path.
+    - **eBUS chip-antenna `ebus_chip_in1`:** its In1 GND patch is drawn over signal tracks, which end at
+      the patch's edge. That is the intent, and the edit warning already reported it.
+    - **AMOLED, nRF52840 DK, Nordic reference boards, eBUS FPC/YL1439/chip runs:** clean.
+
 - **An antenna short drawn with its own net (warned since Nov 2026).** Two eBUS inverted-F studies drew the
   whole antenna, short included, as `"net": "ANT"` over the GND pour. The raster cut the short off, so the
   antenna was an open-ended monopole: capacitive below resonance, with 3-9 Ω at a series resonance. An
