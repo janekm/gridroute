@@ -1424,9 +1424,18 @@ pub fn build(g: &Grid, lay: &Layout, lumped: &[Lumped], o: &BuildOpts) -> Proble
     p
 }
 
+/// Whether the surface-impedance update of in-plane edge `a` (0 = Ex, 1 = Ey) at (i, j, k) stays on the grid.
+/// It reads H one cell back along the two axes across the edge: Ex reads Hz at j - 1 and Hy at k - 1, Ey
+/// reads Hz at i - 1 and Hx at k - 1. The edge's own axis is free: Ex at i = 0 and Ey at j = 0 are ordinary
+/// interior edges and must keep their loss (on a domain without absorber they are a whole row of the sheet).
+pub(crate) fn cond_stencil_ok(a: usize, i: usize, j: usize, k: usize) -> bool {
+    k > 0 && if a == 0 { j > 0 } else { i > 0 }
+}
+
 /// Copper sheet edges that get a surface impedance: metal in-plane edges (cb = 0) of real copper outside
 /// the CPML slabs. Element copper ("~name": bars of ports and parts, whose loss is in the part model) and
-/// edges inside the absorber (where the curl carries CPML terms) stay perfect conductors.
+/// edges inside the absorber (where the curl carries CPML terms) stay perfect conductors. So do edges on
+/// the domain wall, where the update's stencil would leave the grid (`cond_stencil_ok`).
 fn cond_edges(g: &Grid, masks: &[SheetMask], nets: &[String], cb: &[Vec<f32>; 3], pml: &[usize; 6], c: &crate::cond::Conductor, dt: f64) -> crate::cond::Cond {
     use crate::cond::*;
     let (nx, ny, nz) = (g.nx(), g.ny(), g.nz());
@@ -1457,7 +1466,7 @@ fn cond_edges(g: &Grid, masks: &[SheetMask], nets: &[String], cb: &[Vec<f32>; 3]
                 let q = j * nx + i;
                 let id = g.idx(i, j, k);
                 for (a, on, net) in [(0usize, m.ex[q], m.exn[q]), (1usize, m.ey[q], m.eyn[q])] {
-                    if on && !wild[net as usize] && cb[a][id] == 0.0 && inside(i, j, k) && i > 0 && j > 0 && k > 0 {
+                    if on && !wild[net as usize] && cb[a][id] == 0.0 && inside(i, j, k) && cond_stencil_ok(a, i, j, k) {
                         ids.push(id as u32 | (a as u32) << 30);
                         fac.push(dz as f32);
                         layer.push(si as u32);

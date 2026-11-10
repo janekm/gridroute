@@ -318,7 +318,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         bodies.push(crate::bodies::Body { name, eps, tand, shape, metal });
     }
     let cell = num(&sp, "cell", 0.1);
-    let fmax = num(&sp, "fmax", 3e9);
+    let fmax = spec_fmax(&sp);
     let air = num(&sp, "air", 3.0);
     let air_z = num(&sp, "air_z", 4.0);
     let npml = num(&sp, "pml", 8.0) as usize;
@@ -1385,12 +1385,50 @@ impl RunOpts {
             fidelity: spec.get("fidelity_record").cloned().unwrap_or(Value::Null),
         }
     }
+
+    /// Every frequency a run evaluates besides the port sweep must lie at or below `fmax`. The far-field box
+    /// and the field snapshots are transformed from samples taken at 3 fmax (`dft_every`), so a frequency f
+    /// above fmax aliases with 3 fmax - f, where the Gaussian still carries energy: about 3.5 % of the power
+    /// at 1.2 fmax, 14 % at 1.3 fmax, and nothing meaningful from 1.5 fmax. The objective's port powers are
+    /// transformed at the full rate, but the excitation is 20 dB down at fmax and falls fast above it.
+    pub fn check_freqs(&self, fmax: f64) -> Result<(), String> {
+        let far = self.farfield.as_ref().map(|f| f.freqs.as_slice()).unwrap_or(&[]);
+        let (band, harm) = self.objective.as_ref().map(|o| (o.band.as_slice(), o.harmonics.as_slice())).unwrap_or((&[], &[]));
+        for (key, list, sampled) in [("farfield.freqs", far, true), ("fields.freqs", self.fields.as_slice(), true), ("objective.band", band, false), ("objective.harmonics", harm, false)] {
+            let over: Vec<String> = list.iter().filter(|&&f| f > fmax * (1.0 + 1e-9)).map(|f| format!("{:.3}", f * 1e-9)).collect();
+            if over.is_empty() {
+                continue;
+            }
+            let top = list.iter().cloned().fold(0.0, f64::max);
+            return Err(format!(
+                "\"{key}\": {} GHz is above \"fmax\" ({:.3} GHz). {} Set \"fmax\" to at least {:.3e} (the highest frequency asked for), \
+                 or drop the frequency.",
+                over.join(", "),
+                fmax * 1e-9,
+                if sampled {
+                    "These transforms sample the fields at 3 x fmax, so a result above fmax is aliased with a lower frequency and wrong."
+                } else {
+                    "The excitation has almost no energy above fmax, so the objective there is not meaningful."
+                },
+                top
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `"fmax"` of a run spec: the top of the port sweep and of the excitation's band (default 3 GHz).
+pub fn spec_fmax(spec: &Value) -> f64 {
+    num(spec, "fmax", 3e9)
 }
 
 /// Run every excitation of a board spec, write results to `out`.
 pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> {
+    // before the set-up: a frequency above fmax should fail at once, not after the mesh is built
+    let ro = RunOpts::from_spec(&cx.spec);
+    ro.check_freqs(spec_fmax(&cx.spec))?;
     let st = setup(cx)?;
-    run_setup(&st, out, backend, &RunOpts::from_spec(&cx.spec))
+    run_setup(&st, out, backend, &ro)
 }
 
 /// Frequency of the strongest component in the last third of a port signal, between `f0` and `f1` (the
@@ -1449,6 +1487,7 @@ pub fn z_from_s(s: &[Vec<Cx>], z0: f64) -> Option<Vec<Vec<Cx>>> {
 
 /// Run a prepared set-up, write `scene.json`, `result.json`, Touchstone and fields to `out`.
 pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Result<Value, String> {
+    ro.check_freqs(st.fmax)?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let t0 = std::time::Instant::now();
     let p = build(&st.grid, &st.layout, &st.lumped, &st.opts);
