@@ -30,7 +30,7 @@ def main():
         while pending and len(running)<a.jobs:
             name,opts=pending.pop(0);o=dict(shared);o.update(opts);dest=a.out/'variants'/name
             log=open(a.out/'variants'/(name+'.log'),'w')
-            running.append((name,dest,log,subprocess.Popen([sys.executable,str(ROOT/'run.py'),a.case,'--out',str(dest),
+            running.append((name,dest,log,subprocess.Popen([sys.executable,str(ROOT/'run.py'),a.case,'--out',str(dest),'--engine','grid',
                                                             '--options-json',json.dumps(o)],stdout=log,stderr=subprocess.STDOUT,env=env)))
         time.sleep(.5)
         for r in list(running):

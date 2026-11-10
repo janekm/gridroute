@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Serial native acceptance harness. A process exit is never routing acceptance."""
+"""Serial native acceptance harness. A process exit is never routing acceptance.
+
+Routes with topor by default (run.py); --engine grid uses the grid router. A case's manifest routing_options
+are grid options; with topor only deadline_seconds and topor_args are read from them.
+"""
 import argparse,collections,json,pathlib,subprocess,sys,time,os
 ROOT=pathlib.Path(__file__).resolve().parent
 
@@ -8,8 +12,11 @@ def main():
     p.add_argument('--kicad-python',default='/Applications/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3')
     p.add_argument('--kicad-cli',default='/Applications/KiCad.app/Contents/MacOS/kicad-cli');p.add_argument('--deadline',type=float,default=60)
     p.add_argument('--options-json',default='{}')
+    p.add_argument('--engine',choices=['topor','grid'],default='topor',help='routing engine (default topor)')
     p.add_argument('--native-feedback',action='store_true',help='Retry at most four native gaps, at two bounded pitches')
-    a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
+    a=p.parse_args()
+    if a.native_feedback and a.engine!='grid':p.error('--native-feedback repairs with the grid router: add --engine grid')
+    a.out.mkdir(parents=True,exist_ok=True)
     cases=json.loads((ROOT/'manifest.json').read_text())['cases'];rows=[]
     chosen=[c for c in cases if c['id'] in a.cases] if a.cases else [c for c in cases if c.get('enabled',True)]
     if a.cases and set(a.cases)-{c['id'] for c in chosen}:p.error('Unknown case name')
@@ -17,11 +24,11 @@ def main():
     env=dict(os.environ,PYTHONHASHSEED='0',GRIDROUTE_CACHE='off',GRIDROUTE_NO_BUILD='1')
     for case in chosen:
         name=case['id'];out=a.out/name;out.mkdir();options=dict(case.get('routing_options',{}));options.update(json.loads(a.options_json));options.setdefault('deadline_seconds',a.deadline)
-        commands=[([sys.executable,str(ROOT/'run.py'),name,'--out',str(out),'--options-json',json.dumps(options)],options['deadline_seconds']+120),
+        commands=[([sys.executable,str(ROOT/'run.py'),name,'--out',str(out),'--engine',a.engine,'--options-json',json.dumps(options)],options['deadline_seconds']+120),
                   ([a.kicad_python,str(ROOT/'kicad_io.py'),'export',name,'--out',str(out)],60),
                   ([a.kicad_cli,'pcb','drc','--format','json','--severity-all','--all-track-errors','-o',str(out/'routed-drc.json'),str(out/'routed.kicad_pcb')],120),
                   ([sys.executable,str(ROOT/'accept.py'),name,'--out',str(out)],30)]
-        row={'case':name,'steps':[]};start=time.monotonic()
+        row={'case':name,'engine':a.engine,'steps':[]};start=time.monotonic()
         with (out/'run.log').open('w') as log:
             for cmd,limit in commands:
                 try:code=subprocess.run(cmd,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=limit).returncode
