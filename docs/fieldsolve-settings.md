@@ -42,7 +42,7 @@ then start the long run.
 
 | warning | what it means | fix |
 |---|---|---|
-| `"loss": {"copper": true} is a plane-pair stand-in` | The copper stays lossless. Instead, about δ_s/h is added to the dielectric's tan δ. That is a rough stand-in for loss between two planes, and wrong for traces and antennas. | `"conductor": true`, and drop `"copper"` from `"loss"` |
+| `"loss": {"copper": true} is a plane-pair stand-in` | The copper stays lossless. Instead, about δ_s/h is added to the dielectric's tan δ. That is a rough stand-in for loss between two planes, and wrong for traces and antennas. Together with `"conductor"` the run is refused (plane loss counted twice). | `"conductor": true`, and drop `"copper"` from `"loss"` |
 | `far-field run with lossless copper` | Radiation efficiency and gain come out optimistic. | `"conductor": true`, or `"preset": "antenna"` |
 | `far-field run without "loss": {"model": "wideband"}` | Substrate loss is right at one frequency only. | `"loss": {"model": "wideband"}` |
 | `far-field run with the domain cropped to "roi"` | The board's ground beyond the window is missing, and on a small board it is part of the antenna. | `"extent": "board"` |
@@ -52,6 +52,10 @@ then start the long run.
 | `N signal nets ... carry 10 mm or more of track with nothing modelled on them` (far-field runs) | Long signal tracks near the fine region end at a chip that isn't modelled. Their far ends are often unconnected pins too, so they are resonant stubs. | `"pin_loads"` on the chip they run to (see The model). Nets you have checked go in `"open_nets_ok"`. |
 | `port X reached max_steps before any stop rule` | The run was cut off before it converged, so the S-parameters are an estimate. | Raise `max_steps`, or loosen `end_db` |
 | `power balance ... check the port's placement` (on a full run) | The port's energy does not add up. The port bridge may miss a pad, or short the port. | Check the printed nets under each port, and `fieldsolve raster` |
+| `far-field box: N tangential and M normal E edges on its faces are not free space` | Copper, dielectric or a lead crosses the far-field box. The far field, radiated power and efficiency are not valid. | More air (`"air"`, `"air_z"`), or keep every body and lead inside the box |
+| `not every port is excited, and X (R ohm) is not 50 ohm` | S11, `s_col_db`, the objective and the far field are the response with that port in its own resistance, not 50 Ω S-parameters or matched patterns. | `"excite": "all"` |
+| `S-matrix: the wave matrix is singular at N of M frequencies` | S is written as 0 at those frequencies. A port saw no incident wave, or two excitations were not independent. | Check the ports' placement and the printed nets under each port |
+| `wideband loss: the Debye fit misses the loss tangent asked for by up to N %` | The loss band spans too many decades for the eight poles (over 10 % error). | Narrow `"f_lo"`..`"f_hi"` to the band in use |
 | `edit ... (net X) overlaps copper of net Y` | An `"add"` edit carries a net and lies on another net's copper. The net-aware raster cuts copper of two nets apart where they touch, so the added copper is **not** connected to it. | Leave `"net"` out of edits that must join existing copper (an inverted-F's short into the ground pour). Net-less copper never conflicts. |
 
 ## Geometry: the fine region
@@ -139,6 +143,11 @@ then start the long run.
   A run refuses any `"farfield"`, `"fields"` or `"objective"` frequency above `fmax`: the far-field box is
   sampled at 3 × `fmax`, and a result above `fmax` is aliased (14 % wrong at 1.3 × `fmax`). The default
   `fmax` is 3 GHz, so a spec that lists 4.88 GHz without setting `fmax` used to return a wrong number.
+  Also refused, all before the mesh is built:
+  - an `"objective"` band frequency that is not in `"farfield.freqs"` (with a far field the objective is
+    the radiated power, which exists only at those frequencies);
+  - `"loss": {"copper": true}` together with `"conductor"`;
+  - `"farfield": {"gap": 0}`.
 - **Far field:** list frequencies on a dense grid across the band, 0.02-0.05 GHz apart, plus the
   harmonics. A board can carry a narrow, lossy resonance about 0.05 GHz wide that removes 5-12 points of
   efficiency at one frequency and moves between meshes. Three spot frequencies (2.40 / 2.44 / 2.48 GHz) can
@@ -160,6 +169,27 @@ then start the long run.
 - **Far field:** the box flux check should agree with the far-field integral to about 1 %.
 - **Timing:** two jobs sharing the GPU each run 1.5-2× slower. Compare speed-ups in cells × steps, or time
   them on an idle GPU.
+
+## Tuning an antenna's length
+
+- **Tune to the match, not to the resistance peak.** A tapped PIFA or inverted-F seen at its feed shows a
+  high-resistance parallel resonance (hundreds of ohms to kilohms, X crossing zero) *below* the frequency
+  where it is matched. It's designed to pass close to 50 Ω a few hundred MHz higher, where X crosses zero a
+  second time. The figure of merit for a length change is |S11| against 50 Ω at the feed (best value and
+  the −10 dB band), or better, the ladder co-simulation's objective at the chip pin. On the eBUS B board, the
+  WCH/MTH PIFA as drawn had its R peak at 2.12 GHz but its 50 Ω match at 2.41 GHz (−21 dB). Moving the
+  R peak to 2.44 GHz took a 9.2 mm cut and left no −10 dB band at all; the right trim was 1.05 mm.
+- **A late-time ringing warning names the high-Q feature,** usually that parallel resonance, not the
+  operating frequency.
+- **Compare with a known-good result first.** For a reference design or an antenna already measured or
+  simulated on another board, check that the new board reproduces it in free space before changing it. Then
+  split the detuning: free space, enclosure only, installed.
+- **Plausibility limits:** a moulded plastic housing a millimetre or so from a printed antenna typically
+  moves it 2-5 %. A required change beyond about 5 % of frequency, or of the radiator's length, needs an
+  explanation (a different ground plane, a modelling fault) before it goes into the layout.
+- **Check the model's nets at the feed.** A net-tie antenna footprint (feed pad on the RF net, radiator on
+  GND) was cut apart by the net-aware raster, which fed the antenna through a ~0.85 pF gap and moved every
+  number. Bridge the junction with net-less copper until net ties are handled.
 
 ## Known open issues
 
@@ -196,3 +226,25 @@ then start the long run.
 - **Copper loss through the plane-pair stand-in.** On the MTH PIFA, real copper (`"conductor": true`)
   costs 4-5 points of radiation efficiency compared with `"loss": {"copper": true}`. Every far-field
   result from before Nov 2026 that used the stand-in is that much optimistic.
+- **`cosim` and `tune` mixed frequencies (fixed Nov 2026).** The EM S-matrix came from the nearest sweep
+  point while the parts and patterns used the exact frequency. Both now interpolate the EM data to the
+  frequency asked for. On the MTH fixture the scores moved by 0.06-0.08 dB; near a sharp resonance on a
+  coarse sweep the old error reached 16 % in S. Results where every report frequency was a sweep point
+  are unchanged.
+- **Part files held outside their range (reported since Nov 2026).** A vendor file that stops below a
+  harmonic is still held at its end value, but `cosim.json` and `tune.json` now carry `"warnings"` naming
+  the part and the frequency. Check older harmonic results against the files' ranges.
+- **One port excited, another port not at 50 Ω (fixed Nov 2026).** The far-field summary counted the wave
+  such a port reflects as absorbed, so "power out of the other ports", loss and efficiency were wrong.
+  The bookkeeping is now exact, `farfield.json` records `"other_ports"`, and the run warns. Runs with
+  `"excite": "all"`, or with every port at 50 Ω, are unchanged.
+- **Edge corrections with a plane 2 to 4 cells away (fixed Nov 2026).** The singular factors faded to no
+  correction instead of to the conformal one. On a 0.2 mm substrate at 0.06-0.08 mm cells εeff was up to
+  4 % low; it is now within 0.25 %. Unchanged at 4 or more cells across the substrate, and where a plane
+  is closer than 2 cells (the 75 µm prepreg cases).
+- **Far-field box in graded cells (fixed Nov 2026).** H was averaged across each face without cell-size
+  weights, which read the radiated power about 1 % low when the box lay in graded cells. A box in uniform
+  cells is unchanged.
+- **Far-field box crossed by a thin lead (warned since Nov 2026).** The box check looked at tangential
+  edges only, so a wire, via barrel or port lead one cell across could leave the box unnoticed. The check
+  now counts normal edges too and is written to `result.json` `"checks"`.

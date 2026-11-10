@@ -919,8 +919,11 @@ impl Evaluator for SimEval<'_> {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("spec.json"), serde_json::to_string_pretty(&spec).unwrap()).map_err(|e| e.to_string())?;
         let mut cx = sim::Ctx { spec, board, kicad: self.kicad, zs: vec![] };
-        let r = sim::run(&mut cx, &dir, self.backend)?;
-        eval_of(&r, false)
+        sim::run(&mut cx, &dir, self.backend)?;
+        // score from the file just written, as a cached point is: serde_json's default number parser can be
+        // one ulp off the value in memory, and a repeated search must give the same numbers bit for bit
+        let t = std::fs::read_to_string(dir.join("result.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
+        eval_of(&serde_json::from_str(&t).map_err(|e| format!("{}: {e}", dir.display()))?, false)
     }
 }
 

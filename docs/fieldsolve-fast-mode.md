@@ -27,8 +27,10 @@ target/release/fieldsolve radmatrix run/farfield.json [candidates]   # radiation
 
 `tune` loads `sparams.sNp`, `result.json` and `farfield.json` of an all-port EM run once. It then:
 
-- **caches every allowed part's reflection** at the objective frequencies (one solve point per band frequency
-  for the match, one for the radiation, one per harmonic; the frequency conventions are exactly `cosim`'s);
+- **caches every allowed part's reflection** at the objective frequencies. Each band frequency and each
+  harmonic is one solve point: the EM S-matrix interpolated to that frequency, as `cosim` does, with the
+  parts and the pattern at the same frequency. Frequencies outside the EM sweep, and parts whose files do
+  not cover an objective frequency, are listed in `tune.json` `"warnings"` and printed;
 - **reduces the patterns to radiation matrices.** For embedded patterns E_i and incident waves a_i,
   `R_ij = ∮ (conj Eθ_i Eθ_j + conj Eφ_i Eφ_j) / (2 η0) dΩ` and `P_rad = Re(aᴴ R a)`, on the far field's
   own quadrature. This is algebraically `Pattern::combine(..).p_rad()`; the off-diagonal terms carry the
@@ -175,6 +177,11 @@ domain, since the ground plane is part of the antenna, and materials, loss, port
   to the other ports and the radiated box flux, each in dB, at every energy check. `result.json`
   `"objective"` holds the per-frequency totals: radiated power per watt incident, with the other ports
   matched (the radiated part from the far field), and the worst of the band.
+  - With a far field every band frequency must be one of `"farfield.freqs"`, or the run is refused: the
+    radiated power exists only there. A harmonic that is not a far-field frequency is tracked by its
+    accepted power and coupling alone.
+  - With one port excited and another port not at 50 Ω, the totals are the response with that port in its
+    own resistance (the record's `"quantity"` says so), and the run warns.
 - **The objective stop** ends an excitation once every component's spread (max − min) over the last
   `window_periods` periods of the band's lowest frequency is at most `tol_db`, and the source has ended,
   followed by `min_settle_periods` periods (8 by default). The standard energy/port rule is then only

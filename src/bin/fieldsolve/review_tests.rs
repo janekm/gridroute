@@ -249,7 +249,7 @@ fn nearly_aligned_pads_keep_the_straight_bridge() {
 #[test]
 fn frequencies_above_fmax_are_rejected() {
     let ok = json!({"fmax": 8e9, "farfield": {"freqs": [2.44e9, 4.88e9, 7.32e9]}, "fields": {"freqs": [2.44e9, 8e9]},
-                    "objective": {"band": [2.40e9, 2.48e9], "harmonics": [4.88e9, 7.32e9]}});
+                    "objective": {"band": [2.44e9], "harmonics": [4.88e9, 7.32e9]}});
     assert!(sim::RunOpts::from_spec(&ok).check_freqs(sim::spec_fmax(&ok)).is_ok());
     // the default fmax is 3 GHz: the second harmonic of 2.44 GHz is out of reach
     for (bad, key) in [
@@ -306,4 +306,109 @@ fn sheet_loss_covers_the_first_row_of_edges() {
     assert_eq!(count(&|e| e.0 == 1 && e.2 == 0), count(&|e| e.0 == 1 && e.2 == 1));
     // and the stencil never leaves the grid
     assert_eq!(count(&|e| (e.0 == 0 && e.2 == 0) || (e.0 == 1 && e.1 == 0)), 0);
+}
+
+/// Physics review A8: where the excitations are not independent S has no value; the zeros written there
+/// must be reported, and the test has to be relative (a weak excitation is not a singular one).
+#[test]
+fn singular_wave_matrix_is_reported() {
+    let z0 = 50.0f64;
+    let s_ref = [[Cx::new(0.2, 0.1), Cx::new(0.5, -0.3)], [Cx::new(0.5, -0.3), Cx::new(-0.1, 0.4)]];
+    // excitation j with unit incident wave at port j, the other port matched: a = e_j, b = S e_j
+    let vi = |j: usize, k: usize, amp: f64| {
+        let a = if j == k { Cx::new(1.0, 0.0) } else { Cx::default() };
+        let b = s_ref[k][j];
+        ((a + b) * (z0.sqrt() * amp), (a - b) * (amp / z0.sqrt()))
+    };
+    // frequency 0: as is; 1: the second excitation repeats the first; 2: both excitations 1e-9 as strong
+    let cell = |j: usize, k: usize, f: usize| match f {
+        0 => vi(j, k, 1.0),
+        1 => vi(0, k, 1.0),
+        _ => vi(j, k, 1e-9),
+    };
+    let v: Vec<Vec<Vec<Cx>>> = (0..2).map(|j| (0..2).map(|k| (0..3).map(|f| cell(j, k, f).0).collect()).collect()).collect();
+    let i: Vec<Vec<Vec<Cx>>> = (0..2).map(|j| (0..2).map(|k| (0..3).map(|f| cell(j, k, f).1).collect()).collect()).collect();
+    let (s, singular) = post::s_matrix(&v, &i, z0);
+    assert_eq!(singular, vec![1]);
+    for p in 0..2 {
+        for j in 0..2 {
+            assert!((s[p][j][0] - s_ref[p][j]).abs() < 1e-12 && (s[p][j][2] - s_ref[p][j]).abs() < 1e-9, "S{p}{j}: {:?} {:?}", s[p][j][0], s[p][j][2]);
+            assert_eq!(s[p][j][1].abs(), 0.0);
+        }
+    }
+}
+
+/// Physics review A8: a conductor one cell across that leaves the far-field box along a face normal sets
+/// no tangential edge on the face. The box check has to see it, and the warning has to exist as text (it
+/// goes to result.json "checks", not only to the log).
+#[test]
+fn far_field_box_check_sees_a_wire_along_the_face_normal() {
+    let mut st = cases::dipole_setup(10.0, 1.0, 3e9, 10.0);
+    let p = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+    let plan = nf2ff::auto_plan(&p, st.opts.pml, 3).unwrap();
+    assert_eq!(nf2ff::non_free_edges(&p, &plan), (0, 0));
+    assert!(nf2ff::box_warning(&p, &plan).is_none());
+    // the upper arm continued to the top of the domain: it crosses the +z face
+    st.layout.barrels[1].z1 = st.grid.z.last().unwrap() * 1e3;
+    let p = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+    let (tangential, normal) = nf2ff::non_free_edges(&p, &plan);
+    assert_eq!(tangential, 0, "the wire sets no tangential edge: the old check could not see it");
+    assert_eq!(normal, 2, "the edge ending on the face and the one starting on it");
+    let w = nf2ff::box_warning(&p, &plan).unwrap();
+    assert!(w.contains("2 normal") && w.contains("not valid"), "{w}");
+    // a box on the absorber is refused
+    assert!(nf2ff::auto_plan(&p, st.opts.pml, 0).unwrap_err().contains("gap"));
+}
+
+/// Physics review A8: with a far field the objective is the radiated power, which exists only at the
+/// far-field frequencies. A band frequency outside that list used to fall back to the accepted power
+/// silently; a harmonic outside it shifted the names of the tracked components.
+#[test]
+fn objective_band_must_be_in_the_far_field_list() {
+    let spec = |band: serde_json::Value, far: serde_json::Value| json!({"fmax": 6e9, "farfield": far, "objective": {"band": band, "harmonics": [4.88e9]}});
+    let check = |s: &serde_json::Value| sim::RunOpts::from_spec(s).check_freqs(sim::spec_fmax(s));
+    assert!(check(&spec(json!([2.4e9, 2.45e9]), json!({"freqs": [2.4e9, 2.45e9, 2.5e9]}))).is_ok());
+    // no far field: the objective is the accepted power, at any frequency of the sweep
+    assert!(check(&spec(json!([2.4e9, 2.47e9]), serde_json::Value::Null)).is_ok());
+    let e = check(&spec(json!([2.4e9, 2.47e9]), json!({"freqs": [2.4e9, 2.45e9, 2.5e9]}))).unwrap_err();
+    assert!(e.contains("objective.band") && e.contains("2.4700") && e.contains("farfield.freqs") && !e.contains("2.4000"), "{e}");
+    // the names of the tracked components: a radiated entry only where the box is transformed
+    let o = sim::ObjectiveOpts::from_spec(&spec(json!([2.4e9, 2.45e9]), serde_json::Value::Null)).unwrap();
+    let names = vec!["P".to_string(), "Q".to_string()];
+    let c = o.components(&names, 0, Some(&[2.4e9, 2.45e9, 2.5e9]));
+    assert_eq!(c.len(), 3 * 2 + 2, "{c:?}");
+    assert_eq!(c.iter().filter(|n| n.starts_with("radiated")).count(), 2);
+    assert!(!c.iter().any(|n| n == "radiated 4.880GHz") && c.iter().any(|n| n == "radiated 2.450GHz"), "{c:?}");
+    assert_eq!(o.components(&names, 0, None).len(), 3 * 2);
+}
+
+/// Physics review A8: settings that contradict each other are refused at set-up, and the wideband fit's
+/// error is kept.
+#[test]
+fn contradictory_loss_models_and_a_zero_gap_are_refused() {
+    let base = json!({"roi": [-2, -2, 2, 2], "cell": 0.2, "air": 1, "air_z": 1, "max_cell": 0.5, "pml": 2, "fmax": 6e9});
+    let with = |extra: serde_json::Value| {
+        let mut s = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            s[k] = v.clone();
+        }
+        sim::setup(&mut ctx(vec![rect(-0.2, -0.2, 0.2, 0.2, "A")], s))
+    };
+    let e = with(json!({"loss": {"model": "wideband", "copper": true}, "conductor": true})).err().unwrap();
+    assert!(e.contains("counted twice"), "{e}");
+    assert!(with(json!({"loss": {"model": "wideband", "copper": true}, "conductor": false})).is_ok());
+    let e = with(json!({"farfield": {"freqs": [2.4e9], "gap": 0}})).err().unwrap();
+    assert!(e.contains("gap") && e.contains("at least 1"), "{e}");
+    assert!(with(json!({"farfield": {"freqs": [2.4e9], "gap": 1}})).is_ok());
+
+    // the fit error: a few percent for a board band, none without the wideband model
+    assert!(with(json!({})).unwrap().loss_fit.is_none());
+    let st = with(json!({"loss": {"model": "wideband"}, "conductor": true})).unwrap();
+    let (poles, worst) = st.loss_fit.unwrap();
+    assert!(poles >= 3 && worst > 0.0 && worst < sim::LOSS_FIT_WARN, "{poles} poles, {worst}");
+    assert!(!st.checks.iter().any(|c| c.contains("Debye fit")), "{:?}", st.checks);
+    // eight poles (the most there are) over nine decades cannot hold the loss tangent flat: say so
+    let st = with(json!({"loss": {"model": "wideband", "f_lo": 1e3, "f_hi": 1e12}})).unwrap();
+    assert!(st.loss_fit.unwrap().1 > sim::LOSS_FIT_WARN);
+    assert!(st.checks.iter().any(|c| c.contains("Debye fit")), "{:?}", st.checks);
 }

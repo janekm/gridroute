@@ -105,6 +105,32 @@ pub fn si(s: &str) -> Result<f64, String> {
     body.parse::<f64>().map(|v| v * mul).map_err(|_| format!("bad value {s:?}"))
 }
 
+/// Local cubic (four-point Lagrange) interpolation on the ascending grid `x`: the first point of the window,
+/// the number of points in it and their weights at `f`. `f` is held inside the grid. At a grid point the
+/// weights are exactly 1 and 0, so data on the grid comes back unchanged.
+pub fn interp_weights(x: &[f64], f: f64) -> (usize, usize, [f64; 4]) {
+    let n = x.len();
+    let m = n.min(4);
+    let f = f.clamp(x[0], x[n - 1]);
+    let k = x.partition_point(|&v| v < f);
+    let i0 = k.saturating_sub(2).min(n - m);
+    let mut w = [0.0; 4];
+    for a in 0..m {
+        w[a] = (0..m).filter(|&b| b != a).map(|b| (f - x[i0 + b]) / (x[i0 + a] - x[i0 + b])).product();
+    }
+    (i0, m, w)
+}
+
+/// The S-matrix `s[i][j]` of a sweep at frequency `f`, interpolated between the sweep's points
+/// (`interp_weights`). The parts and the far-field patterns are evaluated at the exact frequency asked for,
+/// so the EM data must be too: at a resonance of Q 20 the nearest point of a 20 MHz sweep is up to 16 % off
+/// in S, the interpolated value under 1 %.
+pub fn s_at(ts: &Touchstone, f: f64) -> Vec<Vec<Cx>> {
+    let (i0, m, w) = interp_weights(&ts.freqs, f);
+    let n = ts.s.len();
+    (0..n).map(|i| (0..n).map(|j| (0..m).fold(Cx::default(), |acc, a| acc + ts.s[i][j][i0 + a] * w[a])).collect()).collect()
+}
+
 /// A two-terminal part's impedance model.
 #[derive(Clone)]
 pub enum Part {
@@ -199,6 +225,21 @@ impl Part {
                 Some(z[k - 1] * (1.0 - t) + z[k] * t)
             }
         }
+    }
+
+    /// The frequency range of a vendor table (through any series element); `None` for a model.
+    pub fn table_range(&self) -> Option<(f64, f64)> {
+        match self {
+            Part::Table { freqs, .. } => Some((freqs[0], freqs[freqs.len() - 1])),
+            Part::Series { inner, .. } => inner.table_range(),
+            _ => None,
+        }
+    }
+
+    /// Whether `f` is outside a vendor table's range, where `z` holds the end value: the part's parasitics
+    /// stop changing with frequency there, which is wrong (a capacitor's reactance keeps rising with its ESL).
+    pub fn held_at(&self, f: f64) -> Option<(f64, f64)> {
+        self.table_range().filter(|&(a, b)| f < a * (1.0 - 1e-9) || f > b * (1.0 + 1e-9))
     }
 
     fn gamma(&self, f: f64, z0: f64) -> Cx {
@@ -408,22 +449,14 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
     let plot_ideal = cfg["plot_ideal"].as_bool().unwrap_or(true);
     // target: a measured matching network (port 1 = chip side) loaded with Z0, i.e. the load the chip is
     // designed to see; each case is scored by the power-wave reflection against it
-    let target: Option<Vec<Cx>> = match cfg["target"].as_str() {
-        Some(t) => {
-            let ts = read_touchstone(&base.join(t))?;
-            let z = freqs
-                .iter()
-                .map(|&f| {
-                    let k = ts.freqs.partition_point(|&x| x < f).clamp(1, ts.freqs.len() - 1);
-                    let (f0, f1) = (ts.freqs[k - 1], ts.freqs[k]);
-                    let w = ((f - f0) / (f1 - f0)).clamp(0.0, 1.0);
-                    let s11 = ts.s[0][0][k - 1] * (1.0 - w) + ts.s[0][0][k] * w;
-                    zin(s11, ts.z0)
-                })
-                .collect();
-            Some(z)
-        }
-        None => None,
+    let target_ts = cfg["target"].as_str().map(|t| read_touchstone(&base.join(t))).transpose()?;
+    let target = |f: f64| -> Option<Cx> {
+        target_ts.as_ref().map(|ts| {
+            let k = ts.freqs.partition_point(|&x| x < f).clamp(1, ts.freqs.len() - 1);
+            let (f0, f1) = (ts.freqs[k - 1], ts.freqs[k]);
+            let w = ((f - f0) / (f1 - f0)).clamp(0.0, 1.0);
+            zin(ts.s[0][0][k - 1] * (1.0 - w) + ts.s[0][0][k] * w, ts.z0)
+        })
     };
     // "deembed": true removes, from every part, the partial inductance of the bare stretch of its port's bar
     // (result.json "port_bars"): a vendor model measured on its fixture already holds its body's
@@ -440,16 +473,26 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         v.sort_by(|a, b| a.0.cmp(b.0));
         println!("bar inductance removed (nH): {}", v.iter().map(|(n, l)| format!("{n} {:.3}", *l * 1e9)).collect::<Vec<_>>().join(", "));
     }
-    let gam_t = |z: Cx, fi: usize| target.as_ref().map(|t| ((z - t[fi]) / (z + t[fi].conj())).abs());
+    let gam_t = |z: Cx, f: f64| target(f).map(|t| ((z - t) / (z + t.conj())).abs());
     // "farfield": true -> per-port patterns from farfield.json next to the EM file
     let far = if cfg["farfield"].as_bool().unwrap_or(false) { Some(crate::nf2ff::read_farfield(&em_path.with_file_name("farfield.json"))?) } else { None };
     let colours = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"];
     let mut curves = Vec::new();
     let mut out_json = serde_json::Map::new();
     let vars = cfg["variants"].as_object().ok_or("cosim: needs \"variants\"")?;
-    let at = |f: f64| freqs.iter().enumerate().min_by(|a, b| (a.1 - f).abs().partial_cmp(&(b.1 - f).abs()).unwrap()).unwrap().0;
-    println!("{:<24} {:>8} {:>9} {:>9} {:>18}{}", "case", "f [GHz]", "S11 [dB]", "S21 [dB]", "Zin chip side [Ω]", if target.is_some() { "  |Γ| vs target" } else { "" });
-    let tcol = |z: Cx, fi: usize| gam_t(z, fi).map(|g| format!("  {g:13.3}")).unwrap_or_default();
+    // a frequency asked for is evaluated at that frequency: S interpolated on the sweep (`s_at`), the parts,
+    // the target and the patterns at f. Outside the sweep S is held at its end point, with a warning.
+    let (f_lo, f_hi) = (freqs[0], freqs[freqs.len() - 1]);
+    let mut outside: Vec<f64> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut in_sweep = |f: f64| -> f64 {
+        if (f < f_lo * (1.0 - 1e-9) || f > f_hi * (1.0 + 1e-9)) && !outside.contains(&f) {
+            outside.push(f);
+        }
+        f.clamp(f_lo, f_hi)
+    };
+    println!("{:<24} {:>8} {:>9} {:>9} {:>18}{}", "case", "f [GHz]", "S11 [dB]", "S21 [dB]", "Zin chip side [Ω]", if target_ts.is_some() { "  |Γ| vs target" } else { "" });
+    let tcol = |z: Cx, f: f64| gam_t(z, f).map(|g| format!("  {g:13.3}")).unwrap_or_default();
     for (vk, (vname, parts_v)) in vars.iter().enumerate() {
         let mut parts: Vec<(usize, Part)> = Vec::new();
         let mut by_name = std::collections::HashMap::new();
@@ -472,6 +515,26 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
             by_name.insert(pn.clone(), p.clone());
             parts.push((idx(pn)?, p));
         }
+        // vendor tables that do not reach a frequency asked for (report, far field) or the ends of the sweep
+        let asked: Vec<f64> = report.iter().copied().chain(far.iter().flat_map(|x| x.0.iter().copied())).collect();
+        for (pn, ps) in parts_v.as_object().into_iter().flatten() {
+            let Some((a, b)) = by_name.get(pn).and_then(|p| p.table_range()) else { continue };
+            let bad: Vec<String> = asked.iter().filter(|&&f| by_name[pn].held_at(f).is_some()).map(|f| format!("{:.3}", f * 1e-9)).collect();
+            let sweep = by_name[pn].held_at(f_lo).is_some() || by_name[pn].held_at(f_hi).is_some();
+            if bad.is_empty() && !sweep {
+                continue;
+            }
+            let mut w = format!("{pn} = {}: the file covers {:.3} to {:.3} GHz and the part is held at its end value outside that", ps.as_str().unwrap_or(""), a * 1e-9, b * 1e-9);
+            if !bad.is_empty() {
+                w += &format!(": the results at {} GHz are not valid for this part", bad.join(", "));
+            } else {
+                w += &format!(" (part of the {:.3} to {:.3} GHz sweep in the exported file and the plot; no frequency asked for is affected)", f_lo * 1e-9, f_hi * 1e-9);
+            }
+            if !warnings.contains(&w) {
+                println!("WARNING: {w}");
+                warnings.push(w);
+            }
+        }
         for (k, n) in names.iter().enumerate() {
             if !keep.contains(&k) && !parts.iter().any(|p| p.0 == k) {
                 return Err(format!("variant {vname:?}: EM port {n:?} has no part (use \"open\" to leave it open)"));
@@ -483,11 +546,11 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         let mut red: Vec<Vec<Vec<Cx>>> = vec![vec![Vec::with_capacity(freqs.len()); keep.len()]; keep.len()];
         let mut red0: Vec<Vec<Vec<Cx>>> = vec![vec![Vec::with_capacity(freqs.len()); keep.len()]; keep.len()];
         let mut ideal: Vec<[[Cx; 2]; 2]> = Vec::new();
-        let mut ideal0: Vec<Cx> = Vec::new();
-        for (fi, &f) in freqs.iter().enumerate() {
-            let sf: Vec<Vec<Cx>> = (0..em.s.len()).map(|i| (0..em.s.len()).map(|j| em.s[i][j][fi]).collect()).collect();
+        // the kept ports' S at f from the EM S-matrix `sf` at f: at the requested references, and at the EM
+        // file's
+        let reduce = |f: f64, sf: &[Vec<Cx>]| -> (Vec<Vec<Cx>>, Vec<Vec<Cx>>) {
             let t: Vec<(usize, Cx)> = parts.iter().map(|(k, p)| (*k, p.gamma(f, em.z0))).collect();
-            let mut r = terminate(&sf, &keep, &t);
+            let mut r = terminate(sf, &keep, &t);
             if deembed_kept {
                 let w = 2.0 * std::f64::consts::PI * f;
                 let zs: Vec<Cx> = keep.iter().map(|&k| Cx::new(0.0, -w * bar_l.get(&names[k]).copied().unwrap_or(0.0))).collect();
@@ -497,21 +560,33 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
             if renorm {
                 r = renormalise(&r, em.z0, &zr);
             }
+            (r, r0)
+        };
+        // the ideal ladder at f: at the requested references, and its S11 at the EM file's
+        let ideal_at = |f: f64| -> Option<([[Cx; 2]; 2], Cx)> {
+            if ladder_spec.is_empty() {
+                return None;
+            }
+            let steps: Vec<(bool, Part)> = ladder_spec.iter().map(|(sh, n)| (*sh, by_name.get(n).cloned().unwrap_or(Part::Open))).collect();
+            let mut l = ladder(&steps, f, em.z0);
+            let l0 = l[0][0];
+            if renorm && keep.len() == 2 {
+                let m = vec![vec![l[0][0], l[0][1]], vec![l[1][0], l[1][1]]];
+                let m = renormalise(&m, em.z0, &zr);
+                l = [[m[0][0], m[0][1]], [m[1][0], m[1][1]]];
+            }
+            Some((l, l0))
+        };
+        for (fi, &f) in freqs.iter().enumerate() {
+            let sf: Vec<Vec<Cx>> = (0..em.s.len()).map(|i| (0..em.s.len()).map(|j| em.s[i][j][fi]).collect()).collect();
+            let (r, r0) = reduce(f, &sf);
             for i in 0..keep.len() {
                 for j in 0..keep.len() {
                     red[i][j].push(r[i][j]);
                     red0[i][j].push(r0[i][j]);
                 }
             }
-            if !ladder_spec.is_empty() {
-                let steps: Vec<(bool, Part)> = ladder_spec.iter().map(|(sh, n)| (*sh, by_name.get(n).cloned().unwrap_or(Part::Open))).collect();
-                let mut l = ladder(&steps, f, em.z0);
-                ideal0.push(l[0][0]);
-                if renorm && keep.len() == 2 {
-                    let m = vec![vec![l[0][0], l[0][1]], vec![l[1][0], l[1][1]]];
-                    let m = renormalise(&m, em.z0, &zr);
-                    l = [[m[0][0], m[0][1]], [m[1][0], m[1][1]]];
-                }
+            if let Some((l, _)) = ideal_at(f) {
                 ideal.push(l);
             }
         }
@@ -528,18 +603,19 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         };
         let mut rows = Vec::new();
         for &fr in &report {
-            let fi = at(fr);
-            let (s11, s21) = (red[0][0][fi], if keep.len() > 1 { red[1][0][fi] } else { Cx::default() });
-            let z = zin(red0[0][0][fi], em.z0);
-            println!("{:<24} {:>8.3} {:>9.2} {:>9.2} {:>9.2} {:+8.2}j{}", format!("{vname} + layout"), freqs[fi] / 1e9, db(s11), db(s21), z.re, z.im, tcol(z, fi));
-            let mut row = json!({"f": freqs[fi], "s11_db": db(s11), "s21_db": db(s21), "zin": [z.re, z.im]});
-            if let Some(g) = gam_t(z, fi) {
+            let f = in_sweep(fr);
+            let (r, r0) = reduce(f, &s_at(&em, f));
+            let (s11, s21) = (r[0][0], if keep.len() > 1 { r[1][0] } else { Cx::default() });
+            let z = zin(r0[0][0], em.z0);
+            println!("{:<24} {:>8.3} {:>9.2} {:>9.2} {:>9.2} {:+8.2}j{}", format!("{vname} + layout"), f / 1e9, db(s11), db(s21), z.re, z.im, tcol(z, f));
+            let mut row = json!({"f": f, "s11_db": db(s11), "s21_db": db(s21), "zin": [z.re, z.im]});
+            if let Some(g) = gam_t(z, f) {
                 row["gamma_vs_target"] = json!(g);
             }
-            if let Some(l) = ideal.get(fi) {
-                let zi = zin(ideal0[fi], em.z0);
+            if let Some((l, l0)) = ideal_at(f) {
+                let zi = zin(l0, em.z0);
                 if plot_ideal {
-                    println!("{:<24} {:>8.3} {:>9.2} {:>9.2} {:>9.2} {:+8.2}j{}", format!("{vname}, ideal ladder"), freqs[fi] / 1e9, db(l[0][0]), db(l[1][0]), zi.re, zi.im, tcol(zi, fi));
+                    println!("{:<24} {:>8.3} {:>9.2} {:>9.2} {:>9.2} {:+8.2}j{}", format!("{vname}, ideal ladder"), f / 1e9, db(l[0][0]), db(l[1][0]), zi.re, zi.im, tcol(zi, f));
                 }
                 row["ideal"] = json!({"s11_db": db(l[0][0]), "s21_db": db(l[1][0]), "zin": [zi.re, zi.im]});
             }
@@ -551,8 +627,7 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         if let Some((ffreq, fnames, fpats)) = &far {
             let mut frows = Vec::new();
             for (q, &f) in ffreq.iter().enumerate() {
-                let fi = at(f);
-                let sf: Vec<Vec<Cx>> = (0..em.s.len()).map(|i| (0..em.s.len()).map(|j| em.s[i][j][fi]).collect()).collect();
+                let sf = s_at(&em, in_sweep(f));
                 let t: Vec<(usize, Cx)> = parts.iter().map(|(k, p)| (*k, p.gamma(f, em.z0))).collect();
                 let mut ae = vec![Cx::default(); keep.len()];
                 ae[0] = Cx::new(1.0, 0.0);
@@ -611,8 +686,20 @@ pub fn run(cfg_path: &Path) -> Result<(), String> {
         let c: Vec<(&str, &str, Vec<f64>, Vec<f64>)> = curves.iter().map(|(n, c, a, b)| (n.as_str(), *c, a.clone(), b.clone())).collect();
         plot_svg(&out.join("cosim.svg"), freqs, &c, &report).map_err(|e| e.to_string())?;
     }
+    if !outside.is_empty() {
+        let w = format!(
+            "{} GHz is outside the EM sweep ({:.3} to {:.3} GHz): the EM S-matrix is held at the sweep's end there, so those rows are not valid",
+            outside.iter().map(|f| format!("{:.3}", f * 1e-9)).collect::<Vec<_>>().join(", "), f_lo * 1e-9, f_hi * 1e-9
+        );
+        println!("WARNING: {w}");
+        warnings.push(w);
+    }
     let kept: Vec<&String> = keep.iter().map(|&k| &names[k]).collect();
-    std::fs::write(out.join("cosim.json"), serde_json::to_string_pretty(&json!({"em": em_path.to_string_lossy(), "kept": kept, "zref": zr.iter().map(|z| [z.re, z.im]).collect::<Vec<_>>(), "variants": out_json})).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(
+        out.join("cosim.json"),
+        serde_json::to_string_pretty(&json!({"em": em_path.to_string_lossy(), "kept": kept, "zref": zr.iter().map(|z| [z.re, z.im]).collect::<Vec<_>>(), "variants": out_json, "warnings": warnings})).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
     println!("cosim: wrote {}", out.display());
     Ok(())
 }
@@ -713,4 +800,112 @@ mod tests {
         }
     }
 
+    /// A series RLC resonator between two ports (loaded Q 20 at 2.44 GHz), as an "EM" sweep with 20 MHz steps
+    /// that straddle the resonance: the series impedance at `f`.
+    fn resonator_z(f: f64) -> Cx {
+        let w0 = 2.0 * PI * 2.44e9;
+        let l = 20.0 * 105.0 / w0;
+        let w = 2.0 * PI * f;
+        Cx::new(5.0, w * l - 1.0 / (w * (1.0 / (w0 * w0 * l))))
+    }
+
+    fn resonator_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fs_cosim_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("em")).unwrap();
+        let freqs: Vec<f64> = (0..51).map(|k| 2.01e9 + 20e6 * k as f64).collect();
+        let z0 = Cx::new(50.0, 0.0);
+        let s: Vec<Vec<Vec<Cx>>> = (0..2).map(|i| (0..2).map(|j| freqs.iter().map(|&f| {
+            let z = resonator_z(f);
+            if i == j { z / (z + z0 * 2.0) } else { z0 * 2.0 / (z + z0 * 2.0) }
+        }).collect()).collect()).collect();
+        crate::post::write_touchstone(&dir.join("em/sparams.s2p"), &freqs, &s, 50.0).unwrap();
+        std::fs::write(dir.join("em/result.json"), r#"{"port_names": ["P1", "P2"]}"#).unwrap();
+        dir
+    }
+
+    /// Interpolation weights are exact on the grid, and through a resonance of Q 20 on a 20 MHz sweep the
+    /// interpolated S is within 1 % where the nearest sweep point is more than 10 % off.
+    #[test]
+    fn sweep_is_interpolated_between_its_points() {
+        let x: Vec<f64> = (0..9).map(|k| 1.0 + 0.5 * k as f64).collect();
+        for (k, &f) in x.iter().enumerate() {
+            let (i0, m, w) = interp_weights(&x, f);
+            for a in 0..m {
+                assert_eq!(w[a], if i0 + a == k { 1.0 } else { 0.0 }, "weights at grid point {k}");
+            }
+        }
+        // a cubic is reproduced exactly, also in the end intervals and held outside the grid
+        let cubic = |f: f64| 2.0 - f + 0.3 * f * f - 0.05 * f * f * f;
+        for f in [1.1, 1.49, 2.75, 4.9, 0.2, 9.0] {
+            let (i0, m, w) = interp_weights(&x, f);
+            let v: f64 = (0..m).map(|a| w[a] * cubic(x[i0 + a])).sum();
+            assert!((v - cubic(f.clamp(1.0, 5.0))).abs() < 1e-12, "f = {f}: {v}");
+        }
+        assert_eq!(interp_weights(&[3.0], 5.0), (0, 1, [1.0, 0.0, 0.0, 0.0]));
+        let ts = read_touchstone(&resonator_dir("interp").join("em/sparams.s2p")).unwrap();
+        let (mut worst, mut worst_nearest) = (0.0f64, 0.0f64);
+        for k in 0..=40 {
+            let f = 2.40e9 + 2e6 * k as f64;
+            let z = resonator_z(f);
+            let exact = Cx::new(100.0, 0.0) / (z + Cx::new(100.0, 0.0));
+            worst = worst.max((s_at(&ts, f)[1][0] - exact).abs());
+            let near = ts.freqs.iter().enumerate().min_by(|a, b| (a.1 - f).abs().partial_cmp(&(b.1 - f).abs()).unwrap()).unwrap().0;
+            worst_nearest = worst_nearest.max((ts.s[1][0][near] - exact).abs());
+        }
+        assert!(worst < 0.01, "interpolated S21 is off by {worst}");
+        assert!(worst_nearest > 0.1, "the nearest sweep point should be a poor stand-in: {worst_nearest}");
+    }
+
+    /// `cosim` reports at the frequency asked for, not at the nearest sweep point: at the resonance, between
+    /// two sweep points, S21 is the resonator's own -0.42 dB to 0.05 dB (the nearest point reads 0.12 dB lower).
+    #[test]
+    fn report_rows_are_at_the_frequency_asked_for() {
+        let dir = resonator_dir("report");
+        std::fs::write(dir.join("c.json"), r#"{"em": "em/sparams.s2p", "out": "o", "keep": ["P1", "P2"], "variants": {"v": {}}, "report": [2.44e9, 2.45e9, 3.5e9]}"#).unwrap();
+        run(&dir.join("c.json")).unwrap();
+        let cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("o/cosim.json")).unwrap()).unwrap();
+        let rows = cj["variants"]["v"]["report"].as_array().unwrap();
+        let exact = |f: f64| db(Cx::new(100.0, 0.0) / (resonator_z(f) + Cx::new(100.0, 0.0)));
+        assert_eq!(rows[0]["f"].as_f64().unwrap(), 2.44e9);
+        assert!((rows[0]["s21_db"].as_f64().unwrap() - exact(2.44e9)).abs() < 0.06, "{}", rows[0]);
+        assert!((exact(2.44e9) - exact(2.45e9)).abs() > 0.11, "the test needs a sweep step that matters");
+        // on a sweep point the data is used as it is
+        assert!((rows[1]["s21_db"].as_f64().unwrap() - exact(2.45e9)).abs() < 1e-5, "{}", rows[1]);
+        // outside the sweep: held at its end, and said so
+        assert_eq!(rows[2]["f"].as_f64().unwrap(), 3.01e9);
+        let w = cj["warnings"].as_array().unwrap();
+        assert!(w.len() == 1 && w[0].as_str().unwrap().contains("3.500 GHz is outside the EM sweep"), "{w:?}");
+    }
+
+    /// A vendor table that does not reach a frequency asked for is named, with the frequency, on the console
+    /// and in cosim.json; a table that covers everything asked for is not.
+    #[test]
+    fn vendor_table_out_of_range_is_reported() {
+        let dir = resonator_dir("range");
+        let z0 = Cx::new(50.0, 0.0);
+        for (name, lo, hi) in [("short_range", 2.0e9, 2.5e9), ("full_range", 1.0e9, 4.0e9)] {
+            let freqs: Vec<f64> = (0..11).map(|k| lo + (hi - lo) * k as f64 / 10.0).collect();
+            let s: Vec<Vec<Vec<Cx>>> = (0..2).map(|i| (0..2).map(|j| freqs.iter().map(|&f| {
+                let z = Cx::new(0.3, -1.0 / (2.0 * PI * f * 1e-12));
+                if i == j { z / (z + z0 * 2.0) } else { z0 * 2.0 / (z + z0 * 2.0) }
+            }).collect()).collect()).collect();
+            crate::post::write_touchstone(&dir.join(format!("{name}.s2p")), &freqs, &s, 50.0).unwrap();
+        }
+        let p = Part::parse(&format!("s2p:{}", dir.join("short_range.s2p").display())).unwrap();
+        assert_eq!(p.table_range(), Some((2.0e9, 2.5e9)));
+        assert!(p.held_at(2.5e9).is_none() && p.held_at(2.0e9).is_none() && p.held_at(2.6e9).is_some() && p.held_at(1.9e9).is_some());
+        assert!(Part::Series { inner: Box::new(p), l: 1e-10 }.held_at(2.9e9).is_some());
+        assert!(Part::parse("C:1p").unwrap().held_at(1e12).is_none());
+        for (file, expect) in [("short_range", true), ("full_range", false)] {
+            std::fs::write(dir.join("c.json"), format!(r#"{{"em": "em/sparams.s2p", "out": "o_{file}", "keep": ["P1"], "variants": {{"v": {{"P2": "s2p:{file}.s2p"}}}}, "report": [2.44e9, 2.9e9]}}"#)).unwrap();
+            run(&dir.join("c.json")).unwrap();
+            let cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("o_{file}/cosim.json"))).unwrap()).unwrap();
+            let w: Vec<&str> = cj["warnings"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+            if expect {
+                assert!(w.len() == 1 && w[0].starts_with("P2 = s2p:short_range.s2p") && w[0].contains("2.000 to 2.500 GHz") && w[0].contains("results at 2.900 GHz are not valid"), "{w:?}");
+            } else {
+                assert!(w.is_empty(), "{w:?}");
+            }
+        }
+    }
 }

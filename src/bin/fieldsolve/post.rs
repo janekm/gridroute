@@ -147,6 +147,11 @@ pub fn linspace(a: f64, b: f64, n: usize) -> Vec<f64> {
 
 /// Inverse of a small complex matrix (Gauss-Jordan with partial pivoting).
 pub fn inv(m: &[Vec<Cx>]) -> Option<Vec<Vec<Cx>>> {
+    inv_tol(m, 1e-300)
+}
+
+/// `inv` with the pivot threshold given: None when a pivot is smaller than `tol` in magnitude.
+pub fn inv_tol(m: &[Vec<Cx>], tol: f64) -> Option<Vec<Vec<Cx>>> {
     let n = m.len();
     let mut a: Vec<Vec<Cx>> = m.iter().enumerate().map(|(i, r)| {
         let mut row = r.clone();
@@ -155,7 +160,7 @@ pub fn inv(m: &[Vec<Cx>]) -> Option<Vec<Vec<Cx>>> {
     }).collect();
     for c in 0..n {
         let piv = (c..n).max_by(|&x, &y| a[x][c].abs().partial_cmp(&a[y][c].abs()).unwrap())?;
-        if a[piv][c].abs() < 1e-300 {
+        if !(a[piv][c].abs() >= tol) {
             return None;
         }
         a.swap(c, piv);
@@ -184,25 +189,38 @@ pub fn matmul(a: &[Vec<Cx>], b: &[Vec<Cx>]) -> Vec<Vec<Cx>> {
 /// Full S-matrix from all excitations: `v[j][k][f]`, `i[j][k][f]` are port k's voltage and current when
 /// port j is excited. With the wave matrices A = (V + Z0 I) / (2 sqrt Z0) and B = (V - Z0 I) / (2 sqrt Z0)
 /// (column j = excitation j), S = B A^-1. This holds for any port terminations, unlike b_i / a_j, which
-/// assumes the other ports are matched to Z0. Returns `s[i][j][f]`.
-pub fn s_matrix(v: &[Vec<Vec<Cx>>], i: &[Vec<Vec<Cx>>], z0: f64) -> Vec<Vec<Vec<Cx>>> {
+/// assumes the other ports are matched to Z0. Returns `s[i][j][f]` and the frequency indices at which A is
+/// singular (two excitations that are not independent, or a port that saw no incident wave): S is left at
+/// zero there, and the caller has to say so.
+pub fn s_matrix(v: &[Vec<Vec<Cx>>], i: &[Vec<Vec<Cx>>], z0: f64) -> (Vec<Vec<Vec<Cx>>>, Vec<usize>) {
     let n = v.len();
     let nf = v[0][0].len();
     let k = 1.0 / (2.0 * z0.sqrt());
     let mut s = vec![vec![vec![Cx::default(); nf]; n]; n];
+    let mut singular = Vec::new();
     for f in 0..nf {
         let a: Vec<Vec<Cx>> = (0..n).map(|p| (0..n).map(|j| (v[j][p][f] + i[j][p][f] * z0) * k).collect()).collect();
         let b: Vec<Vec<Cx>> = (0..n).map(|p| (0..n).map(|j| (v[j][p][f] - i[j][p][f] * z0) * k).collect()).collect();
-        if let Some(ai) = inv(&a) {
-            let sf = matmul(&b, &ai);
-            for p in 0..n {
-                for j in 0..n {
-                    s[p][j][f] = sf[p][j];
+        // scale each excitation's column to unit size first, so the test is relative: a pivot below 1e-10
+        // of the columns' size means two excitations agree to ten digits
+        let scale: Vec<f64> = (0..n).map(|j| (0..n).map(|p| a[p][j].abs()).fold(0.0, f64::max)).collect();
+        let ok = scale.iter().all(|&x| x > 0.0 && x.is_finite());
+        let an: Vec<Vec<Cx>> = if ok { (0..n).map(|p| (0..n).map(|j| a[p][j] * (1.0 / scale[j])).collect()).collect() } else { Vec::new() };
+        match if ok { inv_tol(&an, 1e-10) } else { None } {
+            Some(ani) => {
+                // A^-1 = D^-1 An^-1 with D = diag(scale)
+                let ai: Vec<Vec<Cx>> = (0..n).map(|j| (0..n).map(|p| ani[j][p] * (1.0 / scale[j])).collect()).collect();
+                let sf = matmul(&b, &ai);
+                for p in 0..n {
+                    for j in 0..n {
+                        s[p][j][f] = sf[p][j];
+                    }
                 }
             }
+            None => singular.push(f),
         }
     }
-    s
+    (s, singular)
 }
 
 /// Power-wave reflection/transmission for excitation port `j` with the other ports terminated in their own

@@ -15,9 +15,9 @@
 //! driven port against the `target` network's (else 1 − |S11|² against z0), and P_rad / P_in the share of the
 //! power entering that port that is radiated; the objective is the worst of the band, in dB. Optional
 //! harmonic constraints bound the radiated power per watt incident at chosen frequencies. Frequency
-//! conventions follow `cosim` exactly (S at the EM grid point nearest each frequency; the match from parts
-//! at that grid frequency, the radiation from parts at the exact frequency), so the scores equal those
-//! computed from `cosim` output.
+//! conventions follow `cosim` exactly (everything at the exact frequency: the EM S-matrix interpolated on
+//! its sweep, the parts, the target and the patterns), so the scores equal those computed from `cosim`
+//! output.
 //!
 //! The search is coordinate descent from the as-built parts and from random starts, plus every one- and
 //! two-part change from as built. Only the selected candidates get detailed output: they are written as a
@@ -220,14 +220,16 @@ pub struct Evaluator {
     pub choices: Vec<Choices>,
     off: Vec<usize>,
     pub band: Vec<f64>,
-    /// per band frequency: (match point, radiation point); per harmonic: radiation point
-    band_pts: Vec<(usize, usize)>,
+    /// the point of each band frequency and of each harmonic
+    band_pts: Vec<usize>,
     harm_pts: Vec<usize>,
     pts: Vec<Point>,
-    /// radiation matrix per radiation point (n x n); empty for match-only points
+    /// radiation matrix per point (n x n)
     rmat: Vec<Vec<Cx>>,
-    /// target impedance at each band frequency's grid point
+    /// target impedance at each band frequency
     target: Vec<Option<Cx>>,
+    /// what the numbers do not cover: frequencies outside the EM sweep, vendor tables that do not reach one
+    pub warnings: Vec<String>,
     pub harm_freqs: Vec<f64>,
     pub harm_limit: Vec<f64>,
     z0: f64,
@@ -321,40 +323,63 @@ impl Evaluator {
         for c in &choices {
             off.push(off.last().unwrap() + c.len());
         }
-        let freqs = &em.freqs;
-        let at = |f: f64| (0..freqs.len()).min_by(|&a, &b| (freqs[a] - f).abs().partial_cmp(&(freqs[b] - f).abs()).unwrap()).unwrap();
+        // every objective frequency is one point: the EM S-matrix interpolated to it (as `cosim`), the parts'
+        // reflections and the patterns at the same frequency
+        let (f_lo, f_hi) = (em.freqs[0], em.freqs[em.freqs.len() - 1]);
+        let mut warnings = Vec::new();
+        let asked: Vec<f64> = st.band.iter().copied().chain(st.harmonics.iter().map(|h| h.0)).collect();
+        let outside: Vec<String> = asked.iter().filter(|&&f| f < f_lo * (1.0 - 1e-9) || f > f_hi * (1.0 + 1e-9)).map(|f| format!("{:.3}", f * 1e-9)).collect();
+        if !outside.is_empty() {
+            warnings.push(format!(
+                "{} GHz is outside the EM sweep ({:.3} to {:.3} GHz): the EM S-matrix is held at the sweep's end there, so the scores at those frequencies are not valid",
+                outside.join(", "), f_lo * 1e-9, f_hi * 1e-9
+            ));
+        }
+        // vendor tables that do not reach an objective frequency are held at their end value there
+        for &f in &asked {
+            let mut held: Vec<(String, (f64, f64))> = Vec::new();
+            for (pi, ps) in parts.iter().enumerate() {
+                held.extend(ps.iter().zip(&choices[pi]).filter_map(|(p, c)| p.held_at(f).map(|r| (format!("{} = {}", positions[pi], c.0), r))));
+            }
+            for (slot, p) in fixed_parts.iter().enumerate() {
+                held.extend(p.as_ref().and_then(|p| p.held_at(f)).map(|r| (names[term[slot]].clone(), r)));
+            }
+            if let Some((who, (a, b))) = held.first() {
+                warnings.push(format!(
+                    "{} part{} not cover {:.3} GHz (e.g. {who}: {:.3} to {:.3} GHz) and {} held at the end value there: scores at that frequency are not valid for {}",
+                    held.len(), if held.len() == 1 { "'s file does" } else { "s' files do" }, f * 1e-9, a * 1e-9, b * 1e-9,
+                    if held.len() == 1 { "is" } else { "are" }, if held.len() == 1 { "it" } else { "them" }
+                ));
+            }
+        }
         let mut pts = Vec::new();
         let mut rmat = Vec::new();
         let mut rad_pats: Vec<(usize, usize)> = Vec::new(); // (point, far-field frequency index)
-        let mut point = |f_parts: f64, fi: usize, far_q: Option<usize>, pts: &mut Vec<Point>| -> usize {
-            let s = (0..n * n).map(|q| em.s[q / n][q % n][fi]).collect();
-            let fixed = fixed_parts.iter().map(|p| p.as_ref().map(|p| gamma(p, f_parts, em.z0)).unwrap_or_default()).collect();
-            let gam = parts.iter().flat_map(|ps| ps.iter().map(|p| gamma(p, f_parts, em.z0))).collect();
-            pts.push(Point { s, fixed, gam });
-            if let Some(q) = far_q {
-                rad_pats.push((pts.len() - 1, q));
-            }
-            pts.len() - 1
-        };
         let far_q = |f: f64| ffreq.iter().position(|&x| (x - f).abs() <= 1e-6 * f).ok_or_else(|| format!("farfield.json has no pattern at {f:.4e} Hz (have {ffreq:?})"));
+        let mut point = |f: f64, pts: &mut Vec<Point>| -> Result<usize, String> {
+            let q = far_q(f)?;
+            let sf = crate::cosim::s_at(&em, f);
+            let s = (0..n * n).map(|q| sf[q / n][q % n]).collect();
+            let fixed = fixed_parts.iter().map(|p| p.as_ref().map(|p| gamma(p, f, em.z0)).unwrap_or_default()).collect();
+            let gam = parts.iter().flat_map(|ps| ps.iter().map(|p| gamma(p, f, em.z0))).collect();
+            pts.push(Point { s, fixed, gam });
+            rad_pats.push((pts.len() - 1, q));
+            Ok(pts.len() - 1)
+        };
         let mut band_pts = Vec::new();
         let mut target = Vec::new();
         for &f in &st.band {
-            let fi = at(f);
-            let m = point(freqs[fi], fi, None, &mut pts);
-            let r = point(f, fi, Some(far_q(f)?), &mut pts);
-            band_pts.push((m, r));
-            // the target network's input impedance at the grid frequency (port 2 in z0), as cosim
+            band_pts.push(point(f, &mut pts)?);
+            // the target network's input impedance at f (port 2 in z0), as cosim
             target.push(target_ts.as_ref().map(|ts| {
-                let g = freqs[fi];
-                let k = ts.freqs.partition_point(|&x| x < g).clamp(1, ts.freqs.len() - 1);
-                let w = ((g - ts.freqs[k - 1]) / (ts.freqs[k] - ts.freqs[k - 1])).clamp(0.0, 1.0);
+                let k = ts.freqs.partition_point(|&x| x < f).clamp(1, ts.freqs.len() - 1);
+                let w = ((f - ts.freqs[k - 1]) / (ts.freqs[k] - ts.freqs[k - 1])).clamp(0.0, 1.0);
                 crate::cosim::zin(ts.s[0][0][k - 1] * (1.0 - w) + ts.s[0][0][k] * w, ts.z0)
             }));
         }
         let mut harm_pts = Vec::new();
         for &(f, _) in &st.harmonics {
-            harm_pts.push(point(f, at(f), Some(far_q(f)?), &mut pts));
+            harm_pts.push(point(f, &mut pts)?);
         }
         tm.parts = t.elapsed().as_secs_f64();
 
@@ -386,6 +411,7 @@ impl Evaluator {
             pts,
             rmat,
             target,
+            warnings,
             harm_freqs: st.harmonics.iter().map(|h| h.0).collect(),
             harm_limit: vec![f64::INFINITY; st.harmonics.len()],
             z0: em.z0,
@@ -481,9 +507,9 @@ impl Evaluator {
     pub fn score(&self, c: &[u16]) -> Score {
         let mut a = [Cx::default(); MAXP];
         let mut worst = f64::INFINITY;
-        for (k, &(mp, rp)) in self.band_pts.iter().enumerate() {
-            let (Some(bm), Some(br)) = (self.solve(mp, c, &mut a), self.solve(rp, c, &mut a)) else { return Score { worst: -300.0, violation: 0.0 } };
-            let v = self.band_value(k, bm, br, &a).0;
+        for (k, &pi) in self.band_pts.iter().enumerate() {
+            let Some(b) = self.solve(pi, c, &mut a) else { return Score { worst: -300.0, violation: 0.0 } };
+            let v = self.band_value(k, b, &a).0;
             worst = worst.min(v);
         }
         let mut violation = 0.0;
@@ -497,17 +523,16 @@ impl Evaluator {
         Score { worst, violation }
     }
 
-    /// (score dB, |Γ_target|, radiated / accepted dB, P_in, P_rad) at band frequency k, from the reflected
-    /// wave at the match point, and the waves `a` and reflected wave at the radiation point.
-    fn band_value(&self, k: usize, b_match: Cx, b_rad: Cx, a: &[Cx; MAXP]) -> (f64, f64, f64, f64, f64) {
-        let rp = self.band_pts[k].1;
-        let z = crate::cosim::zin(b_match, self.z0);
+    /// (score dB, |Γ_target|, radiated / accepted dB, P_in, P_rad) at band frequency k, from the wave `b`
+    /// reflected at the driven port and the incident waves `a`.
+    fn band_value(&self, k: usize, b: Cx, a: &[Cx; MAXP]) -> (f64, f64, f64, f64, f64) {
+        let z = crate::cosim::zin(b, self.z0);
         let g = match self.target[k] {
             Some(t) => ((z - t) / (z + t.conj())).abs(),
-            None => b_match.abs(),
+            None => b.abs(),
         };
-        let p_rad = quad_power(&a[..self.n], &self.rmat[rp]);
-        let p_in = 1.0 - b_rad.abs().powi(2);
+        let p_rad = quad_power(&a[..self.n], &self.rmat[self.band_pts[k]]);
+        let p_in = 1.0 - b.abs().powi(2);
         // as tools/ladder_retune.py: radiated / accepted from the dB values (floored at 1e-30)
         let eta_db = db10(p_rad) - db10(p_in);
         let v = 10.0 * ((1.0 - g * g) * 10f64.powf(eta_db / 10.0)).max(1e-12).log10();
@@ -518,10 +543,8 @@ impl Evaluator {
         let mut a = [Cx::default(); MAXP];
         let mut band = Vec::new();
         for k in 0..self.band_pts.len() {
-            let (mp, rp) = self.band_pts[k];
-            let bm = self.solve(mp, c, &mut a).unwrap_or_default();
-            let br = self.solve(rp, c, &mut a).unwrap_or_default();
-            band.push(self.band_value(k, bm, br, &a));
+            let b = self.solve(self.band_pts[k], c, &mut a).unwrap_or_default();
+            band.push(self.band_value(k, b, &a));
         }
         let harm = self.harm_pts.iter().map(|&hp| {
             self.solve(hp, c, &mut a);
@@ -795,6 +818,9 @@ pub fn run(cfg_path: &Path, args: &[String]) -> Result<Value, String> {
     };
     let (mut ev, mut tm) = Evaluator::load(&st)?;
     tm.parts += t_choices;
+    for w in &ev.warnings {
+        eprintln!("tune: WARNING: {w}");
+    }
     let base = ev.cand_of(cfg["base"].as_object().ok_or("tune: needs \"base\" (label per position)")?)?;
     // "max_db": "base": no worse than as built
     let base_detail = ev.detail(&base);
@@ -953,6 +979,7 @@ pub fn run(cfg_path: &Path, args: &[String]) -> Result<Value, String> {
         "descent_finals": finals.iter().map(|(c, s)| json!({"worst_db": s.worst, "violation_db": s.violation, "parts": ev.labels(c).into_iter().map(|(n, l)| (n, Value::String(l))).collect::<serde_json::Map<_, _>>()})).collect::<Vec<_>>(),
         "cosim_check": check,
         "compare": compare,
+        "warnings": ev.warnings,
     });
     std::fs::write(out.join("tune.json"), serde_json::to_string_pretty(&res).unwrap()).map_err(|e| e.to_string())?;
     eprintln!("tune: wrote {} (total {:.2} s)", out.display(), t_all.elapsed().as_secs_f64());
@@ -1160,6 +1187,33 @@ mod tests {
             spread.push(det.score.worst);
         }
         assert!(spread.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - spread.iter().cloned().fold(f64::INFINITY, f64::min) > 1.0, "the variants should differ: {spread:?}");
+    }
+
+    /// A part file that stops below an objective frequency is named in the warnings (its value is held at
+    /// the file's end there); parts that cover every frequency give none.
+    #[test]
+    fn parts_that_do_not_cover_a_frequency_are_named() {
+        let d = workdir("range");
+        let freqs = crate::post::linspace(2.0e9, 3.0e9, 21);
+        let z0 = Cx::new(50.0, 0.0);
+        let s: Vec<Vec<Vec<Cx>>> = (0..2).map(|i| (0..2).map(|j| freqs.iter().map(|&f| {
+            let w = 2.0 * std::f64::consts::PI * f;
+            let z = Cx::new(0.2, w * 0.35e-9 - 1.0 / (w * 1.0e-12));
+            if i == j { z / (z + z0 * 2.0) } else { z0 * 2.0 / (z + z0 * 2.0) }
+        }).collect()).collect()).collect();
+        crate::post::write_touchstone(&d.join("lib/NARROW.s2p"), &freqs, &s, 50.0).unwrap();
+        let one = |s: &str| vec![(s.to_string(), s.to_string())];
+        let positions = |c20: Choices| -> Vec<(String, Choices)> {
+            vec![("C59".into(), one("C:1p")), ("L4".into(), one("L:4.7n")), ("C60".into(), one("C:1.2p")), ("L5".into(), one("L:2.2n")), ("R70".into(), one("short")), ("C20".into(), c20)]
+        };
+        let wide = format!("s2p:{}", d.join("lib/CAPx1R0B.s2p").display());
+        let narrow = format!("s2p:{}", d.join("lib/NARROW.s2p").display());
+        let (ev, _) = Evaluator::load(&setup(&d, positions(vec![(wide.clone(), wide.clone())]), vec![(4.88e9, None)])).unwrap();
+        assert!(ev.warnings.is_empty(), "{:?}", ev.warnings);
+        let (ev, _) = Evaluator::load(&setup(&d, positions(vec![(wide.clone(), wide), ("narrow".into(), narrow)]), vec![(4.88e9, None)])).unwrap();
+        assert_eq!(ev.warnings.len(), 1, "{:?}", ev.warnings);
+        let w = &ev.warnings[0];
+        assert!(w.contains("4.880 GHz") && w.contains("C20 = narrow") && w.contains("2.000 to 3.000 GHz") && w.contains("held at the end value"), "{w}");
     }
 
     /// The whole command on the fixture: library sets from a template, a harmonic limit "as built", search,

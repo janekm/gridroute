@@ -264,3 +264,47 @@ fn late_time_decay_with_absorber() {
         eprintln!("edges {}: decay {:?}; energy {:?}", eo.is_some(), d, tail);
     }
 }
+
+/// Where other copper is 2 to 4 in-plane cells away, the singular factors fade out (`plane_cells`). The fade
+/// must end at the factor the edge has without them: the conformal one, 1 / (open fraction), for a partly
+/// covered edge. A ground 2.02 cells below (weight 1 %) and one 1.98 cells below (no singular factors) must
+/// give that edge nearly the same permittivity factor. Fading to the uncorrected factor 1 instead made it
+/// jump from 1 to 2 there, and put eps_eff 2 to 4 % low on 0.2 mm prepreg at 0.07 to 0.08 mm cells.
+#[test]
+fn singular_factors_fade_to_the_conformal_ones() {
+    let h = 0.1;
+    let xy: Vec<f64> = (-15..=15).map(|i| i as f64 * h * 1e-3).collect();
+    // (sum of beta of the half-covered Ey edge at x = 0, y = 0..h; singular E edges)
+    let factor = |zt: f64| -> (f64, usize) {
+        let mut z: Vec<f64> = (-4..=0).map(|i| i as f64 * h).collect();
+        z.extend([zt / 2.0, zt]);
+        z.extend((1..=5).map(|i| zt + i as f64 * h));
+        let g = mesh::Grid { x: xy.clone(), y: xy.clone(), z: z.iter().map(|v| v * 1e-3).collect() };
+        // the strip's edge along x at y = h / 2: half a cell beyond the mesh line y = 0
+        let lay = model::Layout {
+            sheets: vec![
+                model::Sheet { name: "top".into(), z: zt, prims: vec![poly(&[(-1.0, -1.0), (1.0, -1.0), (1.0, 0.5 * h), (-1.0, 0.5 * h)])] },
+                model::Sheet { name: "gnd".into(), z: 0.0, prims: vec![poly(&[(-1.2, -1.2), (1.2, -1.2), (1.2, 1.2), (-1.2, 1.2)])] },
+            ],
+            slabs: vec![model::Slab { z0: 0.0, z1: zt, eps: 4.3, tand: 0.0 }],
+            barrels: vec![],
+            outline: vec![],
+            copper_window: None,
+            bodies: vec![],
+        };
+        let (masks, _) = model::sheet_masks(&g, &lay);
+        let fix = crate::edge::analyse(&g, &lay, &masks, &[], &[2; 6], &EdgeOpts::default());
+        let (nx, ny) = (g.x.len(), g.y.len());
+        let (i, j, k) = (mesh::snap(&g.x, 0.0), mesh::snap(&g.y, 0.0), mesh::snap(&g.z, zt * 1e-3));
+        let id = ((k * ny + j) * nx + i) as u32;
+        let beta = fix.e.iter().find(|e| e.0 == 1 && e.1 == id).unwrap_or_else(|| panic!("the half-covered edge is not corrected (ground {zt} mm below)"));
+        (beta.2.iter().map(|&b| b as f64).sum(), fix.stats.e_singular)
+    };
+    let (conf, n0) = factor(1.98 * h);
+    let (faded, n1) = factor(2.02 * h);
+    eprintln!("half-covered edge: factor {conf:.4} with the ground 1.98 cells below ({n0} singular edges), {faded:.4} at 2.02 cells ({n1})");
+    // the ground's own edges have no copper near them and are singular in both; the strip's only in the second
+    assert!(n1 > n0, "the strip's edges get singular factors (at 1 % weight) from plane_cells / 2: {n1} against {n0}");
+    assert!((conf - 2.0).abs() < 1e-3, "conformal factor of a half-covered edge: {conf}");
+    assert!((faded - conf).abs() < 0.05, "the fade does not end at the conformal factor: {faded} against {conf}");
+}

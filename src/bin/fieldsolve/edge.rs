@@ -1077,12 +1077,16 @@ pub fn analyse(g: &Grid, lay: &Layout, masks: &[SheetMask], lumped: &[Lumped], p
                             let tot: f64 = fl.iter().sum();
                             if e.abs() > 1e-9 && tot / e > 0.0 {
                                 let kap = clampk(tot * len / (area * e));
+                                // what the edge gets at zero weight: the uniform-field (conformal) factor. The
+                                // fade must end there, not at the uncorrected factor 1, or the correction
+                                // jumps where the weight reaches zero
+                                let kc = if o.conformal && fo < 1.0 { 1.0 / fo.max(o.min_open) } else { 1.0 };
                                 for bq in 0..2 {
                                     for cq in 0..2 {
                                         let (rb, rc) = quads(bq, cq);
                                         let q = bq * 2 + cq;
                                         let uni = (rb.1 - rb.0) * (rc.1 - rc.0) / area;
-                                        beta[q] = (t * fl[q] / tot * kap + (1.0 - t) * uni) as f32;
+                                        beta[q] = (t * fl[q] / tot * kap + (1.0 - t) * uni * kc) as f32;
                                     }
                                 }
                                 done = true;

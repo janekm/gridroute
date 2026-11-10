@@ -165,7 +165,13 @@ pub struct Setup {
     pub refined: Vec<([f64; 4], f64, String)>,
     /// set-up warnings (presets.rs: settings that are known traps, narrow copper in coarse cells)
     pub checks: Vec<String>,
+    /// wideband dielectric loss: (Debye poles, worst relative error of the fitted tan delta over the band)
+    pub loss_fit: Option<(usize, f64)>,
 }
+
+/// Worst relative tan delta error of the wideband fit above which a run warns. One pole per decade gives
+/// 4-6 % on a flat loss tangent, so anything well above that is a fit that did not work.
+pub const LOSS_FIT_WARN: f64 = 0.10;
 
 /// Partial self-inductance (nH) of a thin flat strip, length l and width w in mm (Grover, t = 0):
 /// L = mu0 l / (2 pi) [ln(2 l / w) + 1/2 + w / (3 l)].
@@ -179,6 +185,7 @@ pub fn strip_inductance_nh(l: f64, w: f64) -> f64 {
 /// Build layout, mesh and lumped elements from the spec.
 pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let sp = cx.spec.clone();
+    crate::presets::spec_errors(&sp)?;
     let mask = sp.get("solder_mask").and_then(|v| v.as_bool()).unwrap_or(false);
     // "dielectrics": [{"t": mm, "er": .., "tand": ..}, ...] top to bottom between the copper layers,
     // overriding the job file (or its absence)
@@ -1061,6 +1068,33 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
     let sheet_names: Vec<String> = layout.sheets.iter().map(|s| s.name.clone()).collect();
+    // "loss": {"model": "wideband", "f_lo": .., "f_hi": .., "f_ref": 1e9, "copper": true}: flat
+    // tan(delta) over the band (Debye poles), plus the plane-pair copper loss if asked
+    let wideband = sp.get("loss").filter(|l| l.get("model").and_then(|m| m.as_str()) == Some("wideband")).map(|l| crate::disp::Wideband {
+        f_lo: num(l, "f_lo", fmin.max(0.1e9)),
+        f_hi: num(l, "f_hi", fmax),
+        f_ref: num(l, "f_ref", 1e9),
+        copper: l.get("copper").and_then(|c| c.as_bool()).unwrap_or(false),
+    });
+    // how well the poles follow the loss tangent asked for: the worst relative error over the band and the
+    // slabs (the same fit model.rs makes). It is a few percent with one pole per decade; much more means the
+    // band is too wide for the poles or the target is not one a few Debye poles can follow
+    let loss_fit = wideband.as_ref().and_then(|w| {
+        let worst = layout.slabs.iter().filter(|s| s.tand > 0.0 || w.copper).map(|s| crate::disp::fit(s.eps, s.tand, (s.z1 - s.z0).abs(), w).2).fold(f64::NAN, f64::max);
+        worst.is_finite().then(|| (w.poles().len(), worst))
+    });
+    if let (Some((n, worst)), Some(w)) = (loss_fit, &wideband) {
+        eprintln!("fieldsolve: wideband loss: {n} Debye poles, tan delta within {:.1} % of the target over {:.2}-{:.2} GHz", 100.0 * worst, w.f_lo / 1e9, w.f_hi / 1e9);
+        if worst > LOSS_FIT_WARN {
+            let msg = format!(
+                "wideband loss: the Debye fit misses the loss tangent asked for by up to {:.0} % over {:.2}-{:.2} GHz ({n} poles): \
+                 dielectric loss is wrong by that much somewhere in the band. Narrow \"loss\": {{\"f_lo\", \"f_hi\"}} to the band that matters",
+                100.0 * worst, w.f_lo / 1e9, w.f_hi / 1e9
+            );
+            eprintln!("fieldsolve: WARNING: {msg}");
+            checks.push(msg);
+        }
+    }
     Ok(Setup {
         grid,
         layout,
@@ -1070,14 +1104,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             f_loss: num(&sp, "f_loss", 1e9),
             fmax,
             cfl: 0.95,
-            // "loss": {"model": "wideband", "f_lo": .., "f_hi": .., "f_ref": 1e9, "copper": true}: flat
-            // tan(delta) over the band (Debye poles), plus the plane-pair copper loss if asked
-            wideband: sp.get("loss").filter(|l| l.get("model").and_then(|m| m.as_str()) == Some("wideband")).map(|l| crate::disp::Wideband {
-                f_lo: num(l, "f_lo", fmin.max(0.1e9)),
-                f_hi: num(l, "f_hi", fmax),
-                f_ref: num(l, "f_ref", 1e9),
-                copper: l.get("copper").and_then(|c| c.as_bool()).unwrap_or(false),
-            }),
+            wideband,
             // "conductor": true or {"sigma": 5.8e7, "roughness_um": 1.0, "thickness_um": 35, "f_lo", "f_hi"}:
             // surface-impedance copper (cond.rs); thickness per layer from the stack-up unless given
             conductor: sp.get("conductor").filter(|c| c.as_bool() != Some(false)).map(|c| {
@@ -1104,6 +1131,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         bars,
         refined,
         checks,
+        loss_fit,
     })
 }
 
@@ -1261,6 +1289,11 @@ pub struct ObjectiveOpts {
     pub extrapolate: Option<crate::extrap::Opts>,
 }
 
+/// Whether `f` is one of `list` (to 1e-6 relative: the same rule everywhere a far-field frequency is looked up).
+fn in_list(list: &[f64], f: f64) -> bool {
+    list.iter().any(|x| (x - f).abs() <= 1e-6 * f)
+}
+
 impl ObjectiveOpts {
     pub fn from_spec(spec: &Value) -> Option<ObjectiveOpts> {
         let o = spec.get("objective")?;
@@ -1301,14 +1334,16 @@ impl ObjectiveOpts {
     const FLOOR_COUPLING: f64 = 1e-2;
 
     /// Component names, in the order `metric` returns them.
-    pub fn components(&self, names: &[String], j: usize, radiation: bool) -> Vec<String> {
+    /// `far` is the list of far-field frequencies, if there is a far-field box: the radiated power is
+    /// tracked at the frequencies that are in it (the box's fields are transformed at those only).
+    pub fn components(&self, names: &[String], j: usize, far: Option<&[f64]>) -> Vec<String> {
         let mut c = Vec::new();
         for f in self.band.iter().chain(&self.harmonics) {
             let g = format!("{:.3}GHz", f * 1e-9);
             for (k, n) in names.iter().enumerate() {
                 c.push(if k == j { format!("accepted {n} {g}") } else { format!("|S {n},{}|^2 {g}", names[j]) });
             }
-            if radiation {
+            if far.is_some_and(|ff| in_list(ff, *f)) {
                 c.push(format!("radiated {g}"));
             }
         }
@@ -1368,7 +1403,8 @@ impl RunOpts {
         }
     }
 
-    /// Every frequency a run evaluates besides the port sweep must lie at or below `fmax`. The far-field box
+    /// Frequency lists that cannot give a result are refused before the run (see also the band check at the
+    /// end). Every frequency a run evaluates besides the port sweep must lie at or below `fmax`. The far-field box
     /// and the field snapshots are transformed from samples taken at 3 fmax (`dft_every`), so a frequency f
     /// above fmax aliases with 3 fmax - f, where the Gaussian still carries energy: about 3.5 % of the power
     /// at 1.2 fmax, 14 % at 1.3 fmax, and nothing meaningful from 1.5 fmax. The objective's port powers are
@@ -1394,6 +1430,18 @@ impl RunOpts {
                 },
                 top
             ));
+        }
+        // with a far field the objective is the radiated power, taken from the far-field row of each band
+        // frequency: a band frequency without a row would fall back to the accepted power without a word
+        if let (Some(ff), Some(o)) = (&self.farfield, &self.objective) {
+            let missing: Vec<String> = o.band.iter().filter(|&&f| !in_list(&ff.freqs, f)).map(|f| format!("{:.4}", f * 1e-9)).collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "\"objective.band\": {} GHz is not in \"farfield.freqs\". With a far field the objective is the radiated power per \
+                     watt incident, which exists only at the far-field frequencies. Add the frequency to \"farfield.freqs\", or drop it from the band.",
+                    missing.join(", ")
+                ));
+            }
         }
         Ok(())
     }
@@ -1509,10 +1557,12 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     }
     let freqs = &st.freqs;
     let z0 = 50.0;
+    // warnings found while running (a far-field box that is not in free space, a high-Q mode still ringing
+    // at the stop of a far-field run, a singular wave matrix)
+    let mut run_checks: Vec<String> = Vec::new();
     let mut far = match &ro.farfield {
         Some(fo) => {
             let plan = crate::nf2ff::auto_plan(&p, st.opts.pml, fo.gap)?;
-            let bad = crate::nf2ff::non_free_edges(&p, &plan);
             let ax = [&p.grid.x, &p.grid.y, &p.grid.z];
             let mm = |a: usize, i: usize| ax[a][i] * 1e3;
             eprintln!(
@@ -1520,8 +1570,9 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
                 mm(0, plan.lo[0]), mm(0, plan.hi[0]), mm(1, plan.lo[1]), mm(1, plan.hi[1]), mm(2, plan.lo[2]), mm(2, plan.hi[2]),
                 plan.gather.iter().map(|g| g.len()).sum::<usize>()
             );
-            if bad > 0 {
-                eprintln!("fieldsolve: WARNING: far-field box: {bad} tangential E edges on its faces are not free space (the structure crosses the box); the far field is not valid");
+            if let Some(msg) = crate::nf2ff::box_warning(&p, &plan) {
+                eprintln!("fieldsolve: WARNING: {msg}");
+                run_checks.push(msg);
             }
             Some(crate::nf2ff::Collector::new(fo.clone(), plan, np))
         }
@@ -1532,8 +1583,6 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     let mut vall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut iall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut runs = Vec::new();
-    // warnings found while running (a high-Q mode still ringing at the stop of a far-field run)
-    let mut run_checks: Vec<String> = Vec::new();
     // objective stop: window and minimum settling time in periods of the band's lowest frequency
     let obj_stop = ro.objective.as_ref().is_some_and(|o| o.stop);
     let period_steps = |n: f64| ro.objective.as_ref().map(|o| (n / o.band.iter().cloned().fold(f64::INFINITY, f64::min) / p.dt).ceil() as usize).unwrap_or(0);
@@ -1651,7 +1700,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
                                  // where the energy/port rules (the spec's own stop) would have ended this run
                                  "standard_rule_step": r.standard_stop.as_ref().map(|x| x.0), "standard_rule": r.standard_stop.as_ref().map(|x| x.1.clone())});
         if let Some(o) = &ro.objective {
-            let comps = o.components(&names, j, far.is_some());
+            let comps = o.components(&names, j, far.as_ref().map(|c| c.opts.freqs.as_slice()));
             run_json["objective_spread_db"] = json!(spread);
             run_json["objective_last_window_change_db"] = json!(tail.map(|t| t.0));
             run_json["objective_projected_remaining_db"] = json!(tail.map(|t| if t.1.is_finite() { t.1 } else { -1.0 }));
@@ -1669,7 +1718,20 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     let mut zmat_out = Value::Null;
     let mut balance_out = Value::Null;
     if excite.len() == np {
-        s_mat = crate::post::s_matrix(&vall, &iall, z0);
+        let (sm, singular) = crate::post::s_matrix(&vall, &iall, z0);
+        s_mat = sm;
+        if !singular.is_empty() {
+            // S = B A^-1 has no value where the excitations are not independent (a port with no edges in
+            // the circuit, a port shorted by copper in the raster): say so instead of writing zeros quietly
+            let list: Vec<String> = singular.iter().take(6).map(|&f| format!("{:.4}", freqs[f] / 1e9)).collect();
+            let msg = format!(
+                "S-matrix: the wave matrix is singular at {} of {} frequencies ({}{} GHz): S is written as 0 there and is not a result. \
+                 A port saw no incident wave or two excitations are not independent: check the ports' placement",
+                singular.len(), freqs.len(), list.join(", "), if singular.len() > 6 { ", ..." } else { "" }
+            );
+            eprintln!("fieldsolve: WARNING: {msg}");
+            run_checks.push(msg);
+        }
         // power balance per port at the low end of the band, where radiation and dielectric loss are
         // negligible: 1 - sum_k |S_kj|^2 should be ~0; a flat few-percent value means a port's edges are
         // not all part of the circuit (or a port sits across something it should not)
@@ -1712,6 +1774,19 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
         Some(c) => c.finish(&names, z0, out)?,
         None => Value::Null,
     };
+    // a column from one excitation is the response with the other ports in their own resistances; it is
+    // the S-parameter only when those are z0 (10 ohm: 1 dB off in S11)
+    let own_r: Vec<String> = (0..np).filter(|&q| (p.ports[q].r - z0).abs() > 1e-6 * z0 && excite.iter().any(|&j| j != q)).map(|q| format!("{} ({} ohm)", names[q], p.ports[q].r)).collect();
+    if excite.len() < np && !own_r.is_empty() {
+        let msg = format!(
+            "not every port is excited, and {} {} not {z0} ohm: s11_db, s_col_db, the objective{} are the response with {} in that resistance,              not {z0}-ohm S-parameters. Use \"excite\": \"all\" for S-parameters and per-port patterns.",
+            own_r.join(", "), if own_r.len() == 1 { "is" } else { "are" }, if far.is_some() { ", the far-field pattern and its power figures" } else { "" },
+            if own_r.len() == 1 { "that port" } else { "those ports" }
+        );
+        eprintln!("fieldsolve: WARNING: {msg}");
+        run_checks.push(msg);
+    }
+    let others = if excite.len() == np || own_r.is_empty() { "other ports matched" } else { "other ports in their own resistances" };
     // the objective, from the far-field summary of its port (radiated power per watt incident, other ports
     // matched) or, without a far field, the accepted power
     let objective_out = match &ro.objective {
@@ -1733,7 +1808,7 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             }
             let worst = rows.iter().map(|r| r["total_db"].as_f64().unwrap_or(f64::NAN)).fold(f64::INFINITY, f64::min);
             let stab = obj_hist[pi].as_ref().and_then(|(_, h)| crate::fdtd::objective_tail(h, obj_window));
-            json!({"port": port, "band": o.band, "quantity": if far.is_some() { "radiated power per watt incident (other ports matched)" } else { "accepted power per watt incident" },
+            json!({"port": port, "band": o.band, "quantity": if far.is_some() { format!("radiated power per watt incident ({others})") } else { "accepted power per watt incident".to_string() },
                    "per_f": rows, "worst_db": worst,
                    // stability over the objective port's run: change over the last window and the projected
                    // remaining change (-1: not yet decaying geometrically)
@@ -1754,6 +1829,9 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     });
     let mut res = res;
     res["settings"] = ro.settings.clone();
+    if let Some((n, worst)) = st.loss_fit {
+        res["loss_fit"] = json!({"poles": n, "worst_tand_error": (worst * 1e4).round() / 1e4});
+    }
     res["checks"] = json!(st.checks.iter().chain(&run_checks).collect::<Vec<_>>());
     res["fidelity"] = crate::fidelity::finish_record(&ro.fidelity, &res);
     if let Some(f) = res["fidelity"].as_object() {

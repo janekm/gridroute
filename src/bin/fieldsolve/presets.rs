@@ -91,6 +91,28 @@ pub fn summary(spec: &Value) -> (Value, String) {
     (v, line)
 }
 
+/// Settings that contradict each other or cannot give a result: refused before the mesh is built.
+pub fn spec_errors(spec: &Value) -> Result<(), String> {
+    let standin = spec.pointer("/loss/copper").and_then(|c| c.as_bool()).unwrap_or(false);
+    if standin && on(spec.get("conductor")) {
+        return Err(
+            "\"loss\": {\"copper\": true} together with \"conductor\": the plane-pair stand-in adds the planes' copper loss to the \
+             dielectric, and the surface-impedance copper adds it again on the copper itself, so plane loss is counted twice. \
+             Remove \"copper\" from \"loss\" (keep \"conductor\")."
+                .to_string(),
+        );
+    }
+    if let Some(g) = spec.pointer("/farfield/gap") {
+        if !g.as_u64().is_some_and(|g| g >= 1) {
+            return Err(format!(
+                "\"farfield\": {{\"gap\": {g}}}: the gap between the absorber and the far-field box must be a whole number of cells, \
+                 at least 1 (default 3). With 0 the box's outer H samples lie inside the absorber."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Warnings about settings that are known traps (independent of the geometry).
 pub fn spec_checks(spec: &Value) -> Vec<String> {
     let mut w = Vec::new();

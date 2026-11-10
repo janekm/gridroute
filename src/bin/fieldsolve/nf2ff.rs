@@ -120,6 +120,41 @@ impl Plan {
         }
         v
     }
+
+    /// E edges normal to the box faces that touch them: for the face at node plane p of axis a, the E_a
+    /// edges ending on the plane (index p - 1) and starting on it (index p), at every node of the face. A
+    /// conductor one cell across that leaves the box along the face normal (a wire, a via barrel, a port
+    /// lead) sets only these edges; the tangential ones around it stay free space.
+    pub fn face_normal_edges(&self) -> Vec<(usize, u32)> {
+        let mut v = Vec::new();
+        for a in 0..3 {
+            let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+            for p in [self.lo[a], self.hi[a]] {
+                for q in [p - 1, p] {
+                    for jc in self.lo[c]..=self.hi[c] {
+                        for jb in self.lo[b]..=self.hi[b] {
+                            let mut ijk = [0usize; 3];
+                            ijk[a] = q;
+                            ijk[b] = jb;
+                            ijk[c] = jc;
+                            v.push((a, ((ijk[2] * self.dims[1] + ijk[1]) * self.dims[0] + ijk[0]) as u32));
+                        }
+                    }
+                }
+            }
+        }
+        v
+    }
+}
+
+/// Weights of the tangential H samples half a cell before and after node plane `p` of `line`, each already
+/// summed over its two in-plane neighbours: linear interpolation to the plane, times the 1/2 of the in-plane
+/// mean. The two samples sit at different distances from the plane where the cells on its two sides differ
+/// (a box inside the graded part of the mesh); the plain mean then reads H at a point off the plane, and the
+/// radiated power about 1 % low.
+fn plane_weights(line: &[f64], p: usize) -> (f64, f64) {
+    let (d0, d1) = (line[p] - line[p - 1], line[p + 1] - line[p]);
+    (0.5 * d1 / (d0 + d1), 0.5 * d0 / (d0 + d1))
 }
 
 /// Equivalent sources on the face cells at one frequency.
@@ -147,12 +182,13 @@ pub fn sources(plan: &Plan, g: &Grid, data: &[Vec<f32>; 6]) -> Sources {
     for &(a, side, [eb, ec, hb0, hb1, hc0, hc1]) in &plan.faces {
         let (b, c) = ((a + 1) % 3, (a + 2) % 3);
         let p = plan.patches[eb].plane;
+        let (w0, w1) = plane_weights(ax[a], p);
         for n in plan.lo[c]..plan.hi[c] {
             for m in plan.lo[b]..plan.hi[b] {
                 let e_b = (at(eb, m, n) + at(eb, m, n + 1)) * 0.5;
                 let e_c = (at(ec, m, n) + at(ec, m + 1, n)) * 0.5;
-                let h_b = (at(hb0, m, n) + at(hb0, m + 1, n) + at(hb1, m, n) + at(hb1, m + 1, n)) * 0.25;
-                let h_c = (at(hc0, m, n) + at(hc0, m, n + 1) + at(hc1, m, n) + at(hc1, m, n + 1)) * 0.25;
+                let h_b = (at(hb0, m, n) + at(hb0, m + 1, n)) * w0 + (at(hb1, m, n) + at(hb1, m + 1, n)) * w1;
+                let h_c = (at(hc0, m, n) + at(hc0, m, n + 1)) * w0 + (at(hc1, m, n) + at(hc1, m, n + 1)) * w1;
                 let db = ax[b][m + 1] - ax[b][m];
                 let dc = ax[c][n + 1] - ax[c][n];
                 let mut r = [0.0; 3];
@@ -192,12 +228,13 @@ pub fn box_flux(plan: &Plan, g: &Grid, data: &[Vec<f32>; 6]) -> f64 {
     let mut p = 0.0;
     for &(a, side, [eb, ec, hb0, hb1, hc0, hc1]) in &plan.faces {
         let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+        let (w0, w1) = plane_weights(ax[a], plan.patches[eb].plane);
         for n in plan.lo[c]..plan.hi[c] {
             for m in plan.lo[b]..plan.hi[b] {
                 let e_b = (at(eb, m, n) + at(eb, m, n + 1)) * 0.5;
                 let e_c = (at(ec, m, n) + at(ec, m + 1, n)) * 0.5;
-                let h_b = (at(hb0, m, n) + at(hb0, m + 1, n) + at(hb1, m, n) + at(hb1, m + 1, n)) * 0.25;
-                let h_c = (at(hc0, m, n) + at(hc0, m, n + 1) + at(hc1, m, n) + at(hc1, m, n + 1)) * 0.25;
+                let h_b = (at(hb0, m, n) + at(hb0, m + 1, n)) * w0 + (at(hb1, m, n) + at(hb1, m + 1, n)) * w1;
+                let h_c = (at(hc0, m, n) + at(hc0, m, n + 1)) * w0 + (at(hc1, m, n) + at(hc1, m, n + 1)) * w1;
                 p += 0.5 * side * (e_b * h_c.conj() - e_c * h_b.conj()).re * (ax[b][m + 1] - ax[b][m]) * (ax[c][n + 1] - ax[c][n]);
             }
         }
@@ -332,20 +369,41 @@ impl FarOpts {
 
 /// The box `gap` cells inside the CPML (`pml` = cells per side: x-, x+, y-, y+, z-, z+).
 pub fn auto_plan(p: &crate::model::Problem, pml: [usize; 6], gap: usize) -> Result<Plan, String> {
+    if gap == 0 {
+        // the H samples half a cell outside the faces would lie inside the absorber
+        return Err("far-field box: \"gap\" must be at least 1 cell (the box's faces have to lie in free space inside the CPML)".into());
+    }
     let dims = [p.nx, p.ny, p.nz];
     let lo = std::array::from_fn(|a| pml[2 * a] + gap);
     let hi = std::array::from_fn(|a| dims[a] - 1 - pml[2 * a + 1] - gap);
     Plan::new(dims, lo, hi)
 }
 
-/// Tangential E edges on the box faces that are not free space (dielectric, loss, metal or a lumped
-/// element). The transform assumes free space there.
-pub fn non_free_edges(p: &crate::model::Problem, plan: &Plan) -> usize {
+/// E edges on the box faces that are not free space (dielectric, loss, metal or a lumped element): the
+/// tangential edges in the faces, and the edges normal to a face that touch it. The transform assumes free
+/// space there. Returns (tangential, normal) counts.
+pub fn non_free_edges(p: &crate::model::Problem, plan: &Plan) -> (usize, usize) {
     let cb0 = (p.dt / crate::model::EPS0) as f32;
-    plan.face_e_edges().iter().filter(|&&(c, id)| {
-        let (ca, cb) = (p.ca[c][id as usize], p.cb[c][id as usize]);
-        (ca - 1.0).abs() > 1e-5 || (cb - cb0).abs() > 1e-4 * cb0
-    }).count()
+    let count = |edges: Vec<(usize, u32)>| {
+        edges.iter().filter(|&&(c, id)| {
+            let (ca, cb) = (p.ca[c][id as usize], p.cb[c][id as usize]);
+            (ca - 1.0).abs() > 1e-5 || (cb - cb0).abs() > 1e-4 * cb0
+        }).count()
+    };
+    (count(plan.face_e_edges()), count(plan.face_normal_edges()))
+}
+
+/// The warning for a far-field box that is not in free space, if any (for the log and result.json).
+pub fn box_warning(p: &crate::model::Problem, plan: &Plan) -> Option<String> {
+    let (tan, norm) = non_free_edges(p, plan);
+    if tan + norm == 0 {
+        return None;
+    }
+    Some(format!(
+        "far-field box: {tan} tangential and {norm} normal E edges on its faces are not free space (the structure crosses the box): \
+         the far field, radiated power and efficiency are not valid. Give the board more air (\"air\", \"air_z\") or keep every \
+         body and lead inside the box"
+    ))
 }
 
 /// Far-field bookkeeping over the excitations of one run set.
@@ -378,7 +436,10 @@ impl Collector {
         self.i[j] = i;
     }
 
-    /// Per-port patterns per 1 W incident (other ports matched to z0), power bookkeeping, outputs.
+    /// Per-port patterns per 1 W incident, power bookkeeping, outputs. With every port excited the other
+    /// ports are matched to z0 (the S-matrix and the patterns are solved for that). With only some excited,
+    /// each run is taken as it was simulated: the other ports in their own resistances, which is the same
+    /// thing only when those are z0.
     pub fn finish(&self, names: &[String], z0: f64, out: &Path) -> Result<serde_json::Value, String> {
         use serde_json::json;
         let np = names.len();
@@ -392,6 +453,8 @@ impl Collector {
             let wave = |j: usize, p: usize, sign: f64| (self.v[j][p][fi] + self.i[j][p][fi] * (sign * z0)) * k;
             // S and the patterns per unit incident wave
             let mut s = vec![vec![Cx::default(); np]; np];
+            // power absorbed by the other ports per watt incident at port p
+            let mut absorbed = vec![0.0; np];
             if all {
                 let a: Vec<Vec<Cx>> = (0..np).map(|p| (0..np).map(|j| wave(j, p, 1.0)).collect()).collect();
                 let b: Vec<Vec<Cx>> = (0..np).map(|p| (0..np).map(|j| wave(j, p, -1.0)).collect()).collect();
@@ -400,6 +463,7 @@ impl Collector {
                 for p in 0..np {
                     let parts: Vec<(&Pattern, Cx)> = (0..np).map(|j| (&self.runs[j].as_ref().unwrap()[fi].0, ai[j][p] * s2)).collect();
                     embedded[p][fi] = Some(Pattern::combine(&parts));
+                    absorbed[p] = (0..np).filter(|&q| q != p).map(|q| s[q][p].abs().powi(2)).sum();
                 }
             } else {
                 for j in (0..np).filter(|&j| self.runs[j].is_some()) {
@@ -407,6 +471,9 @@ impl Collector {
                     for p in 0..np {
                         s[p][j] = wave(j, p, -1.0) / ajj;
                     }
+                    // a port in a resistance other than z0 reflects part of what reaches it back into the
+                    // structure (its incident wave is not zero), so it absorbs |b|^2 - |a|^2, not |b|^2
+                    absorbed[j] = (0..np).filter(|&q| q != j).map(|q| (wave(j, q, -1.0).abs().powi(2) - wave(j, q, 1.0).abs().powi(2)) / ajj.abs().powi(2)).sum();
                     embedded[j][fi] = Some(self.runs[j].as_ref().unwrap()[fi].0.scale(Cx::new(s2, 0.0) / ajj));
                 }
             }
@@ -415,7 +482,7 @@ impl Collector {
                 let p_rad = pat.p_rad();
                 let (umax, th, ph) = pat.u_max();
                 let p_in = 1.0 - s[p][p].abs().powi(2);
-                let p_other: f64 = (0..np).filter(|&q| q != p).map(|q| s[q][p].abs().powi(2)).sum();
+                let p_other = absorbed[p];
                 // raw-run check: integrated far field against the Poynting flux through the box
                 let (run_rad, run_box) = match &self.runs[p] {
                     Some(r) => {
@@ -460,7 +527,9 @@ impl Collector {
             "theta_deg": self.theta.iter().map(|t| t.to_degrees()).collect::<Vec<_>>(),
             "phi_deg": self.phi.iter().map(|t| t.to_degrees()).collect::<Vec<_>>(),
             "z0": z0,
-            "normalisation": "r*E_theta, r*E_phi (V, peak) per 1 W incident at the port, other ports matched to z0; index [it * nphi + ip]",
+            "normalisation": format!("r*E_theta, r*E_phi (V, peak) per 1 W incident at the port, other ports {}; index [it * nphi + ip]",
+                                     if all { "matched to z0" } else { "in their own resistances (not every port was excited)" }),
+            "other_ports": if all { "matched" } else { "own_resistance" },
             "box_nodes": {"lo": self.plan.lo, "hi": self.plan.hi},
             "ports": ports_json,
             "summary": summary,
@@ -541,21 +610,15 @@ pub fn polar_svg(path: &Path, pat: &Pattern, title: &str) -> std::io::Result<()>
 mod tests {
     use super::*;
 
-    /// A z-directed Hertzian dipole I dl at the origin, sampled on a box: the transform must give
-    /// U = eta k^2 |I dl|^2 sin^2(theta) / (32 pi^2), P = eta k^2 |I dl|^2 / (12 pi) and a Poynting flux
-    /// equal to P. Exact fields of the dipole fill the gathered samples at their Yee positions.
-    #[test]
-    fn hertzian_dipole_on_a_box() {
+    /// The exact fields of a z-directed Hertzian dipole I dl at the origin (3 GHz), sampled at their Yee
+    /// positions on the faces of the box `lo..=hi` of the grid. Returns the sources, the pattern and the
+    /// exact radiated power eta k^2 |I dl|^2 / (12 pi).
+    fn dipole_on(g: &Grid, lo: [usize; 3], hi: [usize; 3]) -> (Sources, Pattern, f64) {
         let f = 3e9;
         let k = 2.0 * PI * f / C0;
-        let w = 2.0 * PI * f;
         let idl = Cx::new(1e-3, 0.0);
-        // uniform grid, 2 mm cells, box +-30 mm (0.6 lambda), nodes at multiples of 2 mm
-        let h = 2e-3;
-        let nn = 41;
-        let line: Vec<f64> = (0..nn).map(|i| (i as f64 - 20.0) * h).collect();
-        let g = Grid { x: line.clone(), y: line.clone(), z: line.clone() };
-        let plan = Plan::new([nn, nn, nn], [5, 5, 5], [35, 35, 35]).unwrap();
+        let dims = [g.x.len(), g.y.len(), g.z.len()];
+        let plan = Plan::new(dims, lo, hi).unwrap();
         // exact fields of a z dipole (e^{jwt}): H_phi, E_r, E_theta
         let field = |r3: [f64; 3]| -> ([Cx; 3], [Cx; 3]) {
             let r = (r3[0] * r3[0] + r3[1] * r3[1] + r3[2] * r3[2]).sqrt();
@@ -576,19 +639,15 @@ mod tests {
             let hh = [hphi * (-sp), hphi * cp, Cx::default()];
             (e, hh)
         };
-        let _ = w;
+        let ax = [&g.x, &g.y, &g.z];
         let pos = |c: usize, id: u32| -> [f64; 3] {
             let id = id as usize;
-            let (i, j, kk) = (id % nn, (id / nn) % nn, id / (nn * nn));
-            let mut p = [line[i], line[j], line[kk]];
-            // E_a: half along a; H_a: half along the other two
-            if c < 3 {
-                p[c] += h / 2.0;
-            } else {
-                for a in 0..3 {
-                    if a != c - 3 {
-                        p[a] += h / 2.0;
-                    }
+            let ijk = [id % dims[0], (id / dims[0]) % dims[1], id / (dims[0] * dims[1])];
+            let mut p: [f64; 3] = std::array::from_fn(|a| ax[a][ijk[a]]);
+            // E_a: half a cell along a; H_a: half a cell along the other two
+            for a in 0..3 {
+                if (c < 3) == (a == c % 3) {
+                    p[a] = 0.5 * (ax[a][ijk[a]] + ax[a][ijk[a] + 1]);
                 }
             }
             p
@@ -603,10 +662,21 @@ mod tests {
                 })
                 .collect()
         });
-        let s = sources(&plan, &g, &data);
+        let s = sources(&plan, g, &data);
+        assert!((box_flux(&plan, g, &data) - s.p_box).abs() <= 1e-9 * s.p_box.abs(), "box_flux and sources disagree");
         let (th, ph) = grid_deg(5.0);
         let pat = pattern(&s, f, &th, &ph);
-        let p_exact = ETA0 * k * k * idl.abs().powi(2) / (12.0 * PI);
+        (s, pat, ETA0 * k * k * idl.abs().powi(2) / (12.0 * PI))
+    }
+
+    /// The transform of a Hertzian dipole's exact fields must give U = eta k^2 |I dl|^2 sin^2(theta) /
+    /// (32 pi^2), the exact radiated power, and a Poynting flux equal to it.
+    #[test]
+    fn hertzian_dipole_on_a_box() {
+        // uniform grid, 2 mm cells, box +-30 mm (0.6 lambda), nodes at multiples of 2 mm
+        let line: Vec<f64> = (0..41).map(|i| (i as f64 - 20.0) * 2e-3).collect();
+        let g = Grid { x: line.clone(), y: line.clone(), z: line.clone() };
+        let (s, pat, p_exact) = dipole_on(&g, [5, 5, 5], [35, 35, 35]);
         let p = pat.p_rad();
         assert!((p / p_exact - 1.0).abs() < 0.03, "P_rad {p} vs {p_exact}");
         assert!((s.p_box / p_exact - 1.0).abs() < 0.03, "Poynting {} vs {p_exact}", s.p_box);
@@ -617,5 +687,65 @@ mod tests {
         assert!((tmax.to_degrees() - 90.0).abs() < 1e-6);
         let u = pat.u();
         assert!(u[0] < 1e-3 * umax, "on-axis U {} vs max {umax}", u[0]);
+    }
+
+    /// One port excited, the other terminated in 10 ohm instead of z0. The structure is a node joining both
+    /// ports with a 40-ohm "radiation" resistance to ground: at 1 V the driven port delivers 62.5 mW, the
+    /// 10-ohm port absorbs 50 mW and 12.5 mW is radiated, so the radiation efficiency is 100 %. Counting
+    /// the other port's |b|^2 as absorbed (right only for a z0 termination) gave 0.685 W per watt incident
+    /// absorbed out of 0.476 W accepted.
+    #[test]
+    fn one_port_run_counts_what_a_mismatched_port_absorbs() {
+        let opts = FarOpts { freqs: vec![2.4e9], step_deg: 5.0, gap: 3, tol: 0.01 };
+        let mut c = Collector::new(opts, Plan::new([8, 8, 8], [2, 2, 2], [5, 5, 5]).unwrap(), 2);
+        let (v, i1, i2) = (1.0, 1.0 / 10.0 + 1.0 / 40.0, -1.0 / 10.0);
+        let p_rad_w = 0.5 * v * v / 40.0;
+        // an isotropic pattern carrying p_rad_w
+        let e = (2.0 * ETA0 * p_rad_w / (4.0 * PI)).sqrt();
+        let n = c.theta.len() * c.phi.len();
+        let pat = Pattern { theta: c.theta.clone(), phi: c.phi.clone(), eth: vec![Cx::new(e, 0.0); n], eph: vec![Cx::default(); n] };
+        c.runs[0] = Some(vec![(pat, p_rad_w)]);
+        c.v[0] = vec![vec![Cx::new(v, 0.0)], vec![Cx::new(v, 0.0)]];
+        c.i[0] = vec![vec![Cx::new(i1, 0.0)], vec![Cx::new(i2, 0.0)]];
+        let dir = std::env::temp_dir().join("fieldsolve-test-ff-mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = c.finish(&["P1".to_string(), "P2".to_string()], 50.0, &dir).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        let pinc = (v + 50.0 * i1).powi(2) / (8.0 * 50.0);
+        let get = |k: &str| r[k].as_f64().unwrap();
+        assert!((get("p_in") - 0.5 * v * i1 / pinc).abs() < 1e-9, "p_in {}", get("p_in"));
+        assert!((get("p_other_ports") - 0.5 * v * v / 10.0 / pinc).abs() < 1e-9, "p_other {}", get("p_other_ports"));
+        assert!((get("radiation_efficiency") - 1.0).abs() < 0.005, "efficiency {}", get("radiation_efficiency"));
+        assert!(get("p_loss").abs() < 0.005 * get("p_rad"), "p_loss {}", get("p_loss"));
+        let ff: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("farfield.json")).unwrap()).unwrap();
+        assert_eq!(ff["other_ports"], "own_resistance");
+    }
+
+    /// The same dipole with the box planes inside a graded mesh: the cells on the two sides of each plane
+    /// differ by a factor 1.3, as they do when the box sits where the mesh is still growing. The H samples
+    /// are then at unequal distances from the plane and must be interpolated to it, not averaged.
+    #[test]
+    fn hertzian_dipole_on_a_box_in_a_graded_mesh() {
+        // 1 mm cells out to +-20 mm, then growing by 1.3 per cell
+        let mut half = vec![0.0];
+        let mut h = 1e-3;
+        while half.len() < 30 {
+            if half.len() > 20 {
+                h *= 1.3;
+            }
+            half.push(half.last().unwrap() + h);
+        }
+        let line: Vec<f64> = half.iter().rev().map(|x| -x).chain(half.iter().skip(1).copied()).collect();
+        let n = line.len();
+        let g = Grid { x: line.clone(), y: line.clone(), z: line.clone() };
+        // box planes 4 cells into the graded part
+        let (lo, hi) = (n / 2 - 24, n / 2 + 24);
+        let (s, pat, p_exact) = dipole_on(&g, [lo; 3], [hi; 3]);
+        let p = pat.p_rad();
+        eprintln!("graded: plane at {:.2} mm, cells {:.2} / {:.2} mm: P_rad {:+.3} %, box flux {:+.3} %", line[hi] * 1e3, (line[hi] - line[hi - 1]) * 1e3, (line[hi + 1] - line[hi]) * 1e3, 100.0 * (p / p_exact - 1.0), 100.0 * (s.p_box / p_exact - 1.0));
+        assert!((p / p_exact - 1.0).abs() < 0.004, "P_rad {p} vs {p_exact}");
+        assert!((s.p_box / p_exact - 1.0).abs() < 0.004, "Poynting {} vs {p_exact}", s.p_box);
     }
 }

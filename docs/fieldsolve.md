@@ -58,11 +58,16 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   too high at 4-8 GHz with `f_loss` at 1 GHz). `"loss": {"model": "wideband", "f_lo": 0.3e9, "f_hi": 10e9,
   "f_ref": 1e9}` instead fits a sum of Debye poles to a flat tan δ, which is how FR4 behaves
   (Djordjevic-Sarkar): one pole per decade from f_lo/3 to 3·f_hi, at most eight, with non-negative weights
-  fitted by NNLS. εr is matched at `f_ref`. The fit is flat to about 1 % over the band (`disp.rs`). The poles
-  run as auxiliary-current ADEs on the edges in dielectric, on the CPU and in the fused Metal kernels.
+  fitted by NNLS. εr is matched at `f_ref`. The poles run as auxiliary-current ADEs on the edges in
+  dielectric, on the CPU and in the fused Metal kernels.
+  - With one pole per decade the fitted tan δ ripples about the target (`disp.rs`): by 4.8 % over
+    0.1-6 GHz, 8.8 % over 0.1-100 GHz, and 12 % over 1 MHz-1 THz, where the eight poles are spread thinner.
+  - The run prints the worst error over the band and writes it to `result.json` as `"loss_fit": {"poles",
+    "worst_tand_error"}`. Above 10 % it warns: narrow `f_lo`..`f_hi` to the band you use.
   `"copper": true` adds the plane-pair copper loss of each slab as an extra tan δ of about δ_s/h (skin depth
   over slab thickness, rising as √f). That is a stand-in for conductor loss between planes only. The copper
-  itself stays lossless, and the run prints a warning. Use `"conductor"` (below) instead.
+  itself stays lossless, and the run prints a warning. Use `"conductor"` (below) instead. A spec with both
+  `"copper": true` and `"conductor"` is refused, because plane loss would be counted twice.
 - **Conductor loss.** `"conductor": {"sigma": 5.8e7, "roughness_um": 1.0}` (or `true` for these defaults)
   gives every copper sheet edge a surface impedance instead of a perfect conductor (`cond.rs`). For a
   conductor of thickness t with current on one face, Z_s = k/σ · coth(kt), k = (1 + j)/δ: 1/(σt) at DC and
@@ -93,7 +98,12 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   mesh (it is a zero-radius wire).
 - **Multi-port S-parameters.** With every port excited, S = B·A⁻¹ from the wave matrices of all runs, so
   the port terminations need not equal the 50 Ω reference. The impedance matrix is in `result.json`.
-  With one excitation, `s_col_db` holds b_k/a_j with the other ports terminated in their own R.
+  With one excitation, `s_col_db` holds b_k/a_j with the other ports terminated in their own R. That is
+  the 50 Ω S-parameter only when those are 50 Ω (a 10 Ω port moves S11 by 1 dB), and the run warns when
+  one is not.
+  - If the wave matrix A is singular at a frequency, S is written as 0 there and the run warns, on the
+    console and in `result.json` `"checks"`. It means a port saw no incident wave, or two excitations
+    were not independent. The test is a pivot below 1e-10 after each excitation's column is scaled to 1.
 - **Excitation and stopping.** The excitation is a Gaussian, openEMS's `SetGaussExcite(0, fmax)`. Two rules
   can stop a run; `"stop"` chooses:
   - `"ports"` (default): stop when the signal energy at every port, over a sliding window, has fallen
@@ -276,8 +286,19 @@ Part models:
 | `s2p-shunt:FILE` | Vendor two-port measured as a shunt to ground on a through line (Yageo): Z = −Z0·S21/(2·S11). Check the file: a shunt part has \|S21 − S11\| = 1, a series part \|S11 + S21\| = 1. |
 | `s1p:FILE` | Vendor one-port. |
 
-Both two-port forms are ratios, so a symmetric matched fixture line left in the data cancels. Outside a
-file's frequency range the nearest value is held.
+Both two-port forms are ratios, so a symmetric matched fixture line left in the data cancels.
+
+Outside a file's frequency range the value at its end is held. That is not a result, so it is reported:
+`cosim` names each part whose file does not cover a report or far-field frequency, on the console and in
+`cosim.json` `"warnings"`. `tune` does the same for its band and harmonics (`tune.json` `"warnings"`). A
+file that only fails to cover part of the exported sweep gets a milder note.
+
+**Frequencies.** A report, far-field or objective frequency need not be a point of the EM sweep. The EM
+S-matrix is interpolated to it (cubic, through the four nearest sweep points; exact at a sweep point), and
+the parts and the patterns are evaluated at the same frequency. Until Nov 2026 the EM data came from the
+nearest sweep point while the parts used the exact frequency. At a resonance of Q 20 on a 20 MHz sweep the
+nearest point is up to 16 % off in S; the interpolated value is within 1 %. A frequency outside the sweep
+is held at the sweep's end and listed in `"warnings"`.
 
 Port names come from `result.json` next to the EM file.
 
@@ -328,16 +349,27 @@ on Metal and on the CPU, touching only the face samples. Afterwards each face ce
 currents J = n × H and M = −n × E. The radiation integrals give r·E_θ and r·E_φ on a θ/φ grid
 (Balanis, *Advanced Engineering Electromagnetics* 6.8; e^{jωt}, the sign of the field DFT).
 
+H is sampled half a cell on either side of a face and interpolated linearly to it. Where the cells on the
+two sides differ (a box in the graded part of the mesh) a plain mean reads H off the plane: on a graded
+box around a Hertzian dipole's exact fields the radiated power was 0.93 % low with the mean and is 0.07 %
+low with the interpolation (`hertzian_dipole_on_a_box_in_a_graded_mesh`). `gap` must be at least 1; at 0 the outer H
+samples would lie inside the absorber, and the run is refused.
+
 **Every far-field frequency must be at or below `fmax`.** The box DFT samples the fields at 3 × `fmax`, so
 a frequency f above `fmax` is mixed with its alias at 3 × `fmax` − f, where the excitation still has energy.
 The radiated power is then off by about 3.5 % at 1.2 × `fmax` and 14 % at 1.3 × `fmax`, and from
 1.5 × `fmax` it means nothing. The default `fmax` is 3 GHz, so the harmonics of a 2.44 GHz radio need
 `"fmax": 8e9`. A run that lists a far-field frequency above `fmax` is refused before the mesh is built, and so is
-one with `"fields"` or `"objective"` frequencies (band or harmonics) above it.
+one with `"fields"` or `"objective"` frequencies (band or harmonics) above it. An `"objective"` band
+frequency that is not in `"farfield.freqs"` is refused as well: with a far field the objective is the
+radiated power, and that exists only at the far-field frequencies.
 
-**The box must be in free space, with everything that radiates inside it.** The run warns when tangential E
-edges on its faces are not free space. A window of a board (the default `roi` domain) is cut at the domain
-edge, so its far field is meaningless. For far-field runs use:
+**The box must be in free space, with everything that radiates inside it.** The run warns when E edges on
+its faces are not free space, on the console and in `result.json` `"checks"`. It counts the tangential
+edges in the faces and the edges normal to a face that touch it. A conductor one cell across that leaves
+the box along the normal (a wire, a via barrel, a port lead) sets only the normal ones. A window of a board
+(the default `roi` domain) is cut at the domain edge, so its far field is meaningless. For far-field runs
+use:
 
 - **`"extent": "board"`:** the domain is the whole board outline plus `air` (and `air_z` above and
   below). The `roi` stays the fine-meshed region; cells grade up to `max_cell` outside it. Copper is
@@ -359,6 +391,13 @@ dipole read 110 % at 1 GHz although its radiated power matched the box flux to 0
 **Patterns per port.** With `"excite": "all"` the patterns are combined with the inverse of the wave
 matrix, F = F_run·A⁻¹, exactly as S = B·A⁻¹. Each port then has a pattern per 1 W incident with the
 other ports matched to 50 Ω. Those patterns add linearly with any port waves.
+
+With only some ports excited there is nothing to solve for, and each pattern is its run as simulated: the
+other ports sit in their own resistances. `farfield.json` says which case it holds (`"other_ports":
+"matched"` or `"own_resistance"`). The power out of the other ports is then |b|² − |a|² at each port, which
+is exact for any resistance; |b|² alone, as used until Nov 2026, counted the wave a 10 Ω port reflects back
+into the structure as absorbed. `cosim` and `tune` need the matched patterns, so use `"excite": "all"` for
+them.
 
 Outputs:
 - **`farfield.json`:** θ/φ grid, per-port patterns (r·E_θ, r·E_φ, peak, per 1 W incident) and a summary.
@@ -549,8 +588,9 @@ to a copper edge those factors come from an assumed local field instead of a uni
   - The half-plane field ignores the ground. Components sampled over the metal keep the conformal factors:
     there the half-plane field made the line 5-10 % off. And the factors have full weight only where the
     nearest copper of another layer (or a PEC wall) is at least 4 in-plane cells away (`plane_cells`),
-    fading to none at 2. On 75 µm prepreg at 0.05 mm cells that leaves conformal alone, which there did as
-    well as both together.
+    fading to the conformal factors at 2. On 75 µm prepreg at 0.05 mm cells that leaves conformal alone,
+    which there did as well as both together. Between 2 and 4 cells each component is a blend of its
+    singular and its conformal factor (table below).
 - **Only on the fine mesh.** An in-plane E edge gets fractions, opening or singular factors only if it is
   at most `max_cell` long (the edge's own length is its extent across a copper boundary it crosses); faces,
   slivers and the vertical and off-sheet components only if the finer of their two in-plane cells is. The
@@ -619,6 +659,27 @@ Errors against Hammerstad-Jensen over seven insets (0.05, 0.2, 0.35, 0.5, 0.65, 
 | εeff, max | 21.7 % | 1.0 % | 0.27 % |
 | Z0, range | −5.2 to +8.5 % | −7.0 to −1.8 % | −2.8 to +3.2 % |
 | C per length, range | −2.9 to +15.9 % | +2.0 to +8.1 % | −3.3 to +2.8 % |
+
+**In the fade, 2 to 4 cells across the substrate** (w 0.33-0.42 mm, h = 0.2 mm, εr 4.3). Until Nov 2026
+the blend ran from the singular factor to the uncorrected factor 1 instead of the conformal one, so a
+partly covered edge lost its conformal correction as the weight fell. εeff was up to 4 % low. Errors
+against Hammerstad-Jensen, before → after, with conformal alone for comparison:
+
+| cell (cells across h) | inset | εeff, both | Z0, both | εeff / Z0, conformal |
+|---|---|---|---|---|
+| 0.08 mm (2.5) | 1/3 | −2.30 → +0.15 % | −0.41 → −2.38 % | +0.04 / −2.74 % |
+| | 1/2 | −4.17 → −0.23 % | +3.24 → −0.74 % | −0.34 / −0.84 % |
+| 0.07 mm (2.9) | 1/3 | −1.86 → +0.19 % | −0.09 → −2.02 % | +0.06 / −2.94 % |
+| | 1/2 | −3.34 → −0.11 % | +3.37 → −0.64 % | −0.29 / −1.29 % |
+| 0.06 mm (3.3) | 1/3 | −0.84 → +0.18 % | −0.91 → −1.68 % | +0.09 / −3.23 % |
+| | 1/2 | −1.67 → −0.02 % | +0.44 → −0.82 % | −0.14 / −2.13 % |
+
+- εeff is now within 0.25 % everywhere in the fade, and Z0 moves steadily from the conformal value at 2
+  cells (0.1 mm: equal to conformal) to the full correction at 4 (0.05 mm: −0.3 to +0.5 %).
+- At inset 1/3 the old Z0 was closer to the reference. That was two errors cancelling (εeff and C both
+  low), not accuracy: at inset 1/2 the same blend gave +3.2 to +3.4 %.
+- Rows at inset 0, at 0.1 mm and at 0.05 mm are unchanged, and so is every result at 4 or more cells across
+  the substrate or with a plane closer than 2 cells.
 
 **DK-like substrate** (w ≈ 0.3 mm on 75 µm, εr 4.4; 0.05 mm cells, 1.5 across h; 4 insets). Here the
 ground plane is closer than the singular factors' fade distance, so "both" equals conformal:
