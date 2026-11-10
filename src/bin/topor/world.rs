@@ -359,6 +359,10 @@ impl World {
             objs.push(Obj { s, alive: true, plane, lv: Vec::new() });
         }
         let spec_obj: Vec<u32> = map.iter().map(|&k| first + k as u32).collect();
+        // rings (outline, holes, edge cuts, keepouts) may overlap: cut them at their crossings so that their fixed
+        // edges meet at shared vertices instead of crossing (the CDT cannot hold two crossing fixed edges)
+        split_ring_crossings(&mut objs);
+        let is_ring: Vec<bool> = objs.iter().map(|o| ring_kind(o.s.kind)).collect();
         let lo = p2(-5.0, -5.0);
         let hi = p2(b.size[0] + 5.0, b.size[1] + 5.0);
         let mut layers = Vec::new();
@@ -377,7 +381,8 @@ impl World {
                     let p = to_ip(o.s.pts[k]);
                     let v = cdt.insert(p)?;
                     if (v as usize) < vobj.len() {
-                        if vobj[v as usize] != oi as u32 {
+                        let other = vobj[v as usize];
+                        if other != oi as u32 && !(is_ring[oi] && other != NONE && is_ring[other as usize]) {
                             warnings.push(format!("layer {}: point of {} coincides with {}", l, o.s.name, vobj[v as usize]));
                         }
                     } else {
@@ -471,13 +476,30 @@ impl World {
 
     fn mark_blocked(&mut self, l: usize) {
         let outline_ids: Vec<u32> = (0..self.objs.len() as u32).filter(|&i| self.objs[i as usize].s.kind == Kind::Outline && self.objs[i as usize].s.name.starts_with("outline")).collect();
+        // the outline's segments (nanometre grid, with bounding boxes)
+        let mut oseg: Vec<(IP, IP, IP, IP)> = Vec::new();
+        for &i in &outline_ids {
+            let pts: Vec<IP> = self.objs[i as usize].s.pts.iter().map(|&q| to_ip(q)).collect();
+            for k in 0..pts.len() {
+                let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+                oseg.push((a, b, [a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]));
+            }
+        }
         let layer = &mut self.layers[l];
         let nt = layer.cdt.tris.len();
-        // outside the board: flood from triangles touching the bounding-box corners, stopping at outline edges
-        let is_outline_edge = |layer: &Layer, e: u32| -> bool {
-            let ed = layer.cdt.edges[e as usize];
-            ed.fixed && outline_ids.contains(&layer.vobj[ed.a as usize]) && outline_ids.contains(&layer.vobj[ed.b as usize])
-        };
+        // outside the board: flood from triangles touching the bounding-box corners, stopping at outline edges: fixed
+        // edges along an outline segment. By geometry, not by which object owns the ends: an outline segment that
+        // another ring's vertex splits (a keepout's side along the board edge), or a keepout's edge between two of
+        // its crossings with the outline (vertices the outline owns), must not let the flood in or stop it
+        let on_seg = |s: &(IP, IP, IP, IP), p: IP| p[0] >= s.2[0] && p[0] <= s.3[0] && p[1] >= s.2[1] && p[1] <= s.3[1] && orient(s.0, s.1, p) == 0;
+        let mut outline_edge = vec![false; layer.cdt.edges.len()];
+        for (e, ed) in layer.cdt.edges.iter().enumerate() {
+            if ed.fixed {
+                let (pa, pb) = (layer.cdt.pts[ed.a as usize], layer.cdt.pts[ed.b as usize]);
+                outline_edge[e] = oseg.iter().any(|s| on_seg(s, pa) && on_seg(s, pb));
+            }
+        }
+        let is_outline_edge = |_: &Layer, e: u32| -> bool { outline_edge[e as usize] };
         let mut seen = vec![false; nt];
         let mut stack: Vec<u32> = Vec::new();
         for t in 0..nt {
@@ -500,32 +522,38 @@ impl World {
                 stack.push(tr.n[i]);
             }
         }
-        // interiors of objects (all three vertices on one object, centroid inside it)
+        // rings that block their inside on this layer (keepouts, edge cuts, outline holes), with bounding boxes
+        let mut rings: Vec<(u32, P2, P2)> = Vec::new();
+        for (i, o) in self.objs.iter().enumerate() {
+            if ring_kind(o.s.kind) && o.s.name != "outline" && o.on(l) && o.npts() >= 3 {
+                let lo = o.s.pts.iter().fold(p2(f64::INFINITY, f64::INFINITY), |a, q| p2(a.x.min(q.x), a.y.min(q.y)));
+                let hi = o.s.pts.iter().fold(p2(f64::NEG_INFINITY, f64::NEG_INFINITY), |a, q| p2(a.x.max(q.x), a.y.max(q.y)));
+                rings.push((i as u32, lo, hi));
+            }
+        }
+        // interiors: of copper (all three vertices on one object), and of rings (centroid inside any of them, whatever
+        // the corners are on: rings overlap and share their crossings, and vias or pads inside a keepout put corners of
+        // their own into it; a wire there is further from the ring than the exact checks look)
         for t in 0..nt {
             let tr = layer.cdt.tris[t];
             if !tr.alive {
                 continue;
             }
-            let o = layer.vobj[tr.v[0] as usize];
-            if o == NONE || layer.vobj[tr.v[1] as usize] != o || layer.vobj[tr.v[2] as usize] != o {
+            let ow = [layer.vobj[tr.v[0] as usize], layer.vobj[tr.v[1] as usize], layer.vobj[tr.v[2] as usize]];
+            if ow.contains(&NONE) {
                 continue;
             }
-            let obj = &self.objs[o as usize];
-            if obj.npts() < 3 {
-                continue;
+            let o = ow[0];
+            if ow[1] == o && ow[2] == o {
+                let obj = &self.objs[o as usize];
+                if matches!(obj.s.kind, Kind::Pad | Kind::Hole | Kind::Via) && obj.npts() >= 3 {
+                    layer.tflag[t] |= T_BLOCK;
+                    continue;
+                }
             }
             let c = (from_ip(layer.cdt.pts[tr.v[0] as usize]) + from_ip(layer.cdt.pts[tr.v[1] as usize]) + from_ip(layer.cdt.pts[tr.v[2] as usize])) * (1.0 / 3.0);
-            let inside = point_in_poly(&obj.s.pts, c);
-            match obj.s.kind {
-                Kind::Outline if obj.s.name == "outline" => {}
-                Kind::Pad | Kind::Hole | Kind::Via if obj.npts() >= 3 => {
-                    layer.tflag[t] |= T_BLOCK;
-                }
-                _ => {
-                    if inside {
-                        layer.tflag[t] |= T_BLOCK;
-                    }
-                }
+            if rings.iter().any(|&(i, lo, hi)| c.x >= lo.x && c.x <= hi.x && c.y >= lo.y && c.y <= hi.y && point_in_poly(&self.objs[i as usize].s.pts, c)) {
+                layer.tflag[t] |= T_BLOCK;
             }
         }
     }
@@ -3134,6 +3162,12 @@ fn merge_overlaps(specs: Vec<ObjSpec>, nsig: usize) -> (Vec<ObjSpec>, Vec<usize>
         if (a.kind == Kind::Keepout) != (b.kind == Kind::Keepout) {
             continue;
         }
+        // overlapping rings (keepouts, edge cuts) stay separate too: World::new cuts them at their crossings. Their
+        // convex hull would cover free board between them, on the layers of all of them, and chain on through
+        // every ring that touches the next (rule areas sharing a side): half a board kept out on every layer
+        if ring_kind(a.kind) && ring_kind(b.kind) {
+            continue;
+        }
         // core hulls closer than their radii (touching or overlapping copper)?
         let mut d = f64::INFINITY;
         let ring = |s: &ObjSpec| matches!(s.kind, Kind::Keepout | Kind::Outline);
@@ -3251,6 +3285,88 @@ fn merge_overlaps(specs: Vec<ObjSpec>, nsig: usize) -> (Vec<ObjSpec>, Vec<usize>
     (out, map, warnings)
 }
 
+/// Rings: objects whose points are a polygon outline (the board outline and its holes, edge cuts, keepouts), not the
+/// core of copper.
+pub fn ring_kind(k: Kind) -> bool {
+    matches!(k, Kind::Keepout | Kind::Outline)
+}
+
+/// Cut rings that share a layer at their crossings: each crossing point goes into both rings (into the one ring only
+/// when it falls on a vertex of the other), so that their fixed edges in the CDT meet at shared vertices instead of
+/// crossing. The shapes stay as they are (a crossing is rounded to the nanometre grid).
+fn split_ring_crossings(objs: &mut [Obj]) {
+    let rings: Vec<usize> = (0..objs.len()).filter(|&i| ring_kind(objs[i].s.kind) && objs[i].npts() >= 3).collect();
+    // rounding a crossing bends both edges by under a nanometre, which can make a new crossing nearby: repeat
+    for _ in 0..4 {
+        let ip: Vec<Vec<IP>> = rings.iter().map(|&i| objs[i].s.pts.iter().map(|&q| to_ip(q)).collect()).collect();
+        let bb: Vec<(IP, IP)> = ip
+            .iter()
+            .map(|r| r.iter().fold(([i64::MAX, i64::MAX], [i64::MIN, i64::MIN]), |(lo, hi), q| ([lo[0].min(q[0]), lo[1].min(q[1])], [hi[0].max(q[0]), hi[1].max(q[1])])))
+            .collect();
+        let overlap = |a: &(IP, IP), b: &(IP, IP)| a.0[0] <= b.1[0] && b.0[0] <= a.1[0] && a.0[1] <= b.1[1] && b.0[1] <= a.1[1];
+        // per ring: (edge, parameter along it, point)
+        let mut adds: Vec<Vec<(usize, f64, IP)>> = vec![Vec::new(); rings.len()];
+        for i in 0..rings.len() {
+            for j in i + 1..rings.len() {
+                if objs[rings[i]].s.layers & objs[rings[j]].s.layers == 0 || !overlap(&bb[i], &bb[j]) {
+                    continue;
+                }
+                let (ra, rb) = (&ip[i], &ip[j]);
+                for ea in 0..ra.len() {
+                    let (a0, a1) = (ra[ea], ra[(ea + 1) % ra.len()]);
+                    let ea_bb = ([a0[0].min(a1[0]), a0[1].min(a1[1])], [a0[0].max(a1[0]), a0[1].max(a1[1])]);
+                    if !overlap(&ea_bb, &bb[j]) {
+                        continue;
+                    }
+                    for eb in 0..rb.len() {
+                        let (b0, b1) = (rb[eb], rb[(eb + 1) % rb.len()]);
+                        let (o1, o2) = (orient(a0, a1, b0), orient(a0, a1, b1));
+                        let (o3, o4) = (orient(b0, b1, a0), orient(b0, b1, a1));
+                        if o1 * o2 >= 0 || o3 * o4 >= 0 {
+                            continue; // no proper crossing (touching and collinear edges the CDT splits by itself)
+                        }
+                        let d = |p: IP, q: IP| [(q[0] - p[0]) as i128, (q[1] - p[1]) as i128];
+                        let cr = |u: [i128; 2], v: [i128; 2]| u[0] * v[1] - u[1] * v[0];
+                        let (da, db, dab) = (d(a0, a1), d(b0, b1), d(a0, b0));
+                        let den = cr(da, db) as f64;
+                        let (t, u) = (cr(dab, db) as f64 / den, cr(dab, da) as f64 / den);
+                        let x = [(a0[0] as f64 + t * da[0] as f64).round() as i64, (a0[1] as f64 + t * da[1] as f64).round() as i64];
+                        // a crossing on a vertex of one ring goes into the other ring only
+                        if x != a0 && x != a1 {
+                            adds[i].push((ea, t, x));
+                        }
+                        if x != b0 && x != b1 {
+                            adds[j].push((eb, u, x));
+                        }
+                    }
+                }
+            }
+        }
+        if adds.iter().all(|a| a.is_empty()) {
+            return;
+        }
+        for (ri, mut add) in adds.into_iter().enumerate() {
+            if add.is_empty() {
+                continue;
+            }
+            add.sort_by(|a, b| (a.0, a.1).partial_cmp(&(b.0, b.1)).unwrap());
+            let o = &mut objs[rings[ri]];
+            let old = std::mem::take(&mut o.s.pts);
+            let mut k = 0;
+            for (e, q) in old.iter().enumerate() {
+                o.s.pts.push(*q);
+                while k < add.len() && add[k].0 == e {
+                    let x = add[k].2;
+                    if to_ip(*o.s.pts.last().unwrap()) != x {
+                        o.s.pts.push(from_ip(x));
+                    }
+                    k += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Copper of a net laid before routing besides its pads: a zone's fill pieces and neck-down stubs. Tied to the pads
 /// it touches, never hulled with them.
 pub fn fixed_copper(name: &str) -> bool {
@@ -3291,4 +3407,84 @@ pub fn clr_in(b: &Board, x: &Attr, y: &Attr) -> Option<f64> {
         c
     };
     Some(c + MARGIN)
+}
+
+#[cfg(test)]
+mod rule_area_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A 20 x 20 mm board with chamfered corners, a through pad inside an In1 rule area, and rule areas that overlap
+    /// each other, share sides, cross the outline and run along it.
+    fn world() -> World {
+        let ra = |layers: &[&str], tracks: bool, vias: bool, x0: f64, y0: f64, x1: f64, y1: f64| json!({"layers": layers, "tracks": tracks, "vias": vias, "polygons": [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]]});
+        let m = json!({
+            "name": "t", "size": [20.0, 20.0], "origin": [0.0, 0.0],
+            "outline": [[2.0, 0.0], [18.0, 0.0], [20.0, 2.0], [20.0, 18.0], [18.0, 20.0], [2.0, 20.0], [0.0, 18.0], [0.0, 2.0]], "outline_holes": [],
+            "layers": ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], "rules": [0.15, 0.15, 0.5, 0.3],
+            "classes": {"Default": [0.15, 0.15, 0.5, 0.3]}, "net_class": {"SIG": "Default", "GND": "Default"},
+            "pads": [
+                {"ref": "C1", "num": "1", "x": 16.0, "y": 16.0, "w": 0.5, "h": 0.5, "rot": 0, "shape": "rect", "layers": "F", "net": "SIG"},
+                {"ref": "C2", "num": "1", "x": 18.0, "y": 10.0, "w": 0.5, "h": 0.5, "rot": 0, "shape": "rect", "layers": "F", "net": "SIG"},
+                {"ref": "TP1", "num": "1", "x": 7.0, "y": 7.0, "w": 0.6, "h": 0.6, "drill": 0.3, "rot": 0, "shape": "rect", "layers": "all", "net": "GND"}
+            ],
+            "zones": [],
+            "rule_areas": [
+                // A: tracks kept off In1 under a block, vias allowed
+                ra(&["In1.Cu"], true, false, 2.0, 2.0, 12.0, 12.0),
+                // B: tracks and vias, In1, overlapping A's right side
+                ra(&["In1.Cu"], true, true, 10.0, 3.0, 16.0, 9.0),
+                // C: In1 and In2, across A's left side
+                ra(&["In1.Cu", "In2.Cu"], true, true, 1.0, 8.0, 4.0, 10.0),
+                // D: every signal layer, sharing a side with C and reaching past the outline
+                ra(&["F.Cu", "In1.Cu", "In2.Cu"], true, true, -1.0, 5.0, 1.0, 15.0),
+                // E: along the bottom edge, over both chamfers, its side on the outline's
+                ra(&["F.Cu", "In1.Cu", "In2.Cu"], true, true, -1.0, 0.0, 21.0, 1.0)
+            ],
+            "routable_nets": 1,
+            "global_rules": {"min_track_width": 0.1, "min_copper_edge_clearance": 0.3},
+            "cold_routing": {"planes": {"GND": "B.Cu"}}
+        });
+        World::new(Board::load(&m).expect("model")).expect("world")
+    }
+
+    fn blocked(w: &World, l: usize, x: f64, y: f64) -> bool {
+        match w.locate(l, p2(x, y)).expect("locate") {
+            crate::cdt::Loc::Inside(t) => w.layers[l].tflag[t as usize] & T_BLOCK != 0,
+            other => panic!("({}, {}) not inside a triangle: {:?}", x, y, other),
+        }
+    }
+
+    /// Overlapping rule areas stay what they are: not the convex hull of all of them, on all of their layers (which,
+    /// chained through areas sharing a side, kept half a board out on every layer), and none of them lets the outside
+    /// of the board in.
+    #[test]
+    fn overlapping_rule_areas_block_their_union_on_their_own_layers() {
+        let w = world();
+        let (f, in1, in2) = (0, 1, 2);
+        assert!(!w.warnings.iter().any(|x| x.contains("rule_area")), "rule area edges all in the CDT: {:?}", w.warnings);
+        assert_eq!(w.objs.iter().filter(|o| o.s.name == "rule_area").count(), 5, "rule areas kept apart");
+        // the board between and around the areas is free on every layer
+        for l in [f, in1, in2] {
+            assert!(!blocked(&w, l, 16.0, 14.0), "free board blocked on layer {}", l);
+            assert!(!blocked(&w, l, 10.0, 1.5), "free board above the edge area blocked on layer {}", l);
+        }
+        // inside the hull of A and B but in neither
+        assert!(!blocked(&w, in1, 13.0, 10.0));
+        // the In1 areas do not spread onto F (through D, which shares a side with C)
+        assert!(!blocked(&w, f, 7.0, 9.0));
+        assert!(!blocked(&w, f, 13.0, 6.0));
+        assert!(!blocked(&w, in2, 7.0, 9.0));
+        // each area blocks its inside on its layers: where two overlap, and next to a pad inside one
+        assert!(blocked(&w, in1, 11.0, 5.0), "A and B overlap");
+        assert!(blocked(&w, in1, 2.5, 9.0), "A and C overlap");
+        assert!(blocked(&w, in1, 7.0, 7.6), "beside the pad in A");
+        assert!(blocked(&w, in1, 9.0, 11.0));
+        assert!(blocked(&w, in2, 3.0, 9.0), "C on In2");
+        assert!(blocked(&w, f, 0.5, 10.0), "D inside the outline");
+        assert!(blocked(&w, f, 10.0, 0.5), "E along the edge");
+        // vias: kept out of every part of an area that forbids them, allowed in one that forbids tracks only
+        assert!(w.b.via_kept_out(p2(13.0, 6.0), 0.3), "deep inside B");
+        assert!(!w.b.via_kept_out(p2(5.0, 5.0), 0.3), "A allows vias");
+    }
 }
