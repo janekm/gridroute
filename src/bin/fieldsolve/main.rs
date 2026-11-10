@@ -13,8 +13,18 @@ mod disp;
 mod cond;
 mod post;
 mod export;
+mod fidelity;
 mod sim;
 mod lines;
+mod edge;
+mod edge_cases;
+mod amr2d;
+mod meshpol;
+mod octree;
+mod tune;
+mod extrap;
+mod optimise;
+mod presets;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_fdtd;
 
@@ -51,6 +61,145 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     match cmd {
+        "edge-diag" => {
+            // where the late-time energy sits: edge-diag SPEC [steps] [top]
+            let (mut cx, _) = sim::load(std::path::Path::new(&args[2])).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let p = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let steps = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(20000);
+            let top = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(30);
+            edge::diag(&p, 0, steps, top);
+        }
+        "octree-count" => {
+            // step-3 estimate: octree cells vs the rectilinear mesh for a spec's board. octree-count SPEC [r]
+            let (mut cx, _) = sim::load(std::path::Path::new(&args[2])).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let (masks, _) = model::sheet_masks(&st.grid, &st.layout);
+            // where the rectilinear mesh's cells are: per axis, by cell size
+            for a in 0..3 {
+                let l = st.grid.axis(a);
+                let d: Vec<f64> = l.windows(2).map(|w| (w[1] - w[0]) * 1e3).collect();
+                let hmin = d.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mut bins = [0usize; 5];
+                for &v in &d {
+                    let r = v / hmin;
+                    bins[if r < 1.05 { 0 } else if r < 2.0 { 1 } else if r < 4.0 { 2 } else if r < 8.0 { 3 } else { 4 }] += 1;
+                }
+                println!("axis {a}: {} cells, finest {hmin:.4} mm; at the finest {} , <2x {}, <4x {}, <8x {}, coarser {}", d.len(), bins[0], bins[1], bins[2], bins[3], bins[4]);
+            }
+            for r in [1.3, 1.5, 2.0] {
+                let (nr, no) = amr2d::octree_estimate(&st.grid, &masks, r);
+                println!("grading {r}: rectilinear {:.2} M cells, octree estimate {:.2} M ({:.1} x fewer)", nr as f64 * 1e-6, no * 1e-6, nr as f64 / no);
+            }
+        }
+        "octree-check" => {
+            // octree prototype (octree.rs) on the microstrip: octree-check [hc] [nz] [insets,..] [grading] [smax]
+            let num = |i: usize, d: f64| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+            let (hc, nz) = (num(2, 0.2), num(3, 8.0) as u32);
+            let insets: Vec<f64> = args.get(4).map(|s| s.as_str()).unwrap_or("0.05,0.35,0.65,0.95").split(',').filter_map(|v| v.parse().ok()).collect();
+            let (r, smax) = (num(5, 1.3), num(6, 8.0) as u32);
+            for &f in &insets {
+                let (w, z0, ee, leaves, masters, faces, steps, secs) = octree::microstrip(3.0, 1.6, 4.3, hc, nz, f, r, smax);
+                let (z0r, eer) = cases::hammerstad(w, 1.6, 4.3);
+                let (cs, cr) = (ee.sqrt() / (299_792_458.0 * z0), eer.sqrt() / (299_792_458.0 * z0r));
+                println!(
+                    "octree cell {hc} nz {nz} inset {f:.3} w {w:.4}: Z0 {z0:.3} ({:+.2} %)  eps_eff {ee:.4} ({:+.2} %)  C {:+.2} %  [{leaves} leaves, {masters} edge unknowns, {faces} faces, {steps} steps, {secs:.0} s]",
+                    100.0 * (z0 / z0r - 1.0), 100.0 * (ee / eer - 1.0), 100.0 * (cs / cr - 1.0)
+                );
+            }
+        }
+        "amr-check" => {
+            // dynamic-resolution prototype (amr2d.rs): plane pair with a slot, uniform reference vs static and
+            // dynamic quadtrees. amr-check [h_mm] [steps] [absorb_mm]
+            let num = |i: usize, d: f64| args.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+            let (h, steps, ab) = (num(2, 0.125), num(3, 60000.0) as usize, num(4, 0.0));
+            let geo = amr2d::plane_pair(40.0, 30.0, 4.3, 0.02, h, 15.0, ab);
+            let freqs = post::linspace(0.3e9, 5.0e9, 471);
+            let mut cases: Vec<(&str, amr2d::AmrOpts)> = vec![("uniform", amr2d::AmrOpts { max_size: 1, ..Default::default() })];
+            for (name, ms, ppw) in [("static ppw20", 8u32, 20.0), ("static ppw10", 16, 10.0), ("static ppw5", 32, 5.0)] {
+                cases.push((name, amr2d::AmrOpts { max_size: ms, ppw, ..Default::default() }));
+            }
+            // refine_tol: (h k)^2 / 4 of a wave at ppw 20 is 0.025, at ppw 10 0.1
+            for (name, every, rt, ct) in [("dynamic 0.1/0.025", 10usize, 0.1, 0.025), ("dynamic 0.025/0.006", 10, 0.025, 0.006), ("dynamic 0.01/0.0025", 10, 0.01, 0.0025)] {
+                cases.push((name, amr2d::AmrOpts { max_size: 32, ppw: 5.0, every, refine_tol: rt, coarsen_tol: ct, ..Default::default() }));
+            }
+            let mut zref: Vec<post::Cx> = vec![];
+            let mut pref: Vec<f64> = vec![];
+            let mut uref = 0.0;
+            for (name, o) in cases {
+                let mut a = amr2d::Amr::new(geo.clone(), o);
+                let n0 = a.leaves();
+                // the same dt in every case (set by the finest cell that may appear)
+                let exc = amr2d::gauss(0.0, 6e9, a.dt());
+                let r = a.run(&exc, steps);
+                let z = amr2d::port_z(&r, &freqs);
+                let db: Vec<f64> = z.iter().map(|c| 20.0 * c.abs().log10()).collect();
+                // the first cavity modes: the |Z| maximum near f10 (1.81), f01 (2.41), f11 (3.01 GHz without the slot)
+                let peaks: Vec<f64> = [(1.4e9, 2.1e9), (2.1e9, 2.7e9), (2.7e9, 3.4e9), (3.4e9, 4.2e9)]
+                    .iter()
+                    .map(|&(lo, hi)| {
+                        let k = (0..freqs.len()).filter(|&k| freqs[k] >= lo && freqs[k] <= hi).max_by(|&a, &b| db[a].partial_cmp(&db[b]).unwrap()).unwrap();
+                        freqs[k] / 1e9
+                    })
+                    .collect();
+                let probe = &r.probes[0];
+                if zref.is_empty() {
+                    zref = z.clone();
+                    pref = probe.clone();
+                    uref = r.cell_updates;
+                }
+                let rms_db = (db.iter().zip(&zref).map(|(a, b)| (a - 20.0 * b.abs().log10()).powi(2)).sum::<f64>() / db.len() as f64).sqrt();
+                let pk = pref.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let perr = (probe.iter().zip(&pref).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / pref.iter().map(|b| b * b).sum::<f64>().max(1e-300)).sqrt();
+                let e_in: f64 = r.vport.iter().zip(&r.iport).zip(&exc).map(|((&v, &i), _)| v * i * r.dt).sum();
+                println!(
+                    "{name:<16} leaves {n0:>6} (run {}..{})  updates {:.3e} ({:.1} % of uniform; 2:1 LTS {:.1} %)  |Z| rms {:.3} dB  probe rms {:.2e} (peak {:.2e})  peaks {:?}  remeshes {}  energy lost {:.2e} of {:.2e}  {:.1} s",
+                    r.min_leaves, r.max_leaves, r.cell_updates, 100.0 * r.cell_updates / uref, 100.0 * r.lts_updates / uref, rms_db, perr, pk,
+                    peaks.iter().map(|f| (f * 1000.0).round() / 1000.0).collect::<Vec<_>>(), r.remeshes, r.energy_lost, e_in, r.seconds
+                );
+            }
+        }
+        "edge-check" => {
+            // sub-cell copper edges (edge.rs): microstrip Z0 / eps_eff against Hammerstad at several cells
+            // and edge insets, a 45 degree line, and a series gap; every edge setting
+            // edge-check [line|line45|gap] [w h er] [cells,..] [insets,..] [variants,..]
+            let be = backend(&args);
+            let what = args.get(2).map(|s| s.as_str()).unwrap_or("line");
+            let list = |i: usize, d: &str| -> Vec<f64> { args.get(i).map(|s| s.as_str()).unwrap_or(d).split(',').filter_map(|v| v.parse().ok()).collect() };
+            let geo = list(3, "3,1.6,4.3");
+            let (w, h, er) = (geo[0], geo[1], geo[2]);
+            let cells = list(4, "0.4,0.2,0.1");
+            let insets = list(5, "0,0.3333,0.5");
+            let want: Vec<String> = args.get(6).map(|s| s.split(',').map(|v| v.to_string()).collect()).unwrap_or_default();
+            let nzf = |hc: f64| ((h / hc).round() as usize).max(2);
+            for (name, eo) in edge_cases::variants() {
+                if !want.is_empty() && !want.iter().any(|v| v == name) {
+                    continue;
+                }
+                for &hc in &cells {
+                    match what {
+                        "gap" => {
+                            for &gp in &insets {
+                                let (c, n, steps) = edge_cases::gap(&*be, w, h, er, gp, hc, nzf(hc), eo.clone());
+                                println!("gap {name:<10} w {w} h {h} gap {gp:.4} cell {hc:.4}: C_gap {c:.5} pF  [{n} cells, {steps} steps]");
+                            }
+                        }
+                        _ => {
+                            let a45 = what == "line45";
+                            let ins: Vec<f64> = if a45 { vec![0.0] } else { insets.clone() };
+                            for &f in &ins {
+                                let r = edge_cases::line(&*be, w, h, er, hc, nzf(hc), f, a45, eo.clone());
+                                let (cs, cr) = r.c();
+                                println!(
+                                    "{what} {name:<10} cell {hc:.4} inset {f:.3} w {:.4}: Z0 {:.3} (ref {:.3}, {:+.2} %)  eps_eff {:.4} (ref {:.4}, {:+.2} %)  C {:.2} pF/m ({:+.2} %)  [{} cells, {} steps, dt {:.3e}, {:.0} s]",
+                                    r.w, r.z0, r.z0_ref, 100.0 * (r.z0 / r.z0_ref - 1.0), r.ee, r.ee_ref, 100.0 * (r.ee / r.ee_ref - 1.0), cs, 100.0 * (cs / cr - 1.0), r.cells, r.steps, r.dt, r.seconds
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         "debye-port-check" => {
             // two-port microstrip (gap case without the slot) with the wideband dielectric: S must be passive
             let be = backend(&args);
@@ -220,6 +369,37 @@ fn main() {
                 }
             }
         }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        "edge-bench" => {
+            // A/B step rate with and without the edge corrections, alternating so that other GPU load affects
+            // both alike: edge-bench SPEC [steps] [rounds]
+            let spec = &args[2];
+            let steps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
+            let rounds: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let (mut cx, _) = sim::load(std::path::Path::new(spec)).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let mut st = sim::setup(&mut cx).unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+            let t0 = std::time::Instant::now();
+            st.opts.edge = None;
+            let pa = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let ta = t0.elapsed().as_secs_f64();
+            st.opts.edge = Some(edge::EdgeOpts::default());
+            let t1 = std::time::Instant::now();
+            let pb = model::build(&st.grid, &st.layout, &st.lumped, &st.opts);
+            let tb = t1.elapsed().as_secs_f64();
+            println!("build: plain {ta:.1} s, edges {tb:.1} s; {} H corrections", pb.hcorr.as_ref().map(|h| h.ids.len()).unwrap_or(0));
+            for r in 0..rounds {
+                for (name, p) in [("plain", &pa), ("edges", &pb)] {
+                    // a fresh session each time: the material table and buffers are part of what is compared
+                    let session = metal_fdtd::Session::new().unwrap_or_else(|e| { eprintln!("fieldsolve: {e}"); std::process::exit(1) });
+                    let exc = fdtd::gauss_excite(0.0, st.fmax, p.dt);
+                    let rs = fdtd::RunSpec { excite: Some(0), exc, max_steps: steps, end_db: -1000.0, check_every: 1000, dft_every: 1, ..Default::default() };
+                    match session.run(p, &rs) {
+                        Ok(res) => println!("round {r} {name}: {:6.0} Mcell/s ({:.1} s, {:.0} MB on the GPU)", p.n() as f64 * res.steps as f64 / res.seconds * 1e-6, res.seconds, session.cached_bytes() as f64 * 1e-6),
+                        Err(e) => println!("round {r} {name}: {e}"),
+                    }
+                }
+            }
+        }
         "prims" => {
             // dump a Gerber file's primitives in drawing order as JSON (mm; dark = additive, else clear)
             let Some(f) = args.get(2) else {
@@ -288,7 +468,7 @@ fn main() {
         }
         "run" => {
             let Some(spec) = args.get(2) else {
-                eprintln!("usage: fieldsolve run SPEC.json [--out DIR] [--backend cpu|metal|auto]");
+                eprintln!("usage: fieldsolve run SPEC.json [--fast | --fidelity screening|refined|validated] [--out DIR] [--backend cpu|metal|auto]");
                 std::process::exit(2);
             };
             let (mut cx, mut out) = match sim::load(std::path::Path::new(spec)) {
@@ -300,6 +480,18 @@ fn main() {
             };
             if let Some(o) = arg(&args, "--out") {
                 out = o.into();
+            }
+            // fidelity: --fast is the screening policy; a plain run is the spec as given ("spec")
+            let level = if args.iter().any(|a| a == "--fast") { "screening".to_string() } else { arg(&args, "--fidelity").unwrap_or_else(|| "spec".into()) };
+            match fidelity::resolve(&cx.spec, &level) {
+                Ok(s) => cx.spec = s,
+                Err(e) => {
+                    eprintln!("fieldsolve: {e}");
+                    std::process::exit(2);
+                }
+            }
+            for o in cx.spec["fidelity_record"]["overrides"].as_array().cloned().unwrap_or_default() {
+                eprintln!("fieldsolve: {level}: {} {} -> {} ({})", o["key"].as_str().unwrap_or(""), o["from"], o["to"], o["why"].as_str().unwrap_or(""));
             }
             let be = backend(&args);
             let run = |p: &model::Problem, s: &fdtd::RunSpec| be(p, s);
@@ -346,19 +538,76 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "tune" => {
+            let Some(cfg) = args.get(2) else {
+                eprintln!("usage: fieldsolve tune CONFIG.json [--restarts N] [--rounds N] [--exhaustive 0|1|2] [--top N] [--no-outputs]");
+                std::process::exit(2);
+            };
+            if let Err(e) = tune::run(std::path::Path::new(cfg), &args[3..]) {
+                eprintln!("fieldsolve tune: {e}");
+                std::process::exit(1);
+            }
+        }
+        "optimise" | "optimize" => {
+            let Some(space) = args.get(2) else {
+                eprintln!("usage: fieldsolve optimise SPACE.json [--method surrogate|pattern] [--budget N] [--out DIR] [--backend cpu|metal|auto]");
+                std::process::exit(2);
+            };
+            let be = backend(&args);
+            let run = |p: &model::Problem, s: &fdtd::RunSpec| be(p, s);
+            if let Err(e) = optimise::run(std::path::Path::new(space), &args[3..], &run) {
+                eprintln!("fieldsolve optimise: {e}");
+                std::process::exit(1);
+            }
+        }
+        "optimise-bench" => {
+            // surrogate vs compass search vs full-fidelity-only search on the synthetic two-fidelity problem
+            let seeds = arg(&args, "--seeds").and_then(|s| s.parse().ok()).unwrap_or(50);
+            let mut o = optimise::Opts::default();
+            if let Some(v) = arg(&args, "--promote-every").and_then(|s| s.parse().ok()) {
+                o.promote_every = v;
+            }
+            if let Some(v) = arg(&args, "--final").and_then(|s| s.parse().ok()) {
+                o.final_n = v;
+            }
+            let r = optimise::bench(seeds, &o);
+            if let Some(o) = arg(&args, "--json") {
+                std::fs::write(&o, serde_json::to_string_pretty(&r).unwrap()).unwrap();
+            }
+        }
+        "radmatrix" => {
+            // the radiation-matrix form against Pattern::combine + p_rad on a saved far field
+            let Some(ff) = args.get(2) else {
+                eprintln!("usage: fieldsolve radmatrix RUN/farfield.json [candidates]");
+                std::process::exit(2);
+            };
+            let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
+            match tune::check_radiation_matrix(std::path::Path::new(ff), n) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                Err(e) => {
+                    eprintln!("fieldsolve radmatrix: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "svg" => {
             let dir = args.get(2).expect("usage: fieldsolve svg GERBER_DIR OUT.svg");
             let b = gerber::load_dir(std::path::Path::new(dir)).unwrap_or_else(|e| panic!("{e}"));
             gerber::render_svg(&b, std::path::Path::new(args.get(3).map(|s| s.as_str()).unwrap_or("board.svg")));
         }
         _ => {
-            eprintln!("usage:\n  fieldsolve run SPEC.json [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve svg GERBER_DIR OUT.svg");
+            eprintln!("usage:\n  fieldsolve run SPEC.json [--fast | --fidelity screening|refined|validated] [--out DIR] [--backend auto|cpu|metal]\n  fieldsolve selftest [--case microstrip|patch|cavity|box] [--scale 1] [--backend auto|cpu|metal]\n  fieldsolve lines RUN_DIR/fields [--freq TAG] [--field H|E] [--seeds N] [--phases N]\n  fieldsolve cosim CONFIG.json\n  fieldsolve tune CONFIG.json [--restarts N] [--exhaustive 0|1|2] [--no-outputs]\n  fieldsolve radmatrix RUN/farfield.json [candidates]\n  fieldsolve optimise SPACE.json [--method surrogate|pattern] [--budget N] [--out DIR]\n  fieldsolve optimise-bench [--seeds N] [--promote-every N] [--final N] [--json OUT]\n  fieldsolve svg GERBER_DIR OUT.svg");
         }
     }
 }
 
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod edge_tests;
+
+#[cfg(test)]
+mod fast_tests;
 
 #[cfg(test)]
 mod tests {
@@ -395,7 +644,7 @@ mod tests {
             copper_window: None,
         };
         let port = model::Lumped { name: "P1".into(), axis: 2, lo: [1.0, 1.0, 0.0], hi: [1.0, 1.0, 0.4], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-        model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband, conductor })
+        model::build(&g, &lay, &[port], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband, conductor, edge: None })
     }
 
     #[test]

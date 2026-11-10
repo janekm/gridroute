@@ -76,7 +76,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
     let port = Lumped { name: "P1".into(), axis: 2, lo: [0.0, -w / 2.0, 0.0], hi: [0.0, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let fmax = 3e9;
     let pml = [8, 8, 8, 8, 0, 8];
-    let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None });
+    let mut p = build(&g, &lay, &[port], &BuildOpts { pml, fmax, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None, edge: None });
     for q in 0..3 {
         let xq = xa + q as f64 * d;
         p.add_vprobe(&format!("v{q}"), 2, [xq, 0.0, h], 0.0);
@@ -129,7 +129,7 @@ pub fn patch_capacitance(run: &Runner, scale: f64) -> CaseResult {
         copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [a / 2.0, a / 2.0, 0.0], hi: [a / 2.0, a / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None, edge: None });
     let exc = gauss_excite(0.0, 4e9, p.dt);
     let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 200_000, end_db: -70.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(50e6, 1000e6, 20);
@@ -178,7 +178,7 @@ pub fn cavity(run: &Runner, scale: f64) -> CaseResult {
         copper_window: None,
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [3.0, 3.0, 0.0], hi: [3.0, 3.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95, wideband: None, conductor: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95, wideband: None, conductor: None, edge: None });
     let exc = gauss_excite(0.0, 4e9, p.dt);
     let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 400_000, end_db: -90.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(1.0e9, 3.5e9, 1001);
@@ -216,7 +216,7 @@ pub fn pec_box(run: &Runner, scale: f64) -> CaseResult {
     let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
     let lay = Layout::default();
     let port = Lumped { name: "P1".into(), axis: 2, lo: [7.0, 6.0, 4.0], hi: [7.0, 6.0, 6.0], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 20e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None, edge: None });
     let exc = gauss_excite(0.0, 20e9, p.dt);
     let r = run(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -60.0, check_every: 500, dft_freqs: vec![], dft_every: 1, snap_every: 0, snap_k: vec![], snap_until: 0, ..Default::default() });
     let freqs = linspace(5e9, 16e9, 5501);
@@ -283,12 +283,12 @@ pub fn port_loop_setup(cell: f64, footprint: bool, swap: bool) -> crate::sim::Se
         grid,
         layout,
         lumped,
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95, wideband: None, conductor: None },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax: 3e9, cfl: 0.95, wideband: None, conductor: None, edge: None },
         freqs: linspace(10e6, 3e9, 300),
         fmax: 3e9,
         end_db: -70.0,
         max_steps: 400_000,
-        port_stop: false, bars: vec![],
+        port_stop: false, bars: vec![], refined: vec![], checks: vec![],
     }
 }
 
@@ -339,12 +339,12 @@ pub fn gap_setup(slot: bool, cell: f64, fmax: f64) -> crate::sim::Setup {
         grid,
         layout,
         lumped: vec![port("P1", 0.0), port("P2", len)],
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None, conductor: None },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None, conductor: None, edge: None },
         freqs: linspace(0.0, fmax, 1001),
         fmax,
         end_db: -60.0,
         max_steps: 200_000,
-        port_stop: false, bars: vec![],
+        port_stop: false, bars: vec![], refined: vec![], checks: vec![],
     }
 }
 
@@ -368,12 +368,12 @@ pub fn dipole_setup(len: f64, cell: f64, fmax: f64, air: f64) -> crate::sim::Set
         grid,
         layout,
         lumped: vec![port],
-        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None, conductor: None },
+        opts: BuildOpts { pml: [8; 6], f_loss: 1e9, fmax, cfl: 0.95, wideband: None, conductor: None, edge: None },
         freqs: linspace(fmax / 50.0, fmax, 300),
         fmax,
         end_db: -60.0,
         max_steps: 100_000,
-        port_stop: false, bars: vec![],
+        port_stop: false, bars: vec![], refined: vec![], checks: vec![],
     }
 }
 
@@ -440,7 +440,7 @@ pub fn lossy_cavity(be: &Runner, wideband: bool, tand: f64) -> Vec<(f64, f64)> {
     let lay = Layout { sheets: vec![], slabs: vec![Slab { z0: 0.0, z1: c, eps: 4.0, tand }], barrels: vec![], outline: vec![], copper_window: None };
     let port = Lumped { name: "P".into(), axis: 2, lo: [7.0, 6.0, 0.0], hi: [7.0, 6.0, c], plus_at_hi: true, r: 1e4, c: 0.0, port: true };
     let wb = wideband.then(|| crate::disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false });
-    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: wb, conductor: None });
+    let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: wb, conductor: None, edge: None });
     let exc = gauss_excite(6e9, 4e9, p.dt);
     let r = be(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: 60_000, end_db: -80.0, check_every: 1000, dft_every: 1, ..Default::default() });
     let freqs = linspace(3e9, 9e9, 3001);
@@ -488,7 +488,7 @@ pub fn copper_cavity(be: &Runner, rough_um: f64) -> Vec<(f64, f64, f64)> {
     let sigma = 5.8e7;
     let metal = crate::cond::Metal { sigma, t: 35e-6, rough: rough_um * 1e-6 };
     let q = |conductor: Option<crate::cond::Conductor>, steps: usize| -> Vec<(f64, f64)> {
-        let p = build(&g, &lay, &[port.clone()], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor });
+        let p = build(&g, &lay, &[port.clone()], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor, edge: None });
         let exc = gauss_excite(6e9, 4e9, p.dt);
         let r = be(&p, &RunSpec { excite: Some(0), exc: exc.clone(), max_steps: steps, end_db: -90.0, check_every: 1000, dft_every: 1, ..Default::default() });
         let freqs = linspace(3e9, 9e9, 12001);

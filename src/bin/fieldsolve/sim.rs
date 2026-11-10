@@ -15,14 +15,18 @@
 //!   "excite": "all" | ["VDD"], "l_band": [10e6, 100e6],
 //!   "fields": {"freqs": [2.4e9]},
 //!   "farfield": {"freqs": [2.44e9], "step_deg": 5, "gap": 3},
-//!   "extent": "board", "decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}] }
+//!   "extent": "board", "decouple": [{"net": "VCC2V4", "from": "In1.Cu", "to": "In2.Cu"}],
+//!   "preset": "antenna" | "rf", "loss": {"model": "wideband"}, "conductor": true, "edges": true,
+//!   "mesh": {"no_slivers": true, "z_grade": 3.0}, "refine": [...], "coarse_copper_ok": [[x0, y0, x1, y1]] }
 //! ```
+//! Which keys to use, and the traps: docs/fieldsolve-settings.md. Every run prints the resolved model and
+//! warnings (presets.rs) and records them in result.json "settings" / "checks".
 //! A pad reference is `REF.PIN` (from the Gerber X2 `.P` attributes); a point is `[x, y]`.
 
 use crate::fdtd::{gauss_excite, RunResult, RunSpec};
 use crate::geom::{BBox, Prim, Shape, P2};
 use crate::gerber::{Board, StackKind};
-use crate::mesh::{lines_1d, Grid, Refine};
+use crate::mesh::{Grid, Refine};
 use crate::model::{build, BuildOpts, Barrel, Layout, Lumped, Problem, Sheet, Slab, C0};
 use crate::post::{fit_rl, linspace, port_spectra, s_column, write_touchstone, Cx};
 use serde_json::{json, Value};
@@ -156,6 +160,11 @@ pub struct Setup {
     /// partial self-inductance of that bare stretch nH). A vendor part model measured on its own fixture
     /// already contains its body's inductance across this gap, so `cosim` can subtract it ("deembed").
     pub bars: Vec<(String, f64, f64, f64)>,
+    /// extra refinement boxes from the spec's `"refine"` (fidelity protection): (x0, y0, x1, y1 in the
+    /// spec's coordinates, mm; cell mm; what)
+    pub refined: Vec<([f64; 4], f64, String)>,
+    /// set-up warnings (presets.rs: settings that are known traps, narrow copper in coarse cells)
+    pub checks: Vec<String>,
 }
 
 /// Partial self-inductance (nH) of a thin flat strip, length l and width w in mm (Grover, t = 0):
@@ -288,8 +297,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let y = if cx.kicad { -c.y } else { c.y };
             // "esr": a capacitor's series resistance (ohm) instead of a perfect short
             let el = match d.get("esr").and_then(|v| v.as_f64()) {
-                Some(esr) if esr > 0.0 => json!({"kind": "R", "r": esr, "at": [c.x, y], "from": from, "to": to, "size": "point"}),
-                _ => json!({"kind": "short", "at": [c.x, y], "from": from, "to": to, "size": "point"}),
+                Some(esr) if esr > 0.0 => json!({"kind": "R", "r": esr, "at": [c.x, y], "from": from, "to": to, "size": "point", "snap": true}),
+                _ => json!({"kind": "short", "at": [c.x, y], "from": from, "to": to, "size": "point", "snap": true}),
             };
             pend.push(Pending { name: format!("decouple {r}"), el, port: false });
             added += 1;
@@ -300,7 +309,111 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         };
         eprintln!("fieldsolve: decouple {net}: {added} capacitors outside the roi as {from} -> {to} {what}");
     }
+    // "pin_loads": [{"ref": "U12", "c": 3e-12, "r": 0, "to": "B.Cu", "pins": [...], "except": [...]}]: every pin
+    // of an unmodelled IC (not on a GND net, not already used by a port or element) gets a vertical lumped C
+    // (or R) from its pad down to `to` (default: the next copper layer below the pad), standing in for the
+    // chip's pad capacitance. Without it, tracks ending at the chip are open-ended stubs that resonate (MTH,
+    // Nov 2026: P1_04 / SWDCLK between U12 and H5, Q 70-80 near 2.3 GHz).
+    let used_pads: Vec<String> = pend
+        .iter()
+        .flat_map(|pd| ["pos", "neg", "at"].into_iter().filter_map(|k| pd.el.get(k).and_then(|v| v.as_str()).map(str::to_string)).collect::<Vec<_>>())
+        .collect();
+    // nets already tied to ground at RF by a modelled short (decoupling capacitors as "short" elements, or
+    // "decouple"): a pin load there would close a tiny LC loop through the short and the vias that rings on
+    // its own (MTH, Nov 2026: about 2.15 GHz, Q 20-35, on the DEC and 3V3 pins), so those pins are skipped
+    let shorted_nets: Vec<String> = pend
+        .iter()
+        .filter(|pd| !pd.port && pd.el.get("kind").and_then(|v| v.as_str()) == Some("short"))
+        .flat_map(|pd| {
+            let layer = pd.el.get("layer").and_then(|v| v.as_str()).unwrap_or("F.Cu").to_string();
+            ["pos", "neg"]
+                .into_iter()
+                .filter_map(|k| pd.el.get(k))
+                .filter_map(|v| cx.locate(v, Some(&layer)).ok())
+                .filter_map(|(c, _)| cx.net_at(c, &layer))
+                .collect::<Vec<_>>()
+        })
+        .filter(|n| { let u = n.to_ascii_uppercase(); !u.contains("GND") && !u.contains("VSS") })
+        .collect();
+    for d in sp.get("pin_loads").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let rf = d.get("ref").and_then(|v| v.as_str()).ok_or("pin_loads entry needs \"ref\"")?.to_string();
+        let c = num(&d, "c", 0.0);
+        let r = num(&d, "r", 0.0);
+        if c <= 0.0 && r <= 0.0 {
+            return Err(format!("pin_loads {rf}: give \"c\" (F) and/or \"r\" (ohm)"));
+        }
+        let only: Vec<String> = d.get("pins").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let except: Vec<String> = d.get("except").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        // pin -> (layer, bbox, net)
+        let mut pins: std::collections::BTreeMap<String, (String, BBox, Option<String>)> = Default::default();
+        for l in &cx.board.layers {
+            for q in &l.prims {
+                if let (true, Some((a, pin))) = (q.dark, &q.pad) {
+                    if a == &rf {
+                        let e = pins.entry(pin.clone()).or_insert((l.name.clone(), BBox::empty(), q.net.clone()));
+                        if e.0 == l.name {
+                            e.1.union(&q.shape.bbox());
+                        }
+                    }
+                }
+            }
+        }
+        if pins.is_empty() {
+            return Err(format!("pin_loads: no pads of {rf} in the Gerber X2 attributes"));
+        }
+        let gnd = |n: &Option<String>| n.as_deref().is_some_and(|s| { let u = s.to_ascii_uppercase(); u.contains("GND") || u.contains("VSS") });
+        let (mut added, mut skipped_gnd, mut skipped_used, mut skipped_dec, mut no_return) = (0, 0, 0, 0, 0);
+        for (pin, (layer, bb, net)) in &pins {
+            if (!only.is_empty() && !only.contains(pin)) || except.contains(pin) {
+                continue;
+            }
+            if gnd(net) {
+                skipped_gnd += 1;
+                continue;
+            }
+            if used_pads.iter().any(|u| u == &format!("{rf}.{pin}")) {
+                skipped_used += 1;
+                continue;
+            }
+            if !d.get("load_decoupled").and_then(|v| v.as_bool()).unwrap_or(false) && net.as_ref().is_some_and(|n| shorted_nets.contains(n)) {
+                skipped_dec += 1;
+                continue;
+            }
+            let to = match d.get("to").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    let k = zs.iter().position(|(n, _)| n == layer).unwrap_or(0);
+                    let below = zs.iter().filter(|(_, z)| *z < zs[k].1).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    let above = zs.iter().filter(|(_, z)| *z > zs[k].1).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    match below.or(above) {
+                        Some((n, _)) => n.clone(),
+                        None => return Err(format!("pin_loads {rf}: no other copper layer to load against")),
+                    }
+                }
+            };
+            let ctr = P2::new(0.5 * (bb.x0 + bb.x1), 0.5 * (bb.y0 + bb.y1));
+            if !gnd(&cx.net_at(ctr, &to)) {
+                no_return += 1;
+            }
+            let y = if cx.kicad { -ctr.y } else { ctr.y };
+            // "snap": on the nearest existing mesh node (a pad is several cells wide), so 70 pins don't add 140
+            // fixed mesh lines and slivers that shrink the time step
+            let mut el = json!({"kind": "R", "r": r, "c": c, "at": [ctr.x, y], "from": layer, "to": to, "size": "point", "snap": true});
+            if r <= 0.0 {
+                el["kind"] = json!("C");
+            }
+            pend.push(Pending { name: format!("pin {rf}.{pin}"), el, port: false });
+            added += 1;
+        }
+        eprintln!(
+            "fieldsolve: pin_loads {rf}: {added} pins loaded ({}), {skipped_gnd} ground pins, {skipped_dec} pins on nets shorted to ground by an element and {skipped_used} pins used by ports/elements skipped{}",
+            match (c > 0.0, r > 0.0) { (true, true) => format!("{:.2} pF || {r} ohm", c * 1e12), (true, false) => format!("{:.2} pF", c * 1e12), _ => format!("{r} ohm") },
+            if no_return > 0 { format!("; {no_return} land on no ground copper on the other layer (those loads float)") } else { String::new() }
+        );
+    }
     // first pass: geometry of each element, so its lines can be fixed before meshing
+    // (and the nets every element touches, for the open-ended track check)
+    let mut term_nets: Vec<String> = Vec::new();
     enum Geo {
         Vert { c: P2, half: [f64; 2], z0: f64, z1: f64, plus_hi: bool },
         Plane { a: P2, b: P2, axis: usize, w: f64, z: f64, layer: String },
@@ -317,6 +430,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let to = e.get("to").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: vertical element needs from/to layers", pd.name))?;
             let (c, pbb) = cx.locate(at, Some(from))?;
             let (zf, zt) = (cx.z_of(from)?, cx.z_of(to)?);
+            term_nets.extend(cx.net_at(c, from));
+            term_nets.extend(cx.net_at(c, to));
             if pd.port {
                 port_nets(&pd.name, (cx.net_at(c, from), from), (cx.net_at(c, to), to), true);
             }
@@ -329,8 +444,11 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                 _ if at.is_string() => [0.8 * (pbb.x1 - pbb.x0), 0.8 * (pbb.y1 - pbb.y0)],
                 _ => [0.0, 0.0],
             };
-            fx.push(c.x);
-            fy.push(c.y);
+            // "snap": true puts a point element on the nearest mesh node instead of adding mesh lines
+            if !e.get("snap").and_then(|v| v.as_bool()).unwrap_or(false) {
+                fx.push(c.x);
+                fy.push(c.y);
+            }
             if size[0] > 0.0 {
                 fx.extend([c.x - size[0] / 2.0, c.x + size[0] / 2.0]);
             }
@@ -342,6 +460,8 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
             let layer = e.get("layer").and_then(|v| v.as_str()).unwrap_or("F.Cu").to_string();
             let (a, ba) = cx.locate(e.get("pos").ok_or_else(|| format!("{}: needs pos/neg or at", pd.name))?, Some(&layer))?;
             let (b, bb) = cx.locate(e.get("neg").ok_or_else(|| format!("{}: needs pos/neg or at", pd.name))?, Some(&layer))?;
+            term_nets.extend(cx.net_at(a, &layer));
+            term_nets.extend(cx.net_at(b, &layer));
             if pd.port {
                 port_nets(&pd.name, (cx.net_at(a, &layer), &layer), (cx.net_at(b, &layer), &layer), false);
             }
@@ -434,13 +554,123 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         out
     };
     let (fx, fy) = (merge(&fx), merge(&fy));
-    let mut gx = lines_1d(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &[Refine { a: fine.x0, b: fine.x1, h: cell }], 1.3, hmax, &[]);
-    let mut gy = lines_1d(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &[Refine { a: fine.y0, b: fine.y1, h: cell }], 1.3, hmax, &[]);
+    // "refine": [{"box": [x0, y0, x1, y1]} | {"pads": ["C20.1", ..]} | {"ports": true}, "cell": mm, "margin":
+    // mm]: extra fine regions (a coarse fidelity policy protects ports, feeds, gaps and stubs this way). On
+    // this tensor-product mesh a box's lines run through the whole domain in x and in y.
+    let mut rx = vec![Refine { a: fine.x0, b: fine.x1, h: cell }];
+    let mut ry = vec![Refine { a: fine.y0, b: fine.y1, h: cell }];
+    let mut refined = Vec::new();
+    for r in sp.get("refine").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let h = num(&r, "cell", cell);
+        let margin = num(&r, "margin", 0.0);
+        let mut boxes: Vec<(BBox, String)> = Vec::new();
+        if let Some(a) = r.get("box").and_then(|v| v.as_array()) {
+            let v: Vec<f64> = a.iter().filter_map(|x| x.as_f64()).collect();
+            if v.len() != 4 {
+                return Err("refine box needs [x0, y0, x1, y1]".into());
+            }
+            let (p, q) = (cx.pt(v[0], v[1]), cx.pt(v[2], v[3]));
+            boxes.push((BBox { x0: p.x.min(q.x), y0: p.y.min(q.y), x1: p.x.max(q.x), y1: p.y.max(q.y) }, r.get("what").and_then(|v| v.as_str()).unwrap_or("box").to_string()));
+        }
+        for pad in r.get("pads").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let (_, b) = cx.locate(&pad, None)?;
+            boxes.push((b, format!("pad {}", pad.as_str().unwrap_or("?"))));
+        }
+        if r.get("ports").and_then(|v| v.as_bool()).unwrap_or(false) {
+            for pd in pend.iter().filter(|pd| pd.port) {
+                let layer = pd.el.get("layer").and_then(|v| v.as_str()).or_else(|| pd.el.get("from").and_then(|v| v.as_str()));
+                let mut b = BBox::empty();
+                for k in ["pos", "neg", "at"] {
+                    if let Some(v) = pd.el.get(k) {
+                        b.union(&cx.locate(v, layer)?.1);
+                    }
+                }
+                boxes.push((b, format!("port {}", pd.name)));
+            }
+        }
+        for (b, what) in boxes {
+            let b = b.grow(margin);
+            rx.push(Refine { a: b.x0, b: b.x1, h });
+            ry.push(Refine { a: b.y0, b: b.y1, h });
+            let (p, q) = (cx.pt(b.x0, b.y0), cx.pt(b.x1, b.y1));
+            refined.push(([p.x.min(q.x), p.y.min(q.y), p.x.max(q.x), p.y.max(q.y)], h, what));
+        }
+    }
+    // "mesh": static refinement from the layout (meshpol.rs): no slivers, z grading, copper-edge bands
+    let mp = crate::meshpol::MeshPolicy::from_spec(&sp);
+    let (bx, by) = mp.copper_bands(&sheets, &fine);
+    rx.extend(bx);
+    ry.extend(by);
+    let mut gx = crate::mesh::lines_1d_slack(dom.x0 - pml_w, dom.x1 + pml_w, &fx, &rx, 1.3, hmax, &[], mp.slack());
+    let mut gy = crate::mesh::lines_1d_slack(dom.y0 - pml_w, dom.y1 + pml_w, &fy, &ry, 1.3, hmax, &[], mp.slack());
     let mc: Vec<(f64, f64, usize)> = slabs.iter().map(|s| (s.z0, s.z1, min_layer)).collect();
-    let gz = lines_1d(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &[Refine { a: zlo, b: zhi, h: cell_z }], 1.3, hmax, &mc);
+    let zref = mp.z_refine(zlo, zhi, &fz, cell_z);
+    let gz = crate::mesh::lines_1d_slack(zlo - air_z - pml_w, zhi + air_z + pml_w, &fz, &zref, 1.3, hmax, &mc, mp.slack());
     // keep only fixed lines that fall inside the domain
     gx.dedup();
     gy.dedup();
+    // known traps in the settings, and narrow copper left in coarse cells next to the fine region
+    let mut checks = crate::presets::spec_checks(&sp);
+    if extent_board {
+        // "coarse_copper_ok": [[x0, y0, x1, y1], ...] marks areas reviewed as not carrying RF current (spec
+        // coordinates); clusters inside one are not reported
+        let ok: Vec<BBox> = sp
+            .get("coarse_copper_ok")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        let r = r.as_array()?;
+                        let (p, q) = (cx.pt(r.first()?.as_f64()?, r.get(1)?.as_f64()?), cx.pt(r.get(2)?.as_f64()?, r.get(3)?.as_f64()?));
+                        Some(BBox { x0: p.x.min(q.x), y0: p.y.min(q.y), x1: p.x.max(q.x), y1: p.y.max(q.y) })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let found: Vec<_> = crate::presets::coarse_copper(&sheets, &gx, &gy, &roi, &dom, cell, 2.5 * cell, 1.0, 8.0)
+            .into_iter()
+            .filter(|c| !ok.iter().any(|o| o.x0 <= c.1.x0 && o.y0 <= c.1.y0 && o.x1 >= c.1.x1 && o.y1 >= c.1.y1))
+            .collect();
+        if !found.is_empty() {
+            let list: Vec<String> = found
+                .iter()
+                .take(6)
+                .map(|(l, b, a, h)| {
+                    let (p, q) = (cx.pt(b.x0, b.y0), cx.pt(b.x1, b.y1));
+                    format!("{l} x {:.2}-{:.2} y {:.2}-{:.2} ({a:.1} mm², cells up to {h:.2} mm)", p.x.min(q.x), p.x.max(q.x), p.y.min(q.y), p.y.max(q.y))
+                })
+                .collect();
+            checks.push(format!(
+                "narrow copper (traces, meanders, antenna arms) in cells coarser than {:.3} mm next to the fine region: {}{}. \
+                 If any of it carries RF current (antenna, feed, matching), extend \"roi\" to cover it or add a \"refine\" box; \
+                 list areas you have checked in \"coarse_copper_ok\".",
+                2.5 * cell,
+                list.join("; "),
+                if found.len() > 6 { format!("; and {} more", found.len() - 6) } else { String::new() }
+            ));
+        }
+    }
+    // far-field runs: long signal tracks near the fine region with nothing modelled on them are open-ended
+    // stubs (an unmodelled chip at one end, often an unconnected pin at the other) and resonate
+    if sp.get("farfield").is_some_and(|v| !v.is_null()) {
+        let ok: Vec<String> = sp.get("open_nets_ok").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let found: Vec<_> = crate::presets::open_tracks(&sheets, &term_nets, &roi, 10.0, 10.0).into_iter().filter(|t| !ok.contains(&t.0)).collect();
+        if !found.is_empty() {
+            let list: Vec<String> = found.iter().take(8).map(|(n, l, _)| format!("{n} {l:.1} mm")).collect();
+            checks.push(format!(
+                "{} signal nets within 10 mm of the fine region carry 10 mm or more of track with nothing modelled on them: {}{}. \
+                 Open at an unmodelled chip, such tracks are resonant stubs that can take antenna efficiency in a narrow band. \
+                 Load the chip's pins with \"pin_loads\" (e.g. {{\"ref\": \"U1\", \"c\": 3e-12}}), or list reviewed nets in \"open_nets_ok\".",
+                found.len(),
+                list.join(", "),
+                if found.len() > 8 { format!(" and {} more", found.len() - 8) } else { String::new() }
+            ));
+        }
+    }
+    eprintln!("fieldsolve: {}", crate::presets::summary(&sp).1);
+    for c in &checks {
+        eprintln!("fieldsolve: WARNING: {c}");
+    }
     let grid = Grid { x: gx.iter().map(|v| v * 1e-3).collect(), y: gy.iter().map(|v| v * 1e-3).collect(), z: gz.iter().map(|v| v * 1e-3).collect() };
 
     // second pass: lumped boxes on the mesh; bridges as copper
@@ -656,13 +886,17 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
                     .collect();
                 crate::cond::Conductor { metals, f_lo: o("f_lo").unwrap_or(fmin.max(0.1e9)), f_hi: o("f_hi").unwrap_or(fmax) }
             }),
+            // "edges": true or {"conformal": .., "singular": .., ...}: sub-cell copper edges (edge.rs)
+            edge: sp.get("edges").and_then(crate::edge::EdgeOpts::from_json),
         },
         freqs: linspace(fmin, fmax, nf),
         fmax,
         end_db: num(&sp, "end_db", -70.0),
         max_steps: num(&sp, "max_steps", 400_000.0) as usize,
-        port_stop: sp.get("stop").and_then(|v| v.as_str()).unwrap_or("ports") == "ports",
+        port_stop: sp.get("stop").and_then(|v| v.as_str()).unwrap_or("ports") != "energy",
         bars,
+        refined,
+        checks,
     })
 }
 
@@ -732,6 +966,17 @@ pub fn raster_json(st: &Setup, p: &Problem) -> Value {
     json!({"metal": metal, "cells": cells})
 }
 
+/// Outline of a capsule (segment a-b of radius r): the cap around b on the far side from a, then the cap
+/// around a on the far side from b (13 points each).
+pub fn capsule_outline(a: P2, b: P2, r: f64) -> Vec<P2> {
+    let ang = (b.y - a.y).atan2(b.x - a.x);
+    let cap = |c: P2, from: f64| (0..=12).map(move |k| {
+        let t = from + k as f64 / 12.0 * std::f64::consts::PI;
+        P2::new(c.x + r * t.cos(), c.y + r * t.sin())
+    });
+    cap(b, ang - std::f64::consts::FRAC_PI_2).chain(cap(a, ang + std::f64::consts::FRAC_PI_2)).collect()
+}
+
 /// Scene file: exactly what was simulated, for an independent solver (tools/openems_scene.py).
 pub fn scene_json(st: &Setup, p: &Problem, exc_port: Option<usize>) -> Value {
     let poly = |p: &Prim| -> Vec<[f64; 2]> {
@@ -742,19 +987,7 @@ pub fn scene_json(st: &Setup, p: &Problem, exc_port: Option<usize>) -> Value {
                 let t = k as f64 / 32.0 * std::f64::consts::TAU;
                 P2::new(c.x + r * t.cos(), c.y + r * t.sin())
             }).collect(),
-            Shape::Capsule { a, b, r } => {
-                let ang = (b.y - a.y).atan2(b.x - a.x);
-                let mut v = Vec::new();
-                for k in 0..=12 {
-                    let t = ang + std::f64::consts::FRAC_PI_2 + k as f64 / 12.0 * std::f64::consts::PI;
-                    v.push(P2::new(b.x + r * t.cos(), b.y + r * t.sin()));
-                }
-                for k in 0..=12 {
-                    let t = ang - std::f64::consts::FRAC_PI_2 + k as f64 / 12.0 * std::f64::consts::PI;
-                    v.push(P2::new(a.x + r * t.cos(), a.y + r * t.sin()));
-                }
-                v
-            }
+            Shape::Capsule { a, b, r } => capsule_outline(*a, *b, *r),
         };
         pts.iter().map(|p| [p.x, p.y]).collect()
     };
@@ -777,6 +1010,8 @@ pub type Backend<'a> = &'a dyn Fn(&Problem, &RunSpec) -> RunResult;
 /// What to run on a set-up: which ports to excite (names, or all), field snapshot frequencies, L-fit band.
 #[derive(Clone, Debug, Default)]
 pub struct RunOpts {
+    /// the resolved model (presets::summary), recorded in result.json "settings"
+    pub settings: Value,
     pub excite_all: bool,
     pub excite: Vec<String>,
     pub fields: Vec<f64>,
@@ -790,11 +1025,127 @@ pub struct RunOpts {
     pub snap_until_ps: f64,
     /// Near-to-far-field box and frequencies (`"farfield"` in the spec).
     pub farfield: Option<crate::nf2ff::FarOpts>,
+    /// The objective tracked during the runs and summarised in result.json (`"objective"` in the spec).
+    pub objective: Option<ObjectiveOpts>,
+    /// Skip scene.json (the openEMS cross-check export).
+    pub no_scene: bool,
+    /// The resolved fidelity policy, copied into result.json (`fieldsolve run --fast`).
+    pub fidelity: Value,
+}
+
+/// `"objective": {"port": "C20", "band": [2.40e9, 2.44e9, 2.48e9], "harmonics": [4.88e9], "tol_db": 0.05,
+/// "window_periods": 4, "min_settle_periods": 6}`: the band's radiated power per watt incident at `port` (other ports matched),
+/// tracked at every energy check of every excitation together with each port's |S_kj|^2. With `"stop":
+/// "objective"` a run ends when all of them have stayed within a spread of `tol_db` over `window_periods`
+/// periods of the lowest band frequency, after the source and `min_settle_periods` more periods.
+#[derive(Clone, Debug, Default)]
+pub struct ObjectiveOpts {
+    pub port: Option<String>,
+    pub band: Vec<f64>,
+    /// further frequencies tracked for the stop (e.g. harmonic constraints), not part of the band score
+    pub harmonics: Vec<f64>,
+    pub stop: bool,
+    pub tol_db: f64,
+    pub window_periods: f64,
+    pub min_settle_periods: f64,
+    /// Late-time extrapolation (`"extrapolate": true` or `{"snapshots": 10, "tol_db": 0.05,
+    /// "stable_checks": 4, "stop": true}`): the extrapolated objective is recorded at every check, and with
+    /// `stop` (the default) and the objective stop it can end the run early (see `extrap`).
+    pub extrapolate: Option<crate::extrap::Opts>,
+}
+
+impl ObjectiveOpts {
+    pub fn from_spec(spec: &Value) -> Option<ObjectiveOpts> {
+        let o = spec.get("objective")?;
+        let band: Vec<f64> = o.get("band")?.as_array()?.iter().filter_map(|x| x.as_f64()).collect();
+        if band.is_empty() {
+            return None;
+        }
+        Some(ObjectiveOpts {
+            port: o.get("port").and_then(|v| v.as_str()).map(String::from),
+            band,
+            harmonics: o.get("harmonics").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default(),
+            stop: spec.get("stop").and_then(|v| v.as_str()) == Some("objective"),
+            tol_db: num(o, "tol_db", 0.05),
+            window_periods: num(o, "window_periods", 4.0),
+            min_settle_periods: num(o, "min_settle_periods", 6.0),
+            extrapolate: match o.get("extrapolate") {
+                Some(Value::Bool(true)) => Some(crate::extrap::Opts { stop: true, ..Default::default() }),
+                Some(x @ Value::Object(_)) => {
+                    let d = crate::extrap::Opts::default();
+                    Some(crate::extrap::Opts {
+                        snapshots: num(x, "snapshots", d.snapshots as f64) as usize,
+                        window: num(x, "window", d.window as f64) as usize,
+                        order: num(x, "order", d.order as f64) as usize,
+                        tol_db: num(x, "tol_db", d.tol_db),
+                        stable_checks: num(x, "stable_checks", d.stable_checks as f64) as usize,
+                        stop: x.get("stop").and_then(|v| v.as_bool()).unwrap_or(true),
+                        ..d
+                    })
+                }
+                _ => None,
+            },
+        })
+    }
+
+    /// Floors (dB) below which a component counts as flat: accepted power and radiated power -30 dB of the
+    /// incident power, coupling to another port -20 dB.
+    const FLOOR_RAD: f64 = 1e-3;
+    const FLOOR_COUPLING: f64 = 1e-2;
+
+    /// Component names, in the order `metric` returns them.
+    pub fn components(&self, names: &[String], j: usize, radiation: bool) -> Vec<String> {
+        let mut c = Vec::new();
+        for f in self.band.iter().chain(&self.harmonics) {
+            let g = format!("{:.3}GHz", f * 1e-9);
+            for (k, n) in names.iter().enumerate() {
+                c.push(if k == j { format!("accepted {n} {g}") } else { format!("|S {n},{}|^2 {g}", names[j]) });
+            }
+            if radiation {
+                c.push(format!("radiated {g}"));
+            }
+        }
+        c
+    }
+
+    /// The tracked components (dB) of the run exciting port `j`: per band frequency, the power accepted by
+    /// port j and coupled to every other port, and the box's Poynting flux, all per watt incident.
+    pub fn metric(&self, j: usize, p: &Problem, exc: &[f32], far: Option<(&crate::nf2ff::Plan, &[f64])>) -> crate::fdtd::ObjectiveMetric {
+        let band: Vec<f64> = self.band.iter().chain(&self.harmonics).copied().collect();
+        let gi: Vec<Option<usize>> = band.iter().map(|f| far.and_then(|(_, ff)| ff.iter().position(|x| (x - f).abs() <= 1e-6 * f))).collect();
+        let plan = far.map(|(pl, _)| pl.clone());
+        let grid = p.grid.clone();
+        let rs: Vec<f64> = p.ports.iter().map(|q| q.r).collect();
+        let (exc, dt) = (exc.to_vec(), p.dt);
+        let db = |x: f64, floor: f64| 10.0 * x.max(floor).log10();
+        crate::fdtd::ObjectiveMetric(std::sync::Arc::new(move |_steps, v, gathered| {
+            let z0 = 50.0;
+            let k = 1.0 / (2.0 * f64::sqrt(z0));
+            let spec: Vec<(Vec<Cx>, Vec<Cx>)> = (0..v.len()).map(|q| port_spectra(&v[q], if q == j { &exc } else { &[] }, rs[q], dt, &band)).collect();
+            let mut out = Vec::with_capacity(band.len() * (v.len() + 1));
+            for (fi, gfi) in gi.iter().enumerate() {
+                let a = (spec[j].0[fi] + spec[j].1[fi] * z0) * k;
+                let pinc = (a.abs().powi(2) / 2.0).max(1e-300);
+                for q in 0..v.len() {
+                    let b = (spec[q].0[fi] - spec[q].1[fi] * z0) * k;
+                    let s2 = b.abs().powi(2) / 2.0 / pinc;
+                    out.push(if q == j { db(1.0 - s2, Self::FLOOR_RAD) } else { db(s2, Self::FLOOR_COUPLING) });
+                }
+                if let (Some(g), Some(pl)) = (gfi, &plan) {
+                    if let Some(d) = gathered.get(*g) {
+                        out.push(db(crate::nf2ff::box_flux(pl, &grid, d) / pinc, Self::FLOOR_RAD));
+                    }
+                }
+            }
+            out
+        }))
+    }
 }
 
 impl RunOpts {
     pub fn from_spec(spec: &Value) -> RunOpts {
         RunOpts {
+            settings: crate::presets::summary(spec).0,
             excite_all: spec.get("excite").and_then(|v| v.as_str()) == Some("all"),
             excite: spec.get("excite").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
             fields: spec.pointer("/fields/freqs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default(),
@@ -804,6 +1155,9 @@ impl RunOpts {
             snap_ps: spec.pointer("/frames/every_ps").and_then(|v| v.as_f64()).unwrap_or(5.0),
             snap_until_ps: spec.pointer("/frames/until_ps").and_then(|v| v.as_f64()).unwrap_or(0.0),
             farfield: crate::nf2ff::FarOpts::from_spec(spec),
+            objective: ObjectiveOpts::from_spec(spec),
+            no_scene: spec.get("scene").and_then(|v| v.as_bool()) == Some(false),
+            fidelity: spec.get("fidelity_record").cloned().unwrap_or(Value::Null),
         }
     }
 }
@@ -812,6 +1166,24 @@ impl RunOpts {
 pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> {
     let st = setup(cx)?;
     run_setup(&st, out, backend, &RunOpts::from_spec(&cx.spec))
+}
+
+/// Frequency of the strongest component in the last third of a port signal, between `f0` and `f1` (the
+/// mode still ringing when a run stops); `None` when the tail is too short or silent.
+pub fn late_time_peak(v: &[f32], dt: f64, f0: f64, f1: f64) -> Option<f64> {
+    let n = v.len();
+    if n < 300 || f1 <= f0 {
+        return None;
+    }
+    let tail: Vec<f64> = v[n - n / 3..].iter().map(|&x| x as f64).collect();
+    let mean = tail.iter().sum::<f64>() / tail.len() as f64;
+    let tail: Vec<f64> = tail.iter().map(|x| x - mean).collect();
+    // resolve to a quarter of the tail's frequency resolution, at most 2000 points
+    let df = (1.0 / (tail.len() as f64 * dt) / 4.0).max((f1 - f0) / 2000.0);
+    let freqs: Vec<f64> = (0..).map(|k| f0 + k as f64 * df).take_while(|&f| f <= f1).collect();
+    let spec = crate::post::dft(&tail, dt, 0.0, &freqs);
+    let (k, m) = spec.iter().enumerate().map(|(k, c)| (k, c.abs())).fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+    (m > 0.0).then(|| freqs[k])
 }
 
 /// Z = Z0 (I + S)(I - S)^-1 for an N-port at one frequency.
@@ -886,7 +1258,9 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     let snap_every = if snap_k.is_empty() { 0 } else { ((ro.snap_ps * 1e-12 / p.dt).round() as usize).max(1) };
     let exc = gauss_excite(0.0, st.fmax, p.dt);
     let dft_every = ((1.0 / (2.0 * st.fmax * 1.5)) / p.dt).floor().max(1.0) as usize;
-    std::fs::write(out.join("scene.json"), serde_json::to_string(&scene_json(st, &p, excite.first().copied())).unwrap()).map_err(|e| e.to_string())?;
+    if !ro.no_scene {
+        std::fs::write(out.join("scene.json"), serde_json::to_string(&scene_json(st, &p, excite.first().copied())).unwrap()).map_err(|e| e.to_string())?;
+    }
     let freqs = &st.freqs;
     let z0 = 50.0;
     let mut far = match &ro.farfield {
@@ -912,6 +1286,14 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
     let mut vall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut iall: Vec<Vec<Vec<Cx>>> = vec![vec![]; np];
     let mut runs = Vec::new();
+    // warnings found while running (a high-Q mode still ringing at the stop of a far-field run)
+    let mut run_checks: Vec<String> = Vec::new();
+    // objective stop: window and minimum settling time in periods of the band's lowest frequency
+    let obj_stop = ro.objective.as_ref().is_some_and(|o| o.stop);
+    let period_steps = |n: f64| ro.objective.as_ref().map(|o| (n / o.band.iter().cloned().fold(f64::INFINITY, f64::min) / p.dt).ceil() as usize).unwrap_or(0);
+    let obj_window = period_steps(ro.objective.as_ref().map(|o| o.window_periods).unwrap_or(0.0)).max(3000);
+    let obj_min_steps = exc.len() + period_steps(ro.objective.as_ref().map(|o| o.min_settle_periods).unwrap_or(0.0));
+    let mut obj_hist: Vec<Option<(Vec<String>, Vec<(usize, Vec<f64>)>)>> = vec![None; np];
     for (q, &j) in excite.iter().enumerate() {
         let spec = RunSpec {
             excite: Some(j),
@@ -934,15 +1316,48 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             }),
             gather_tol: far.as_ref().map(|c| c.opts.tol).unwrap_or(0.01),
             gather_lag: 5,
+            objective: ro.objective.as_ref().map(|o| o.metric(j, &p, &exc, far.as_ref().map(|c| (&c.plan, c.opts.freqs.as_slice())))),
+            objective_stop: obj_stop,
+            objective_tol_db: ro.objective.as_ref().map(|o| o.tol_db).unwrap_or(0.0),
+            objective_window: obj_window,
+            min_steps: obj_min_steps,
+            extrap: ro.objective.as_ref().and_then(|o| o.extrapolate.clone()).map(|x| crate::extrap::Opts { dt: p.dt, decimate: dft_every, ..x }),
         };
         let r = backend(&p, &spec);
         eprintln!("fieldsolve: port {} excited: {} steps in {:.1} s (set-up {:.2} s) on {} ({:.0} Mcell/s)", names[j], r.steps, r.seconds, r.setup_seconds, r.backend, p.n() as f64 * r.steps as f64 / r.seconds * 1e-6);
-        if let Some((rate, q)) = crate::fdtd::energy_decay(&r.energy, p.dt, st.fmax / 3.0) {
+        if let Some((rate, _)) = crate::fdtd::energy_decay(&r.energy, p.dt, st.fmax / 3.0) {
+            // the ringing mode's frequency: the peak of the excited port's late-time signal (last third)
+            let f_ring = late_time_peak(&r.v[j], p.dt, st.freqs.first().copied().unwrap_or(0.0).max(1e8), st.fmax);
+            let q_at = |f: f64| -10.0 * std::f64::consts::LOG10_E * 2.0 * std::f64::consts::PI * f * 1e-9 / rate;
             eprintln!(
                 "fieldsolve:   late-time field energy {:+.2} dB/ns{}",
                 rate,
-                if rate >= 0.0 { " (GROWING: numerical instability, not ringing)".to_string() } else { format!(" (Q {:.0} if at {:.2} GHz)", q, st.fmax / 3e9) }
+                if rate >= 0.0 {
+                    " (GROWING: numerical instability, not ringing)".to_string()
+                } else {
+                    match f_ring {
+                        Some(f) => format!(" (strongest late-time signal near {:.3} GHz: Q about {:.0})", f / 1e9, q_at(f)),
+                        None => format!(" (Q {:.0} if at {:.2} GHz)", q_at(st.fmax / 3.0), st.fmax / 3e9),
+                    }
+                }
             );
+            // far-field runs: a mode still ringing at the stop makes efficiency within about f/Q of it
+            // mesh-sensitive (MTH PIFA, Nov 2026: a Q 70-80 board mode, about 0.05 GHz wide, moved 150 MHz
+            // between meshes and cut efficiency by up to 12 points at single frequencies)
+            // Q above 30 at the ringing frequency (at 2.4 GHz: energy falling slower than about 2.2 dB/ns); an
+            // antenna's own loaded ringing (Q 10-20) is not flagged
+            let f = f_ring.unwrap_or(st.fmax / 3.0);
+            let q = q_at(f);
+            if far.is_some() && rate < 0.0 && q > 30.0 {
+                let msg = format!(
+                    "port {}: a high-Q mode is still ringing at the stop (field energy {:+.2} dB/ns; late-time signal near {:.3} GHz, Q about {:.0}). \
+                     Efficiency within about f/Q ({:.0} MHz) of it is mesh-sensitive: list far-field frequencies 0.02-0.05 GHz apart \
+                     around the band to see narrow dips, prefer band averages to single frequencies, and refine max_cell where the mode lives.",
+                    names[j], rate, f / 1e9, q, f / q / 1e6
+                );
+                eprintln!("fieldsolve: WARNING: {msg}");
+                run_checks.push(msg);
+            }
         }
         let mut vs = Vec::new();
         let mut is = Vec::new();
@@ -979,7 +1394,31 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
             let names: Vec<String> = snap_sheets.iter().map(|s| s.name.clone()).collect();
             crate::export::write_frames(out, &p, &st, &names, &r.snaps, &exc).map_err(|e| e.to_string())?;
         }
-        runs.push(json!({"port": names[j], "steps": r.steps, "seconds": r.seconds, "setup_seconds": r.setup_seconds, "backend": r.backend}));
+        let spread = crate::fdtd::objective_spread(&r.objective, obj_window);
+        let tail = crate::fdtd::objective_tail(&r.objective, obj_window);
+        if r.stop == "max_steps" {
+            eprintln!("fieldsolve: WARNING: port {} reached max_steps ({}) before any stop rule: an incomplete estimate, not converged", names[j], r.steps);
+        }
+        eprintln!("fieldsolve:   stopped by {}{}", r.stop, tail.map(|(l, t)| format!(", objective change {l:.3} dB over the last {:.2} ns, projected remaining {t:.3} dB", obj_window as f64 * p.dt * 1e9)).unwrap_or_default());
+        let mut run_json = json!({"port": names[j], "steps": r.steps, "seconds": r.seconds, "setup_seconds": r.setup_seconds, "backend": r.backend,
+                                 "stop": r.stop, "physical_time_ns": r.steps as f64 * p.dt * 1e9,
+                                 // where the energy/port rules (the spec's own stop) would have ended this run
+                                 "standard_rule_step": r.standard_stop.as_ref().map(|x| x.0), "standard_rule": r.standard_stop.as_ref().map(|x| x.1.clone())});
+        if let Some(o) = &ro.objective {
+            let comps = o.components(&names, j, far.is_some());
+            run_json["objective_spread_db"] = json!(spread);
+            run_json["objective_last_window_change_db"] = json!(tail.map(|t| t.0));
+            run_json["objective_projected_remaining_db"] = json!(tail.map(|t| if t.1.is_finite() { t.1 } else { -1.0 }));
+            run_json["objective_window_steps"] = json!(obj_window);
+            run_json["objective_components"] = json!(comps);
+            run_json["objective_history"] = json!(r.objective.iter().map(|(s, v)| json!([s, v.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>()])).collect::<Vec<_>>());
+            if o.extrapolate.is_some() {
+                run_json["objective_extrap_history"] = json!(r.objective_extrap.iter().map(|(s, v)| json!([s, v.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>()])).collect::<Vec<_>>());
+                run_json["extrapolated"] = json!(r.stop == "extrapolated");
+            }
+            obj_hist[j] = Some((comps, r.objective.clone()));
+        }
+        runs.push(run_json);
     }
     let mut zmat_out = Value::Null;
     let mut balance_out = Value::Null;
@@ -1027,10 +1466,54 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
         Some(c) => c.finish(&names, z0, out)?,
         None => Value::Null,
     };
+    // the objective, from the far-field summary of its port (radiated power per watt incident, other ports
+    // matched) or, without a far field, the accepted power
+    let objective_out = match &ro.objective {
+        Some(o) => {
+            let port = o.port.clone().unwrap_or_else(|| names[excite[0]].clone());
+            let pi = names.iter().position(|n| *n == port).ok_or_else(|| format!("objective port {port:?} is not a port"))?;
+            let db = |x: f64| 10.0 * x.max(1e-30).log10();
+            let mut rows = Vec::new();
+            for &f in &o.band {
+                let row = far_summary.as_array().and_then(|a| a.iter().find(|r| r["port"].as_str() == Some(port.as_str()) && (r["f"].as_f64().unwrap_or(0.0) - f).abs() <= 1e-6 * f));
+                let fi = (0..freqs.len()).min_by(|&a, &b| (freqs[a] - f).abs().partial_cmp(&(freqs[b] - f).abs()).unwrap()).unwrap_or(0);
+                let (p_in, p_rad) = match row {
+                    Some(r) => (r["p_in"].as_f64().unwrap_or(f64::NAN), r["p_rad"].as_f64()),
+                    None => (1.0 - s_mat[pi][pi][fi].abs().powi(2), None),
+                };
+                let total = p_rad.unwrap_or(p_in);
+                rows.push(json!({"f": f, "s11_db": db(1.0 - p_in), "accepted_db": db(p_in), "p_rad": p_rad, "total_db": db(total),
+                                 "radiated_over_accepted_db": p_rad.map(|x| db(x) - db(p_in))}));
+            }
+            let worst = rows.iter().map(|r| r["total_db"].as_f64().unwrap_or(f64::NAN)).fold(f64::INFINITY, f64::min);
+            let stab = obj_hist[pi].as_ref().and_then(|(_, h)| crate::fdtd::objective_tail(h, obj_window));
+            json!({"port": port, "band": o.band, "quantity": if far.is_some() { "radiated power per watt incident (other ports matched)" } else { "accepted power per watt incident" },
+                   "per_f": rows, "worst_db": worst,
+                   // stability over the objective port's run: change over the last window and the projected
+                   // remaining change (-1: not yet decaying geometrically)
+                   "stability_db": stab.map(|t| t.0), "projected_remaining_db": stab.map(|t| if t.1.is_finite() { t.1 } else { -1.0 }),
+                   "stop_rule": if o.stop { "objective" } else { "energy/ports" },
+                   "tol_db": o.tol_db, "window_ns": obj_window as f64 * p.dt * 1e9, "min_steps": obj_min_steps})
+        }
+        None => Value::Null,
+    };
+    let ax = [&p.grid.x, &p.grid.y, &p.grid.z];
+    let mesh = json!({"dims": [p.nx, p.ny, p.nz], "cells": p.n(), "dt": p.dt,
+                      "min_step_mm": (0..3).map(|a| ax[a].windows(2).map(|w| w[1] - w[0]).fold(f64::INFINITY, f64::min) * 1e3).collect::<Vec<_>>(),
+                      "refine": st.refined.iter().map(|(b, h, w)| json!({"box": b, "cell": h, "what": w})).collect::<Vec<_>>(),
+                      "excitations": excite.len(), "stops": runs.iter().map(|r| r["stop"].clone()).collect::<Vec<_>>()});
     let res = json!({
-        "grid": [p.nx, p.ny, p.nz], "cells": p.n(), "dt": p.dt, "runs": runs, "ports": ports_out,
+        "grid": [p.nx, p.ny, p.nz], "cells": p.n(), "dt": p.dt, "runs": runs, "ports": ports_out, "mesh": mesh, "objective": objective_out, "fidelity": ro.fidelity,
         "port_names": names, "port_bars": st.bars.iter().map(|b| json!({"name": b.0, "gap_mm": b.1, "width_mm": b.2, "l_gap_nh": b.3})).collect::<Vec<_>>(), "z_matrix": zmat_out, "mesh_shorts": bridge_lines, "farfield": far_summary, "port_power_balance": balance_out,
     });
+    let mut res = res;
+    res["settings"] = ro.settings.clone();
+    res["checks"] = json!(st.checks.iter().chain(&run_checks).collect::<Vec<_>>());
+    res["fidelity"] = crate::fidelity::finish_record(&ro.fidelity, &res);
+    if let Some(f) = res["fidelity"].as_object() {
+        eprintln!("fieldsolve: fidelity {} ({} cells, dt {:.3e} s, stops {:?}), objective worst {:.2} dB, stability {:?} dB",
+            f["status"].as_str().unwrap_or("?"), res["cells"], res["dt"].as_f64().unwrap_or(0.0), f["actual"]["stops"], res.pointer("/objective/worst_db").and_then(|v| v.as_f64()).unwrap_or(f64::NAN), res.pointer("/objective/stability_db"));
+    }
     std::fs::write(out.join("result.json"), serde_json::to_string_pretty(&res).unwrap()).map_err(|e| e.to_string())?;
     Ok(res)
 }
@@ -1038,12 +1521,45 @@ pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Resu
 pub fn load(spec_path: &Path) -> Result<(Ctx, PathBuf), String> {
     let txt = std::fs::read_to_string(spec_path).map_err(|e| format!("{}: {e}", spec_path.display()))?;
     let spec: Value = serde_json::from_str(&txt).map_err(|e| format!("{}: {e}", spec_path.display()))?;
+    // "preset": "rf" | "antenna" fills the recommended model settings the spec leaves out (presets.rs)
+    let spec = crate::presets::apply(spec)?;
     let base = spec_path.parent().unwrap_or(Path::new("."));
     let gdir = base.join(spec.get("gerbers").and_then(|v| v.as_str()).ok_or("spec needs \"gerbers\"")?);
     let out = base.join(spec.get("out").and_then(|v| v.as_str()).unwrap_or("fieldsolve-out"));
-    let board = crate::gerber::load_dir(&gdir)?;
+    let mut board = crate::gerber::load_dir(&gdir)?;
     let kicad = spec.get("coords").and_then(|v| v.as_str()).unwrap_or("kicad") == "kicad";
+    apply_edits(&mut board, &spec, kicad)?;
     Ok((Ctx { spec, board, kicad, zs: vec![] }, out))
+}
+
+/// `"edits": [{"layer": "F.Cu", "op": "add" | "clear", "rect": [x0, y0, x1, y1], "net": "GND"}, ...]`:
+/// geometry changes drawn over the Gerber copper in order (a later object wins, as in Gerber), for
+/// geometry candidates such as a trimmed radiator, a moved feed or a changed ground clearance.
+pub fn apply_edits(board: &mut Board, spec: &Value, kicad: bool) -> Result<(), String> {
+    for e in spec.get("edits").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let layer = e.get("layer").and_then(|v| v.as_str()).ok_or("edit needs \"layer\"")?;
+        let dark = match e.get("op").and_then(|v| v.as_str()) {
+            Some("add") => true,
+            Some("clear") => false,
+            o => return Err(format!("edit op {o:?}: use \"add\" or \"clear\"")),
+        };
+        let r: Vec<f64> = e.get("rect").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+        if r.len() != 4 {
+            return Err("edit needs \"rect\": [x0, y0, x1, y1]".into());
+        }
+        let y = |v: f64| if kicad { -v } else { v };
+        let (x0, x1, y0, y1) = (r[0].min(r[2]), r[0].max(r[2]), y(r[1]).min(y(r[3])), y(r[1]).max(y(r[3])));
+        if x1 - x0 < 1e-9 || y1 - y0 < 1e-9 {
+            continue; // empty: lets a parameterised edit vanish (fieldsolve optimise)
+        }
+        let l = board.layers.iter_mut().find(|l| l.name == layer).ok_or_else(|| format!("edit: no copper layer {layer}"))?;
+        let shape = Shape::Polygon(vec![P2::new(x0, y0), P2::new(x1, y0), P2::new(x1, y1), P2::new(x0, y1)]);
+        if dark {
+            l.bbox.union(&shape.bbox());
+        }
+        l.prims.push(Prim { shape, dark, net: if dark { e.get("net").and_then(|v| v.as_str()).map(String::from) } else { None }, pad: None });
+    }
+    Ok(())
 }
 
 /// TDR comparison: `tdr.json` and `tdr.svg` (impedance versus distance from the port, two-way time scaled
