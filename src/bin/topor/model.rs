@@ -792,7 +792,20 @@ fn place_necks(objs: &mut Vec<ObjSpec>, escapes: &[(usize, f64, Option<P2>, f64)
     }
     // stub ends laid so far: (end, class half-width, clearance, net)
     let mut ends: Vec<(P2, f64, f64, u32)> = Vec::new();
-    for &(pi, e, axis, ec) in escapes {
+    // the stubs narrower than their class first, then those at the class width with a smaller clearance (an RF
+    // line's first stretch at a fine-pitch radio): the wire from such a stub's end needs its class clearance, so
+    // that end is placed clear of the narrow stubs beside it (laid the other way round, a neighbour's stub can
+    // come within the small clearance of it, and no wire can ever leave it; TOPOR_NECK_ORDER_OFF: in model order)
+    let class_width = |&(pi, e, _, _): &(usize, f64, Option<P2>, f64)| -> bool {
+        let o = &objs[pi];
+        let ni = &nets[o.net as usize];
+        (0..32).find(|&l| o.layers == 1 << l).map_or(false, |l| e <= 0.0 || e >= ni.wmin[l].max(ni.wpref[l]))
+    };
+    let mut order = escapes.to_vec();
+    if std::env::var("TOPOR_NECK_ORDER_OFF").is_err() {
+        order.sort_by_key(|x| class_width(x));
+    }
+    for &(pi, e, axis, ec) in &order {
         let pad = objs[pi].clone();
         let net = pad.net;
         let ni = &nets[net as usize];
@@ -867,32 +880,48 @@ fn place_necks(objs: &mut Vec<ObjSpec>, escapes: &[(usize, f64, Option<P2>, f64)
         if 2.0 * across >= wide && gap(pad.center, pad.center, wide / 2.0, my_clear) >= 0.0 {
             continue;
         }
-        // where the pad's copper ends along the stub
-        let core = pad.pts.iter().map(|&q| (q - pad.center).dot(dir)).fold(0.0, f64::max);
-        let reach = core + pad.r;
-        // a stub as narrow as the pad runs in from its centre, over its copper, and is modelled from just past
-        // the pad (touching copper); one wider than the pad would stand out along its sides, so it starts, in the
-        // model and on the board, just past the pad's core, inside its rounded end, and ends round there
-        let wider = e > 2.0 * across + 1e-9;
-        let start = if wider { pad.center + dir * (core + 0.01) } else { pad.center + dir * (reach + e / 2.0 + 0.01) };
-        // (KiCad joins a track to a pad its end lies in: on a square-cornered pad that end stays just inside)
-        let from = if wider { pad.center + dir * (core + 0.01).min(reach - 0.005) } else { pad.center };
-        let mut found = None;
-        let mut why = "no room for the class width within 2.5 mm";
-        let mut t = (start - pad.center).dot(dir) + 0.01;
-        while t < reach + 2.5 {
-            let j = pad.center + dir * t;
-            if gap(start, j, e / 2.0, stub_clear) < 0.0 {
-                why = "the stub runs into other copper first";
-                break;
+        // out along the pad's axis; where that runs into other copper (a corner pin whose neighbour's stub is in the
+        // way), off its side that faces out of the part too (TOPOR_NECK_SIDE_OFF: the axis only)
+        let mut dirs = vec![dir];
+        if axis.is_some() && out_dir.norm() > 1e-6 && std::env::var("TOPOR_NECK_SIDE_OFF").is_err() {
+            for d in [dir.perp(), dir.perp() * -1.0] {
+                if d.dot(out_dir) > 0.25 * out_dir.norm() {
+                    dirs.push(d);
+                }
             }
-            if gap(j, j, wide / 2.0, my_clear) >= 0.005 {
-                found = Some(j);
-                break;
-            }
-            t += 0.01;
         }
-        let Some(j) = found else {
+        let mut why = "no room for the class width within 2.5 mm";
+        let mut laid = None;
+        for &dir in &dirs {
+            let across = pad.pts.iter().map(|&q| (q - pad.center).dot(dir.perp()).abs()).fold(0.0, f64::max) + pad.r;
+            // where the pad's copper ends along the stub
+            let core = pad.pts.iter().map(|&q| (q - pad.center).dot(dir)).fold(0.0, f64::max);
+            let reach = core + pad.r;
+            // a stub as narrow as the pad runs in from its centre, over its copper, and is modelled from just past
+            // the pad (touching copper); one wider than the pad would stand out along its sides, so it starts, in the
+            // model and on the board, just past the pad's core, inside its rounded end, and ends round there
+            let wider = e > 2.0 * across + 1e-9;
+            let start = if wider { pad.center + dir * (core + 0.01) } else { pad.center + dir * (reach + e / 2.0 + 0.01) };
+            // (KiCad joins a track to a pad its end lies in: on a square-cornered pad that end stays just inside)
+            let from = if wider { pad.center + dir * (core + 0.01).min(reach - 0.005) } else { pad.center };
+            let mut t = (start - pad.center).dot(dir) + 0.01;
+            while t < reach + 2.5 {
+                let j = pad.center + dir * t;
+                if gap(start, j, e / 2.0, stub_clear) < 0.0 {
+                    why = "the stub runs into other copper first";
+                    break;
+                }
+                if gap(j, j, wide / 2.0, my_clear) >= 0.005 {
+                    laid = Some((start, from, j));
+                    break;
+                }
+                t += 0.01;
+            }
+            if laid.is_some() {
+                break;
+            }
+        }
+        let Some((start, from, j)) = laid else {
             failed.push(format!("{} ({})", pad.name, why));
             continue;
         };
