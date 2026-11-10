@@ -291,24 +291,37 @@ def _neck_sites(bd, p, cx, cy, masks, reach=1.5):
     return out
 
 
-def _assign(pins, options, rules, slack):
-    """Beam search: at most one site per pin, no two chosen sites in conflict; most escapes, then shortest."""
-    order = sorted((p for p in pins if options[_key(p)]), key=lambda p: (len(options[_key(p)]), _key(p)))
-    beam = [((), 0., ())]                       # (chosen sites, total length, skipped pins)
+def _assign(pins, options, rules, slack, priority=lambda p: 1):
+    """Beam search: at most one site per pin, no two chosen sites in conflict. Maximises the escapes weighted
+    by pin priority (pins that cannot do without one first), then the shortest total stub length. Pins are
+    taken in priority order, the most constrained first within a priority."""
+    order = sorted((p for p in pins if options[_key(p)]),
+                   key=lambda p: (-priority(p), len(options[_key(p)]), _key(p)))
+    beam = [((), 0, 0., ())]                    # (chosen sites, weighted count, total length, skipped pins)
     for p in order:
+        w = priority(p)
         nxt = []
-        for chosen, length, skipped in beam:
+        for chosen, score, length, skipped in beam:
             for s in options[_key(p)]:
                 if not any(s.conflicts(c, rules, slack) for c in chosen):
-                    nxt.append((chosen + (s,), length + s.length, skipped))
-            nxt.append((chosen, length, skipped + (p,)))
-        nxt.sort(key=lambda b: (-len(b[0]), b[1]))
+                    nxt.append((chosen + (s,), score + w, length + s.length, skipped))
+            nxt.append((chosen, score, length, skipped + (p,)))
+        nxt.sort(key=lambda b: (-b[1], b[2]))
         beam = nxt[:BEAM]
     best = beam[0]
-    return list(best[0]), list(best[2]) + [p for p in pins if not options[_key(p)]]
+    return list(best[0]), list(best[3]) + [p for p in pins if not options[_key(p)]]
 
 
-def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2, commit=True):
+def _connected(bd, p):
+    net = p['net']
+    if not net or net.startswith('unconnected-') or p['layers'] == 'all':
+        return False
+    if net in bd.config['planes']:
+        return not bd.plane_reached(p)
+    return len(bd.pads_of(net)) >= 2 and not bd._net_complete(net)
+
+
+def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2, commit=True, every_pin=False):
     """Plan the escapes of every dense package's pins together: dog-bones (stub + via) for pins that must
     change layer and, on boards with neck-down rules, the neck-down stubs of power pins. Returns
     (number placed, [(ref, pin, net) without an escape]). Two-row packages with at least `inward_gap` mm
@@ -317,7 +330,11 @@ def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2, commit=T
     Neck-down stubs and plane pins' dog-bones are copper at once (they are final). Signal dog-bones are
     copper when commit=True; with commit=False their stub and a via-sized disk on every layer are reserved
     instead (Board.reserve), so the net keeps its way out until it is routed, and later stages (power nets,
-    plane drops, other signals) must route around them. A neck stub's landing is always reserved."""
+    plane drops, other signals) must route around them. A neck stub's landing is always reserved.
+
+    every_pin=True gives every connected pin an access via site, not only the pins that must change layer:
+    a via site is a way out on every layer, so a pin holding one cannot be boxed in. When a package cannot
+    host one for each pin, plane and neck-down pins come first, then pins that must change layer."""
     placed = 0
     unplaced = []
     rules = dict(hole_to_hole=geometry.HOLE_TO_HOLE, hole_clear=geometry.HOLE_CLEAR,
@@ -327,8 +344,12 @@ def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2, commit=T
         if not time_left():
             break
         necks = [p for p in ps if _needs_neck(bd, p)]
-        vias = [p for p in ps if _needs_via(bd, p) and not any(_key(q) == _key(p) for q in necks)]
+        neck_keys = {_key(q) for q in necks}
+        vias = [p for p in ps if _key(p) not in neck_keys and (_needs_via(bd, p) or (every_pin and _connected(bd, p)))]
         pins = necks + vias
+        plane_or_neck = neck_keys | {_key(q) for q in vias if q['net'] in bd.config['planes']}
+        needed = {_key(q) for q in vias if _needs_via(bd, q)}
+        priority = lambda q: 3 if _key(q) in plane_or_neck else 2 if _key(q) in needed else 1
         if not pins:
             continue
         cx, cy = package_centre(bd, ref)
@@ -338,7 +359,7 @@ def plan_dogbones(bd, packages, time_left=lambda: True, inward_gap=1.2, commit=T
         masks = {'win': bd._win(min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r)}
         options = {_key(p): _neck_sites(bd, p, cx, cy, masks) for p in necks}
         options.update({_key(p): _sites(bd, p, pitch, cx, cy, inward, masks) for p in vias})
-        chosen, skipped = _assign(pins, options, rules, slack)
+        chosen, skipped = _assign(pins, options, rules, slack, priority)
         for s in chosen:
             p = s.pad
             layer = geometry.LAYERS[_side(p)]
@@ -399,7 +420,10 @@ def audit_escapes(bd, refs=None, margin=.3, reach_mm=3.):
         if part.placed:
             for q in part.pads():
                 groups.setdefault(q['original_ref'], []).append(q)
-    report = dict(pins=0, no_exit=[], no_via=[], joint_unplaced=[], packages={})
+    report = dict(pins=0, no_exit=[], no_via=[], joint_unplaced=[], packages={}, held=0)
+    # pins whose escape is already planned: a held site (reservation) or escape copper starting at the pad
+    planned = {(op[1][0], round(op[1][2][0], 6), round(op[1][2][1], 6)) for op in bd.reservations()}
+    planned |= {(t['net'], round(t['pts'][0][0], 6), round(t['pts'][0][1], 6)) for t in bd.tracks}
     for ref, ps in sorted(groups.items()):
         if refs and ref not in refs:
             continue
@@ -416,6 +440,10 @@ def audit_escapes(bd, refs=None, margin=.3, reach_mm=3.):
                 continue        # already on its plane, or a central (exposed) pad: a via in the pad serves it
             stats['pins'] += 1
             report['pins'] += 1
+            if (net, round(p['x'], 6), round(p['y'], 6)) in planned:
+                stats['exit'] += 1
+                report['held'] += 1
+                continue
             L = _side(p)
             width = p.get('escape_width') or bd.width(net, geometry.LAYERS[L])
             win = bd._win(p['x'] - reach_mm, p['y'] - reach_mm, p['x'] + reach_mm, p['y'] + reach_mm)

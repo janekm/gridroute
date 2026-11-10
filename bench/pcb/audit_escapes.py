@@ -15,7 +15,7 @@ from gridroute.escape import audit_escapes
 
 def summary(name,r):
     bad={k:v for k,v in r['packages'].items() if v['exit']<v['pins'] or v['via']<v['via_needed']}
-    print(f"{name}: {r['pins']} pins; no exit {len(r['no_exit'])}, no via site {len(r['no_via'])}, "
+    print(f"{name}: {r['pins']} pins ({r['held']} with a planned escape); no exit {len(r['no_exit'])}, no via site {len(r['no_via'])}, "
           f"no joint via site {len(r['joint_unplaced'])}")
     for k,v in sorted(bad.items()):print('  ',k,v)
     for kind in ('no_exit','no_via','joint_unplaced'):
@@ -33,7 +33,8 @@ bd=ctl._fresh(ctl.options.pitch)
 # the controller's pre-routing stages, in run() order
 if ctl.options.escape_hold:
     from gridroute.escape import dense_packages,plan_dogbones
-    n,un=plan_dogbones(bd,dense_packages(bd,ctl.options.fine_pitch_mm),commit=False)
+    n,un=plan_dogbones(bd,dense_packages(bd,ctl.options.fine_pitch_mm),commit=False,
+                       every_pin=ctl.options.escape_hold_every_pin)
     print(f'held escapes: {n} planned, {len(un)} without one: {[tuple(x) for x in un]}')
     r=audit_escapes(bd,a.refs);summary('after planning held escapes',r)
 if ctl.options.escape_reserve_mm>0:ctl._reserve_escapes(bd)
