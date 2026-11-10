@@ -198,7 +198,8 @@ impl Relax {
 
     /// Node i after one projection of its elements' constraints, from `p`, and its largest gap deficit. Moving
     /// neighbours share a Jacobi average; fixed obstacles then apply in full from where that leaves the node,
-    /// so no number of pushing neighbours can carry a node through a boundary.
+    /// so no number of pushing neighbours can carry a node through a boundary, one after another, so a run of
+    /// short boundary segments (a densified curve) pushes once, not once per segment.
     fn project(&self, i: usize, p: &[V]) -> (V, f32) {
         let x = p[i];
         if self.kind[i] == 0 {
@@ -220,17 +221,15 @@ impl Relax {
             }
         }
         let mut y = if n > 0 { add(x, mul(acc, 1.0 / n as f32)) } else { x };
-        let mut fix = [0.0f32, 0.0];
         for (e, f, need) in cons() {
             if !self.is_fixed(f) {
                 continue;
             }
             if let Some((d, pen)) = self.contact(i, y, e, f, need, p) {
-                fix = add(fix, d);
+                y = add(y, d);
                 worst = worst.max(pen);
             }
         }
-        y = add(y, fix);
         let lz = self.leash[i];
         if lz[2] >= 0.0 {
             let o = sub(y, [lz[0], lz[1]]);

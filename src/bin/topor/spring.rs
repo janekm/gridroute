@@ -160,12 +160,14 @@ impl Router {
         // movable pieces: every live wire of a net that is not a pair member
         let movable_piece = |p: usize| {
             let pc = &w.pieces[p];
-            pc.alive && !pc.frozen && !pair(pc.net) && pc.poly.len() >= 2
+            // (a drop at a neck-down width stays the straight segment it is)
+            pc.alive && !pc.frozen && !pair(pc.net) && pc.poly.len() >= 2 && pc.width >= w.b.nets[pc.net as usize].wmin[pc.layer as usize] - 1e-9
         };
         // movable vias: signal and plane vias whose wires all move
         let mut via_node: crate::fx::FxMap<u32, u32> = Default::default();
         for (o, ob) in w.objs.iter().enumerate() {
-            if !ob.alive || ob.s.kind != Kind::Via || pair(ob.s.net) || self.ties.iter().any(|t| t.0 == o as u32 || t.1 == o as u32) {
+            // (a dogbone net's via stays beside its pad)
+            if !ob.alive || ob.s.kind != Kind::Via || pair(ob.s.net) || self.ties.iter().any(|t| t.0 == o as u32 || t.1 == o as u32) || w.b.dogbone.get(ob.s.net as usize).copied().unwrap_or(false) {
                 continue;
             }
             let live: Vec<u32> = w.obj_pieces[o].iter().cloned().filter(|&p| w.pieces[p as usize].alive).collect();
@@ -197,7 +199,7 @@ impl Router {
                 _ => {
                     let nodes: Vec<u32> = s.pts.iter().map(|&p| m.node(p, 0)).collect();
                     let rd = if s.kind == Kind::Via { s.drill / 2.0 } else { 0.0 };
-                    let own_pad = s.kind == Kind::Pad && !s.name.starts_with("zone:") && !s.name.starts_with("junction:");
+                    let own_pad = s.kind == Kind::Pad && !crate::world::fixed_copper(&s.name) && !s.name.starts_with("junction:");
                     m.element(nodes, El { layers: s.layers & sig, attr, r: s.r, rd, own_pad, pad: if s.kind == Kind::Pad && s.pts.len() >= 2 { o as u32 } else { NONE }, ends: [NONE; 2] }, false);
                     if s.drill > 0.0 {
                         let c = m.node(s.center, 0);
@@ -218,7 +220,7 @@ impl Router {
         for &(o, n) in &m.vias.clone() {
             let s = &w.objs[o as usize].s;
             let c = w.b.nets[s.net as usize].class;
-            let attr = Attr { kind: Kind::Via, net: s.net, class: c as u32, clear: w.b.classes[c].clear };
+            let attr = Attr { kind: Kind::Via, net: s.net, class: c as u32, clear: s.clear };
             m.element(vec![n], El { layers: (s.layers & sig) | VIARULE, attr, r: s.r, rd: s.drill / 2.0, own_pad: false, pad: NONE, ends: [NONE; 2] }, true);
             m.element(vec![n], El { layers: DRILL, attr, r: s.drill / 2.0, rd: 0.0, own_pad: false, pad: NONE, ends: [NONE; 2] }, true);
         }
@@ -228,7 +230,7 @@ impl Router {
             if !pc.alive || pc.poly.len() < 2 {
                 continue;
             }
-            let attr = w.net_attr(pc.net);
+            let attr = w.net_attr(pc.net, pc.layer as usize);
             let el = El { layers: 1 << pc.layer, attr, r: pc.width / 2.0, rd: 0.0, own_pad: false, pad: NONE, ends: [pc.a.obj, pc.b.obj] };
             if !movable_piece(p) {
                 let nodes: Vec<u32> = pc.poly.iter().map(|&q| m.node(q, 0)).collect();
@@ -441,8 +443,13 @@ impl Router {
     /// The spring relaxation phase (see the module notes). Returns whether the board took the result. Nets
     /// that cannot be joined up again after a relaxation are held as they were in another, up to twice.
     pub fn spring(&mut self) -> bool {
+        self.spring_tries(3)
+    }
+
+    /// The spring relaxation in at most `tries` solves (each holding the nets the one before could not join up).
+    pub fn spring_tries(&mut self, tries: usize) -> bool {
         let mut hold = std::collections::HashSet::new();
-        for _ in 0..3 {
+        for _ in 0..tries {
             match self.spring_once(&hold) {
                 Ok(kept) => return kept,
                 Err(nets) => {
@@ -459,7 +466,10 @@ impl Router {
     /// One relaxation with `hold` fixed: Ok(kept), or the nets that could not be joined up again.
     fn spring_once(&mut self, hold: &std::collections::HashSet<u32>) -> Result<bool, Vec<u32>> {
         let t0 = self.elapsed();
+        let _t = std::time::Instant::now();
         let mut m = self.spring_model(hold);
+        self.prof_add("spring: model", _t);
+        let t_solve = std::time::Instant::now();
         if m.vias.is_empty() && m.chains.is_empty() {
             return Ok(false);
         }
@@ -554,6 +564,7 @@ impl Router {
             }
         }
         let relaxed_len = Self::chain_len(&m);
+        self.prof_add("spring: solve (lists + Metal)", t_solve);
         // what the solve left unmet
         let (mut short, mut worst) = (0usize, 0.0f64);
         for &e in &m.mobile {
@@ -583,7 +594,9 @@ impl Router {
                 self.elapsed(), m.r.pos.len(), m.vias.len(), m.chains.len(), its, batches, if gpu { "Metal" } else { "CPU" }, builds, t_build, redone, t_run, start_len, relaxed_len
             );
         }
+        let _t = std::time::Instant::now();
         let ok = self.spring_write_back(&m);
+        self.prof_add("spring: write-back", _t);
         if self.cfg.verbose {
             eprintln!("[{:.1}s] spring relaxation {} ({:.1}s)", self.elapsed(), if ok.as_ref().map_or(false, |&k| k) { "kept" } else { "dropped" }, self.elapsed() - t0);
         }
@@ -595,9 +608,17 @@ impl Router {
     /// keeps the result only if it is as complete and clean as before and shorter.
     fn spring_write_back(&mut self, m: &Model) -> Result<bool, Vec<u32>> {
         let before_def = self.total_deficit();
+        // nets open before the relaxation: the write-back does not try them again (they cost full searches and
+        // will not come in now)
+        let was_open: std::collections::HashSet<u32> = self.incomplete_nets().into_iter().collect();
+        let _t = std::time::Instant::now();
         let before_viol = self.w.check_all().len();
+        self.prof_add("spring wb: exact checks", _t);
         let before_len = wire_len(&self.w);
+        let _t = std::time::Instant::now();
         let snap = (self.w.clone(), self.ties.clone(), self.history.clone(), self.junctions.clone());
+        self.prof_add("spring wb: snapshot", _t);
+        let t_thread = std::time::Instant::now();
         let restore = |r: &mut Router, s: (crate::world::World, Vec<(u32, u32)>, Vec<f64>, Vec<u32>)| {
             r.w = s.0;
             r.ties = s.1;
@@ -745,6 +766,8 @@ impl Router {
                 }
             }
         }
+        self.prof_add("spring wb: thread, realise, check", t_thread);
+        let t_pending = std::time::Instant::now();
         // the wires left short or not threaded: searched again between their own ends on their own layer
         let mut found = 0;
         for &(net, l, width, ta, tb) in &pending {
@@ -770,8 +793,22 @@ impl Router {
         if dbg {
             eprintln!("  spring: {} wires left short, {} did not thread, {} found again on their layer, {} kept as relaxed, {} ripped for clashes; {} nets to join up", skipped, unthreaded, found, kept, ripped, open.len());
         }
-        // 5. join up what is open
-        for &net in &open {
+        self.prof_add("spring wb: re-search short wires", t_pending);
+        let t_join = std::time::Instant::now();
+        // 5. join up what is open: the nets above, and any other the relaxation left apart without a wire of its
+        // own to rethread (a wire dropped where the triangles changed under it as its neighbours moved): a next try
+        // holds it and the nets beside it
+        let mut apart = Vec::new();
+        for net in self.incomplete_nets() {
+            if !was_open.contains(&net) && !open.contains(&net) {
+                if dbg {
+                    eprintln!("  spring: {} came apart without a wire to rethread", self.w.b.nets[net as usize].name);
+                }
+                open.push(net);
+                apart.push(net);
+            }
+        }
+        for &net in open.iter().filter(|n| !was_open.contains(n)) {
             for _ in 0..3 {
                 if self.route_net(net) == 0 {
                     break;
@@ -782,7 +819,7 @@ impl Router {
             }
         }
         if self.total_deficit() > before_def {
-            self.settle(8);
+            self.settle_except(8, &was_open);
         }
         self.cleanup();
         if dbg {
@@ -791,15 +828,25 @@ impl Router {
             }
         }
         let rerouted = open.len();
+        self.prof_add("spring wb: join up, settle, clean-up", t_join);
+        let _t = std::time::Instant::now();
         let (def, viol, len) = (self.total_deficit(), self.w.check_all().len(), wire_len(&self.w));
+        self.prof_add("spring wb: exact checks", _t);
         let moved = m.vias.iter().filter(|&&(o, n)| snap.0.objs[o as usize].s.center.dist(m.pos(n)) > 1e-3).count();
         if def > before_def || viol > before_viol || len >= before_len {
             if self.cfg.verbose {
                 eprintln!("  spring: dropped (deficit {} -> {}, violations {} -> {}, wires {:.1} -> {:.1} mm, {} nets routed again)", before_def, def, before_viol, viol, before_len, len, rerouted);
             }
+            // (the nets beside one that came apart, on its layers within 1 mm of its copper as it was)
+            let mut hold_next = open.clone();
+            for n in nets_beside(&snap.0, &apart, 1.0) {
+                if !hold_next.contains(&n) {
+                    hold_next.push(n);
+                }
+            }
             restore(self, snap);
             // left incomplete or unclean by the nets that had to be joined up again: the next try holds them
-            return if (def > before_def || viol > before_viol) && !open.is_empty() { Err(open) } else { Ok(false) };
+            return if (def > before_def || viol > before_viol) && !hold_next.is_empty() { Err(hold_next) } else { Ok(false) };
         }
         self.events.push(format!("spring relaxation: {} vias moved, wires {:.1} -> {:.1} mm ({} nets routed again where the relaxed wires did not fit)", moved, before_len, len, rerouted));
         if self.cfg.verbose {
@@ -843,7 +890,7 @@ impl Router {
         if !ob.alive || ob.s.kind != Kind::Via || ob.plane || self.ties.iter().any(|t| t.0 == o || t.1 == o) {
             return None;
         }
-        if self.w.b.partner.get(ob.s.net as usize).map_or(false, |&q| q != NONE) {
+        if self.w.b.partner.get(ob.s.net as usize).map_or(false, |&q| q != NONE) || self.w.b.dogbone.get(ob.s.net as usize).copied().unwrap_or(false) {
             return None;
         }
         let c = ob.s.center;
@@ -987,3 +1034,23 @@ impl Router {
     }
 }
 
+/// Nets with copper within `d` of the wires of `nets` on the same layer (vias: on any layer), in board w.
+fn nets_beside(w: &crate::world::World, nets: &[u32], d: f64) -> Vec<u32> {
+    let mut out = Vec::new();
+    if nets.is_empty() {
+        return out;
+    }
+    let mine: Vec<(usize, P2, P2, f64)> = w.pieces.iter().filter(|p| p.alive && nets.contains(&p.net)).flat_map(|p| p.poly.windows(2).map(move |s| (p.layer as usize, s[0], s[1], p.width))).collect();
+    let near = |l: Option<usize>, a: P2, b: P2, r: f64| mine.iter().any(|&(ml, c, e, mw)| l.map_or(true, |l| l == ml) && seg_seg_dist(a, b, c, e) < d + (r + mw) / 2.0);
+    for p in w.pieces.iter().filter(|p| p.alive && !nets.contains(&p.net)) {
+        if !out.contains(&p.net) && p.poly.windows(2).any(|s| near(Some(p.layer as usize), s[0], s[1], p.width)) {
+            out.push(p.net);
+        }
+    }
+    for o in w.objs.iter().filter(|o| o.alive && o.s.kind == crate::model::Kind::Via && !nets.contains(&o.s.net)) {
+        if !out.contains(&o.s.net) && near(None, o.s.center, o.s.center, 2.0 * o.s.r) {
+            out.push(o.s.net);
+        }
+    }
+    out
+}
