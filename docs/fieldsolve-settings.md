@@ -136,6 +136,9 @@ then start the long run.
   and `tune` can place any part without a new EM run. Check the printed nets under each port. A
   rotated-part port gets a staircase bridge, and both pads must be reached.
 - **Band:** `fmax` at least 3.2× the operating frequency if you want H2 and H3. `nf` 300-400.
+  A run refuses any `"farfield"`, `"fields"` or `"objective"` frequency above `fmax`: the far-field box is
+  sampled at 3 × `fmax`, and a result above `fmax` is aliased (14 % wrong at 1.3 × `fmax`). The default
+  `fmax` is 3 GHz, so a spec that lists 4.88 GHz without setting `fmax` used to return a wrong number.
 - **Far field:** list frequencies on a dense grid across the band, 0.02-0.05 GHz apart, plus the
   harmonics. A board can carry a narrow, lossy resonance about 0.05 GHz wide that removes 5-12 points of
   efficiency at one frequency and moves between meshes. Three spot frequencies (2.40 / 2.44 / 2.48 GHz) can

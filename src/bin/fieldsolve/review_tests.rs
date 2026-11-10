@@ -243,3 +243,67 @@ fn nearly_aligned_pads_keep_the_straight_bridge() {
     assert_eq!(bb.len(), 2, "straight bridge expected, got {bb:?}");
     assert!(st.lumped.iter().any(|l| l.name == "P" && l.axis == 0));
 }
+
+/// The far-field box and the field snapshots are sampled at 3 fmax, so a frequency above fmax aliases.
+/// A run asking for one is refused, with the frequency and the fmax to set in the message.
+#[test]
+fn frequencies_above_fmax_are_rejected() {
+    let ok = json!({"fmax": 8e9, "farfield": {"freqs": [2.44e9, 4.88e9, 7.32e9]}, "fields": {"freqs": [2.44e9, 8e9]},
+                    "objective": {"band": [2.40e9, 2.48e9], "harmonics": [4.88e9, 7.32e9]}});
+    assert!(sim::RunOpts::from_spec(&ok).check_freqs(sim::spec_fmax(&ok)).is_ok());
+    // the default fmax is 3 GHz: the second harmonic of 2.44 GHz is out of reach
+    for (bad, key) in [
+        (json!({"farfield": {"freqs": [2.44e9, 4.88e9]}}), "farfield.freqs"),
+        (json!({"fields": {"freqs": [4.88e9]}}), "fields.freqs"),
+        (json!({"objective": {"band": [2.44e9, 4.88e9]}}), "objective.band"),
+        (json!({"objective": {"band": [2.44e9], "harmonics": [4.88e9]}}), "objective.harmonics"),
+    ] {
+        let e = sim::RunOpts::from_spec(&bad).check_freqs(sim::spec_fmax(&bad)).unwrap_err();
+        assert!(e.contains(key) && e.contains("4.880 GHz") && e.contains("3.000 GHz") && e.contains("4.880e9"), "{e}");
+        assert!(!e.contains("2.440"), "only the offending frequency is named: {e}");
+    }
+    // a full run fails before the set-up and before any solver step
+    let never: &dyn Fn(&model::Problem, &fdtd::RunSpec) -> fdtd::RunResult = &|_, _| panic!("the solver must not start");
+    let spec = json!({"roi": [-5, -5, 5, 5], "cell": 0.5, "ports": [{"name": "P", "pos": "A.1", "neg": "B.1", "layer": "F.Cu"}],
+                      "farfield": {"freqs": [2.44e9, 4.88e9]}});
+    let dir = std::env::temp_dir().join(format!("fieldsolve-test-fmax-guard-{}", std::process::id()));
+    let e = sim::run(&mut ctx(vec![rect(-1., -0.3, -0.1, 0.3, "A"), rect(0.1, -0.3, 1., 0.3, "B")], spec), &dir, never).unwrap_err();
+    assert!(e.contains("farfield.freqs") && e.contains("fmax"), "{e}");
+    assert!(!dir.exists(), "nothing is written for a refused run");
+}
+
+/// Surface-impedance copper on a domain without absorber: the loss must reach the first row of edges.
+/// Ex at i = 0 and Ey at j = 0 are interior edges; only Ex on the y = 0 wall, Ey on the x = 0 wall and
+/// edges on the z = 0 wall are left out, because the update reads H one cell back across the edge.
+#[test]
+fn sheet_loss_covers_the_first_row_of_edges() {
+    assert!(model::cond_stencil_ok(0, 0, 1, 1) && model::cond_stencil_ok(1, 1, 0, 1));
+    assert!(!model::cond_stencil_ok(0, 3, 0, 1) && !model::cond_stencil_ok(1, 0, 3, 1));
+    assert!(!model::cond_stencil_ok(0, 3, 3, 0) && !model::cond_stencil_ok(1, 3, 3, 0));
+
+    let lin = |n: usize, h: f64| (0..=n).map(|i| i as f64 * h * 1e-3).collect::<Vec<f64>>();
+    let g = mesh::Grid { x: lin(6, 1.0), y: lin(5, 1.0), z: lin(4, 0.25) };
+    let plate = |z: f64| model::Sheet {
+        name: format!("plate{z}"),
+        z,
+        prims: vec![Prim { shape: Shape::Polygon(vec![P2::new(-1., -1.), P2::new(7., -1.), P2::new(7., 6.), P2::new(-1., 6.)]), dark: true, net: None, pad: None }],
+    };
+    let lay = model::Layout { sheets: vec![plate(0.75), plate(0.25)], ..Default::default() };
+    let metal = cond::Metal { sigma: 5.8e7, t: 35e-6, rough: 0.0 };
+    let conductor = Some(cond::Conductor { metals: vec![metal.clone(), metal], f_lo: 0.3e9, f_hi: 10e9 });
+    let p = model::build(&g, &lay, &[], &model::BuildOpts { pml: [0; 6], fmax: 10e9, conductor, ..Default::default() });
+    let (nx, ny) = (p.nx, p.ny);
+    let edges: Vec<(usize, usize, usize, usize)> = p.cond.as_ref().unwrap().ids.iter().map(|&w| {
+        let (a, id) = ((w >> 30) as usize, (w & 0x3fff_ffff) as usize);
+        (a, id % nx, (id / nx) % ny, id / (nx * ny))
+    }).collect();
+    let count = |f: &dyn Fn(&(usize, usize, usize, usize)) -> bool| edges.iter().filter(|e| f(e)).count();
+    assert!(count(&|e| e.3 == 1) > 0 && count(&|e| e.3 == 3) > 0 && count(&|e| e.3 != 1 && e.3 != 3) == 0, "both plates, nothing else: {edges:?}");
+    // the first row carries as many lossy edges as the second
+    assert!(count(&|e| e.0 == 0 && e.1 == 0) > 0, "no Ex edge at i = 0");
+    assert_eq!(count(&|e| e.0 == 0 && e.1 == 0), count(&|e| e.0 == 0 && e.1 == 1));
+    assert!(count(&|e| e.0 == 1 && e.2 == 0) > 0, "no Ey edge at j = 0");
+    assert_eq!(count(&|e| e.0 == 1 && e.2 == 0), count(&|e| e.0 == 1 && e.2 == 1));
+    // and the stencil never leaves the grid
+    assert_eq!(count(&|e| (e.0 == 0 && e.2 == 0) || (e.0 == 1 && e.1 == 0)), 0);
+}
