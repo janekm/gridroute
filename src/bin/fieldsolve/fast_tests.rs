@@ -294,3 +294,140 @@ fn extrapolation_experiment() {
         println!("{s:6} raw {}  extrap {x}", h[1]);
     }
 }
+
+/// A printed antenna's feed pad (AE1.1, net RF_ANT) reaching 0.1 mm into its grounded pad (AE1.2, GND) on a
+/// 0.1 mm mesh, and elsewhere an RF_ANT track 0.03 mm from a GND pour (a sub-cell clearance).
+fn tie_layout(ties: model::NetTies) -> (mesh::Grid, model::Layout) {
+    let lines = |a: f64, b: f64| (0..=((b - a) / 0.1).round() as usize).map(|i| (a + 0.1 * i as f64) * 1e-3).collect::<Vec<_>>();
+    let g = mesh::Grid { x: lines(-2.0, 2.0), y: lines(-1.0, 2.2), z: vec![-0.2e-3, 0.0, 0.2e-3] };
+    let pad = |x0: f64, y0: f64, x1: f64, y1: f64, net: &str, pin: Option<&str>| Prim {
+        shape: Shape::Polygon(vec![P2::new(x0, y0), P2::new(x1, y0), P2::new(x1, y1), P2::new(x0, y1)]),
+        dark: true,
+        net: Some(net.into()),
+        pad: pin.map(|p| ("AE1".to_string(), p.to_string())),
+    };
+    let prims = vec![
+        pad(-1.5, -0.15, 0.05, 0.15, "RF_ANT", Some("1")), // feed strip, into pad 2 by 0.1 mm
+        pad(-0.05, -0.6, 1.5, 0.6, "GND", Some("2")),      // radiator and short
+        pad(-1.5, 1.0, 1.5, 1.2, "RF_ANT", None),          // track ...
+        pad(-1.5, 1.23, 1.5, 2.0, "GND", None),            // ... 0.03 mm from the pour
+    ];
+    let lay = model::Layout { sheets: vec![model::Sheet { name: "F.Cu".into(), z: 0.0, prims }], net_ties: ties, ..Default::default() };
+    (g, lay)
+}
+
+/// Are the mesh nodes nearest `a` and `b` (mm) joined through the plane's metal edges?
+fn joined(g: &mesh::Grid, m: &model::SheetMask, a: (f64, f64), b: (f64, f64)) -> bool {
+    let (nx, ny) = (g.nx(), g.ny());
+    let mm = |v: &[f64]| v.iter().map(|x| x * 1e3).collect::<Vec<_>>();
+    let (xs, ys) = (mm(&g.x), mm(&g.y));
+    let node = |p: (f64, f64)| mesh::snap(&ys, p.1) * nx + mesh::snap(&xs, p.0);
+    let (s, t) = (node(a), node(b));
+    let mut seen = vec![false; nx * ny];
+    let mut stack = vec![s];
+    seen[s] = true;
+    while let Some(q) = stack.pop() {
+        let (i, j) = (q % nx, q / nx);
+        let mut nb = Vec::new();
+        if i + 1 < nx && m.ex[q] {
+            nb.push(q + 1);
+        }
+        if i > 0 && m.ex[q - 1] {
+            nb.push(q - 1);
+        }
+        if j + 1 < ny && m.ey[q] {
+            nb.push(q + nx);
+        }
+        if j > 0 && m.ey[q - nx] {
+            nb.push(q - nx);
+        }
+        for r in nb {
+            if !seen[r] {
+                seen[r] = true;
+                stack.push(r);
+            }
+        }
+    }
+    seen[t]
+}
+
+/// Copper of two nets that touches in the source geometry and is cut apart by the raster is reported, with
+/// the nets, the place and the pads; the sub-cell clearance next to it is cut quietly (counted only).
+#[test]
+fn touching_nets_cut_apart_are_reported() {
+    let (g, lay) = tie_layout(Default::default());
+    let (masks, _, rep) = model::sheet_masks_report(&g, &lay);
+    assert_eq!(rep.junctions.len(), 1, "{:?}", rep.junctions);
+    let j = &rep.junctions[0];
+    assert_eq!((j.a.as_str(), j.b.as_str(), j.tie.as_deref()), ("RF_ANT", "GND", None), "{j:?}");
+    assert!(j.edges > 0 && j.nodes > 0);
+    assert!((j.at.x - 0.0).abs() < 0.15 && j.at.y.abs() < 0.2, "contact at {:?}", j.at);
+    assert_eq!(j.pads, ["AE1.1 (RF_ANT)", "AE1.2 (GND)"]);
+    assert!(rep.near_gap > 0, "the track next to the pour is a near gap");
+    assert!(rep.removed >= j.edges + rep.near_gap);
+    assert!(!joined(&g, &masks[0], (-1.0, 0.0), (1.0, 0.0)), "feed cut from the radiator");
+    assert!(!joined(&g, &masks[0], (0.0, 1.1), (0.0, 1.6)), "track apart from the pour");
+    let (warn, info) = sim::junction_checks(&rep, false);
+    assert_eq!(warn.len(), 1, "{warn:?}");
+    assert!(warn[0].contains("\"RF_ANT\" and \"GND\"") && warn[0].contains("AE1.1") && warn[0].contains("net_ties"), "{}", warn[0]);
+    assert!(info.iter().any(|l| l.contains("sub-cell clearances")), "{info:?}");
+}
+
+/// A declared tie (by component or by net pair) keeps the junction joined, is not a mesh short, and leaves
+/// the same two nets apart where they only come close.
+#[test]
+fn a_declared_net_tie_stays_connected_only_where_it_touches() {
+    for ties in [model::NetTies { refs: vec!["AE1".into()], pairs: vec![] }, model::NetTies { refs: vec![], pairs: vec![("GND".into(), "RF_ANT".into())] }] {
+        let (g, lay) = tie_layout(ties.clone());
+        let (masks, _, rep) = model::sheet_masks_report(&g, &lay);
+        assert_eq!(rep.junctions.len(), 1, "{:?}", rep.junctions);
+        let j = &rep.junctions[0];
+        assert!(j.tie.is_some() && j.edges == 0, "{j:?}");
+        assert!(rep.unused_ties.is_empty(), "{:?}", rep.unused_ties);
+        assert!(!masks[0].tied.is_empty());
+        assert!(joined(&g, &masks[0], (-1.0, 0.0), (1.0, 0.0)), "{ties:?}: feed joined to the radiator");
+        assert!(!joined(&g, &masks[0], (0.0, 1.1), (0.0, 1.6)), "{ties:?}: track still apart from the pour");
+        assert!(connect::check(&g, &lay).iter().all(|b| !(b.a == "RF_ANT" && b.b == "GND" || b.a == "GND" && b.b == "RF_ANT")), "a tie is not a mesh short");
+        let (warn, info) = sim::junction_checks(&rep, false);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert!(info.iter().any(|l| l.starts_with("net tie")), "{info:?}");
+    }
+    // a tie naming another component joins nothing, and says so
+    let (g, lay) = tie_layout(model::NetTies { refs: vec!["AE2".into()], pairs: vec![] });
+    let (masks, _, rep) = model::sheet_masks_report(&g, &lay);
+    assert!(!joined(&g, &masks[0], (-1.0, 0.0), (1.0, 0.0)));
+    assert_eq!(rep.unused_ties, ["AE2"]);
+    // the spec key
+    let t = sim::parse_net_ties(&json!({"net_ties": ["AE1", ["RF_ANT", "GND"]]})).unwrap();
+    assert_eq!((t.refs, t.pairs), (vec!["AE1".to_string()], vec![("RF_ANT".to_string(), "GND".to_string())]));
+    assert!(sim::parse_net_ties(&json!({"net_ties": [["A"]]})).is_err());
+}
+
+/// Copper of two nets closer than a cell but not touching is cut exactly as before (the edges of the net
+/// with fewer edges at each shared node), with no junction, also when the pair is declared a tie.
+#[test]
+fn near_gap_copper_is_cut_as_before() {
+    let (g, mut lay) = tie_layout(model::NetTies { refs: vec![], pairs: vec![("RF_ANT".into(), "GND".into())] });
+    lay.sheets[0].prims.drain(..2); // only the track and the pour
+    let (masks, _, rep) = model::sheet_masks_report(&g, &lay);
+    assert!(rep.junctions.is_empty(), "{:?}", rep.junctions);
+    assert_eq!(rep.removed, rep.near_gap);
+    assert!(rep.near_gap > 0);
+    assert_eq!(rep.unused_ties.len(), 1);
+    assert!(masks[0].tied.is_empty());
+    assert!(!joined(&g, &masks[0], (0.0, 1.1), (0.0, 1.6)));
+    // as before: no node keeps edges of two nets, and both conductors are intact away from the gap
+    let (nx, ny) = (g.nx(), g.ny());
+    let m = &masks[0];
+    for j in 1..ny - 1 {
+        for i in 1..nx - 1 {
+            let q = j * nx + i;
+            let mut nets: Vec<u32> = [(m.ex[q], m.exn[q]), (m.ex[q - 1], m.exn[q - 1]), (m.ey[q], m.eyn[q]), (m.ey[q - nx], m.eyn[q - nx])].iter().filter(|e| e.0).map(|e| e.1).collect();
+            nets.dedup();
+            nets.sort();
+            nets.dedup();
+            assert!(nets.len() <= 1, "two nets at node ({i}, {j})");
+        }
+    }
+    assert!(joined(&g, m, (-1.4, 1.1), (1.4, 1.1)) && joined(&g, m, (-1.4, 1.6), (1.4, 1.9)));
+}

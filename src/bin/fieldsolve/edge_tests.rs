@@ -27,6 +27,7 @@ fn problem(edge: Option<EdgeOpts>, wideband: Option<crate::disp::Wideband>, pml:
         outline: vec![vec![P2::new(-2.0, -2.0), P2::new(12.0, -2.0), P2::new(12.0, 8.0), P2::new(-2.0, 8.0)]],
         copper_window: None,
         bodies: vec![],
+        net_ties: Default::default(),
     };
     let (px, py) = r(0.5, 1.0);
     let port = model::Lumped { name: "P1".into(), axis: 2, lo: [px, py, 0.0], hi: [px, py, 0.4], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
@@ -46,6 +47,7 @@ fn no_conformal_fractions_on_graded_cells() {
         outline: vec![vec![P2::new(-2.0, -2.0), P2::new(15.0, -2.0), P2::new(15.0, 15.0), P2::new(-2.0, 15.0)]],
         copper_window: None,
         bodies: vec![],
+        net_ties: Default::default(),
     };
     let build = |edge: Option<EdgeOpts>| model::build(&g, &lay, &[], &model::BuildOpts { pml: [6; 6], fmax: 10e9, f_loss: 2e9, cfl: 0.95, wideband: None, conductor: None, edge });
     let p0 = build(None);
@@ -199,7 +201,7 @@ fn conformal_keeps_a_thin_diagonal_trace_connected() {
     let r2 = 0.5f64.sqrt();
     let p = |s: f64, t: f64| (s * r2 - t * r2, s * r2 + t * r2);
     let tr = poly(&[p(0.0, -w / 2.0), p(8.0, -w / 2.0), p(8.0, w / 2.0), p(0.0, w / 2.0)]);
-    let lay = model::Layout { sheets: vec![model::Sheet { name: "top".into(), z: 0.2, prims: vec![tr] }], slabs: vec![model::Slab { z0: -1.0, z1: 0.2, eps: 4.3, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![] };
+    let lay = model::Layout { sheets: vec![model::Sheet { name: "top".into(), z: 0.2, prims: vec![tr] }], slabs: vec![model::Slab { z0: -1.0, z1: 0.2, eps: 4.3, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     let pr = model::build(&g, &lay, &[], &model::BuildOpts { pml: [0; 6], edge: Some(EdgeOpts { dt_check: false, ..Default::default() }), ..Default::default() });
     let p0 = model::build(&g, &lay, &[], &model::BuildOpts { pml: [0; 6], ..Default::default() });
     let k = 3;

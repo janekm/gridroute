@@ -54,6 +54,19 @@ pub struct Layout {
     /// 3-D dielectric objects (enclosure, FPC substrate): they replace the slab material in the cells they
     /// fill, later ones winning (bodies.rs).
     pub bodies: Vec<crate::bodies::Body>,
+    /// Copper of different nets joined on purpose where it touches (spec `"net_ties"`).
+    pub net_ties: NetTies,
+}
+
+/// Junctions the layout makes between two nets on purpose: a net-tie footprint, or a feed strip that runs
+/// into a shorted antenna's ground pad. Where tied copper touches in the source geometry, conflict
+/// resolution keeps both nets' mesh edges; elsewhere (sub-cell clearances) the nets stay apart as usual.
+#[derive(Clone, Debug, Default)]
+pub struct NetTies {
+    /// Components (reference designators): their pads of different nets are joined where they touch.
+    pub refs: Vec<String>,
+    /// Net pairs: joined wherever their copper touches.
+    pub pairs: Vec<(String, String)>,
 }
 
 impl Layout {
@@ -277,6 +290,9 @@ pub struct SheetMask {
     /// Net index (into the list returned with the masks; 0 = no net) of the copper that set each edge.
     pub exn: Vec<u32>,
     pub eyn: Vec<u32>,
+    /// Nodes (in-plane index `j * nx + i`) where a declared net tie kept the edges of two nets (net a, net
+    /// b): the connectivity check doesn't report them as shorts.
+    pub tied: Vec<(usize, u32, u32)>,
 }
 
 fn paint(mask: &mut [bool], nets: &mut [u32], net: u32, nx: usize, xs: &[f64], ys: &[f64], p: &Prim) {
@@ -335,6 +351,12 @@ pub(crate) fn paint_with(xs: &[f64], ys: &[f64], p: &Prim, mut set: impl FnMut(u
 /// Rasterise copper sheets onto the grid's in-plane edges (coordinates in mm on the layout side). Returns
 /// the masks and the net names they index (entry 0 is "" for copper without a net).
 pub fn sheet_masks(g: &Grid, lay: &Layout) -> (Vec<SheetMask>, Vec<String>) {
+    let (m, n, _) = sheet_masks_report(g, lay);
+    (m, n)
+}
+
+/// [`sheet_masks`] and what conflict resolution did (see [`resolve_conflicts`]).
+pub fn sheet_masks_report(g: &Grid, lay: &Layout) -> (Vec<SheetMask>, Vec<String>, Conflicts) {
     let mut names: Vec<String> = vec![String::new()];
     let mut index = std::collections::HashMap::new();
     let sheet_nets: Vec<Vec<u32>> = lay
@@ -412,14 +434,281 @@ pub fn sheet_masks(g: &Grid, lay: &Layout) -> (Vec<SheetMask>, Vec<String>) {
                 extrude(&mut ex, &mut exn, exi, exj);
                 extrude(&mut ey, &mut eyn, eyi, eyj);
             }
-            SheetMask { k, ex, ey, exn, eyn }
+            SheetMask { k, ex, ey, exn, eyn, tied: Vec::new() }
         })
         .collect();
     let mut masks = masks;
-    // copper added for lumped elements ("~name") joins nets on purpose: it never conflicts
-    let wild: Vec<bool> = names.iter().map(|n| n.starts_with('~')).collect();
-    resolve_conflicts(g, lay, &mut masks, &wild);
-    (masks, names)
+    let rep = resolve_conflicts(g, lay, &mut masks, &names, &sheet_nets);
+    (masks, names, rep)
+}
+
+/// What conflict resolution did to the raster.
+#[derive(Clone, Debug, Default)]
+pub struct Conflicts {
+    /// In-plane edges removed (at barrels and at nodes where two nets meet).
+    pub removed: usize,
+    /// Of those, edges removed where the two nets' source copper does not touch near the node: a clearance
+    /// under a cell, the case the removal is for.
+    pub near_gap: usize,
+    /// Places where two nets' source copper (the Gerber primitives) touches or overlaps and the raster had
+    /// to decide: cut apart (`tie` None, edges removed), or kept joined by a declared net tie.
+    pub junctions: Vec<Junction>,
+    /// Declared ties (as written, a pair as `["A", "B"]`) that kept no junction.
+    pub unused_ties: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Junction {
+    pub sheet: String,
+    pub a: String,
+    pub b: String,
+    /// Centre of the contact (mm, layout frame).
+    pub at: P2,
+    /// Mesh nodes where the two nets met.
+    pub nodes: usize,
+    /// Edges removed (0 when tied).
+    pub edges: usize,
+    /// Pads at the contact, from the X2 `.P` attributes: "AE1.1 (RF_ANT)".
+    pub pads: Vec<String>,
+    /// The tie that kept it joined.
+    pub tie: Option<String>,
+}
+
+/// Source copper counts as touching when the gap is under about this (mm), the local sampling step.
+pub const TOUCH_MM: f64 = 0.005;
+/// Local samples per axis at most (one `u32` row of bits each).
+const MAXS: usize = 32;
+type Bits = [u32; MAXS];
+
+/// Prims of one sheet bucketed by tiles of their bounding boxes, for the local copper around a node.
+struct PrimIndex<'a> {
+    prims: &'a [Prim],
+    net: &'a [u32],
+    x0: f64,
+    y0: f64,
+    t: f64,
+    nx: usize,
+    ny: usize,
+    tiles: Vec<Vec<u32>>,
+}
+
+impl<'a> PrimIndex<'a> {
+    fn new(prims: &'a [Prim], net: &'a [u32]) -> Self {
+        let mut all = BBox::empty();
+        let bbs: Vec<BBox> = prims.iter().map(|p| p.shape.bbox()).collect();
+        bbs.iter().filter(|b| !b.is_empty()).for_each(|b| all.union(b));
+        if all.is_empty() {
+            return PrimIndex { prims, net, x0: 0.0, y0: 0.0, t: 1.0, nx: 0, ny: 0, tiles: vec![] };
+        }
+        let t = ((all.x1 - all.x0).max(all.y1 - all.y0) / 128.0).max(0.25);
+        let nx = ((all.x1 - all.x0) / t) as usize + 1;
+        let ny = ((all.y1 - all.y0) / t) as usize + 1;
+        let mut ix = PrimIndex { prims, net, x0: all.x0, y0: all.y0, t, nx, ny, tiles: vec![Vec::new(); nx * ny] };
+        for (pid, b) in bbs.iter().enumerate() {
+            if let Some((i0, i1, j0, j1)) = ix.span(b) {
+                for j in j0..=j1 {
+                    for i in i0..=i1 {
+                        ix.tiles[j * nx + i].push(pid as u32);
+                    }
+                }
+            }
+        }
+        ix
+    }
+    fn span(&self, b: &BBox) -> Option<(usize, usize, usize, usize)> {
+        if self.nx == 0 || b.is_empty() {
+            return None;
+        }
+        let f = |v: f64, o: f64, n: usize| ((v - o) / self.t).floor().clamp(-1.0, n as f64) as isize;
+        let (i0, i1) = (f(b.x0, self.x0, self.nx).max(0), f(b.x1, self.x0, self.nx).min(self.nx as isize - 1));
+        let (j0, j1) = (f(b.y0, self.y0, self.ny).max(0), f(b.y1, self.y0, self.ny).min(self.ny as isize - 1));
+        (i0 <= i1 && j0 <= j1).then_some((i0 as usize, i1 as usize, j0 as usize, j1 as usize))
+    }
+    /// Prims whose bounding box overlaps `b`, in file order (clears act on what came before them).
+    fn near(&self, b: &BBox, out: &mut Vec<u32>) {
+        out.clear();
+        if let Some((i0, i1, j0, j1)) = self.span(b) {
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    out.extend_from_slice(&self.tiles[j * self.nx + i]);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|&p| self.prims[p as usize].shape.bbox().overlaps(b));
+    }
+}
+
+fn dilate(b: &Bits, n: usize, m: usize) -> Bits {
+    let full = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    let mut h = [0u32; MAXS];
+    for r in 0..m {
+        h[r] = (b[r] | b[r] << 1 | b[r] >> 1) & full;
+    }
+    let mut o = [0u32; MAXS];
+    for r in 0..m {
+        o[r] = h[r] | if r > 0 { h[r - 1] } else { 0 } | if r + 1 < m { h[r + 1] } else { 0 };
+    }
+    o
+}
+fn and(a: &Bits, b: &Bits) -> Bits {
+    std::array::from_fn(|r| a[r] & b[r])
+}
+fn any(a: &Bits) -> bool {
+    a.iter().any(|&r| r != 0)
+}
+
+/// The source copper of a few nets around one mesh node, sampled at about [`TOUCH_MM`] over the cells
+/// next to it (at most [`MAXS`] samples per axis).
+struct Local<'a> {
+    sx: Vec<f64>,
+    sy: Vec<f64>,
+    /// per net (of those asked for): its samples
+    cov: Vec<(u32, Bits)>,
+    /// prims with an X2 pad attribute: (net, (ref, pin), samples)
+    pads: Vec<(u32, &'a (String, String), Bits)>,
+}
+
+struct Contact {
+    at: P2,
+    pads: Vec<String>,
+    tie: Option<String>,
+}
+
+impl<'a> Local<'a> {
+    /// The cells next to node (i, j) of the mesh lines `xs`, `ys` (mm).
+    fn at_node(ix: &PrimIndex<'a>, xs: &[f64], ys: &[f64], i: usize, j: usize, nets: &[u32], buf: &mut Vec<u32>) -> Local<'a> {
+        let b = BBox { x0: xs[i.saturating_sub(1)], x1: xs[(i + 1).min(xs.len() - 1)], y0: ys[j.saturating_sub(1)], y1: ys[(j + 1).min(ys.len() - 1)] };
+        Local::new(ix, &b, nets, buf)
+    }
+    /// The window `b` (mm).
+    fn new(ix: &PrimIndex<'a>, b: &BBox, nets: &[u32], buf: &mut Vec<u32>) -> Local<'a> {
+        let lin = |a: f64, b: f64| -> Vec<f64> {
+            let n = (((b - a) / TOUCH_MM).ceil() as usize + 1).clamp(2, MAXS);
+            (0..n).map(|k| a + (b - a) * k as f64 / (n - 1) as f64).collect()
+        };
+        let (sx, sy) = (lin(b.x0, b.x1), lin(b.y0, b.y1));
+        let h = ((sx[1] - sx[0]).max(sy[1] - sy[0])).max(1e-9);
+        let bb = BBox { x0: sx[0], y0: sy[0], x1: *sx.last().unwrap(), y1: *sy.last().unwrap() }.grow(h);
+        let mut l = Local { cov: nets.iter().map(|&n| (n, [0u32; MAXS])).collect(), pads: Vec::new(), sx, sy };
+        ix.near(&bb, buf);
+        let n = l.sx.len();
+        for &pid in buf.iter() {
+            let p = &ix.prims[pid as usize];
+            let net = ix.net[pid as usize];
+            let slot = l.cov.iter().position(|c| c.0 == net);
+            if p.dark && slot.is_none() {
+                continue;
+            }
+            let mut pc = [0u32; MAXS];
+            paint_with(&l.sx, &l.sy, p, |q| pc[q / n] |= 1 << (q % n));
+            if !any(&pc) {
+                continue;
+            }
+            if p.dark {
+                let c = &mut l.cov[slot.unwrap()].1;
+                (0..MAXS).for_each(|r| c[r] |= pc[r]);
+                if let Some(pad) = &p.pad {
+                    l.pads.push((net, pad, pc));
+                }
+            } else {
+                for c in l.cov.iter_mut().map(|c| &mut c.1).chain(l.pads.iter_mut().map(|p| &mut p.2)) {
+                    (0..MAXS).for_each(|r| c[r] &= !pc[r]);
+                }
+            }
+        }
+        l
+    }
+    fn step(&self) -> f64 {
+        (self.sx[1] - self.sx[0]).max(self.sy[1] - self.sy[0])
+    }
+    /// Where nets `a` and `b` touch here (a gap under about [`TOUCH_MM`]), and the tie that joins them there.
+    /// Where the samples are coarser than that (large cells), each candidate contact is confirmed in a
+    /// small window around it, sampled finer.
+    fn touch(&self, ix: &PrimIndex<'a>, a: u32, b: u32, names: &[String], ties: &Ties, buf: &mut Vec<u32>, depth: usize) -> Option<Contact> {
+        let c = self.contact_bits(a, b)?;
+        let h = self.step();
+        if h <= 2.0 * TOUCH_MM || depth >= 4 {
+            return Some(self.contact(&c, a, b, names, ties));
+        }
+        let (n, m) = (self.sx.len(), self.sy.len());
+        let cand: Vec<(usize, usize)> = (0..m).flat_map(|r| (0..n).map(move |k| (k, r))).filter(|&(k, r)| c[r] >> k & 1 != 0).collect();
+        // at most 12 candidates, spread over the contact samples
+        let pick = cand.len().div_ceil(12).max(1);
+        for &(k, r) in cand.iter().step_by(pick) {
+            let w = BBox { x0: self.sx[k] - 1.5 * h, x1: self.sx[k] + 1.5 * h, y0: self.sy[r] - 1.5 * h, y1: self.sy[r] + 1.5 * h };
+            let fine = Local::new(ix, &w, &[a, b], buf);
+            if let Some(t) = fine.touch(ix, a, b, names, ties, buf, depth + 1) {
+                return Some(t);
+            }
+        }
+        None
+    }
+    /// Samples where `a` and `b` lie within one sample step of each other, if any.
+    fn contact_bits(&self, a: u32, b: u32) -> Option<Bits> {
+        let (n, m) = (self.sx.len(), self.sy.len());
+        let get = |x: u32| self.cov.iter().find(|c| c.0 == x).map(|c| c.1).unwrap_or([0; MAXS]);
+        let (ca, cb) = (get(a), get(b));
+        let c: Bits = {
+            let (u, v) = (and(&dilate(&ca, n, m), &cb), and(&dilate(&cb, n, m), &ca));
+            std::array::from_fn(|r| u[r] | v[r])
+        };
+        any(&c).then_some(c)
+    }
+    /// The contact `c` of `a` and `b`: its centre, the pads at it, and the tie that joins them there.
+    fn contact(&self, c: &Bits, a: u32, b: u32, names: &[String], ties: &Ties) -> Contact {
+        let c = *c;
+        let (n, m) = (self.sx.len(), self.sy.len());
+        let (mut sx, mut sy, mut cnt) = (0.0, 0.0, 0usize);
+        for r in 0..m {
+            for k in 0..n {
+                if c[r] >> k & 1 != 0 {
+                    sx += self.sx[k];
+                    sy += self.sy[r];
+                    cnt += 1;
+                }
+            }
+        }
+        let dc = dilate(&c, n, m);
+        let mut pads: Vec<String> = Vec::new();
+        for (net, pad, pc) in &self.pads {
+            if (*net == a || *net == b) && any(&and(pc, &dc)) {
+                let s = format!("{}.{} ({})", pad.0, pad.1, names[*net as usize]);
+                if !pads.contains(&s) {
+                    pads.push(s);
+                }
+            }
+        }
+        let mut tie = ties.pairs.iter().find(|t| (t.0 == a && t.1 == b) || (t.0 == b && t.1 == a)).map(|t| t.2.clone());
+        if tie.is_none() {
+            // a component tie: that component's pads of the two nets touch each other here
+            for r in &ties.refs {
+                let of = |x: u32| -> Bits {
+                    let mut o = [0u32; MAXS];
+                    for (net, pad, pc) in &self.pads {
+                        if *net == x && &pad.0 == r {
+                            (0..MAXS).for_each(|q| o[q] |= pc[q]);
+                        }
+                    }
+                    o
+                };
+                let (ra, rb) = (of(a), of(b));
+                if any(&ra) && any(&rb) && any(&and(&dilate(&ra, n, m), &rb)) {
+                    tie = Some(r.clone());
+                    break;
+                }
+            }
+        }
+        Contact { at: P2::new(sx / cnt as f64, sy / cnt as f64), pads, tie }
+    }
+}
+
+/// Declared ties resolved to net indices.
+struct Ties {
+    refs: Vec<String>,
+    /// (net a, net b, label)
+    pairs: Vec<(u32, u32, String)>,
 }
 
 /// Keep the mesh's connectivity equal to the layout's where gaps are close to a cell:
@@ -427,12 +716,40 @@ pub fn sheet_masks(g: &Grid, lay: &Layout) -> (Vec<SheetMask>, Vec<String>) {
 ///   node are removed (the other net's copper is the one the node lies in);
 /// - at a via barrel's nodes, copper edges of nets other than the barrel's are removed (a too-small antipad
 ///   in the raster). The barrel's net is the most common net among copper edges at its nodes.
-/// Copper without a net never conflicts. Returns the number of edges removed.
-pub fn resolve_conflicts(g: &Grid, lay: &Layout, masks: &mut [SheetMask], wild: &[bool]) -> usize {
+///
+/// Copper without a net never conflicts, nor does element copper ("~name", bars of ports and parts). At a
+/// two-net node the source copper (the Gerber primitives, `prim_nets` their net indices per sheet) is
+/// sampled over the adjacent cells: where the two nets really touch, the cut is reported as a junction,
+/// and a declared net tie (`lay.net_ties`) keeps both nets' edges there instead (listed in
+/// `SheetMask::tied`). Where they only come within a cell of each other, the cut is the intended one.
+pub fn resolve_conflicts(g: &Grid, lay: &Layout, masks: &mut [SheetMask], names: &[String], prim_nets: &[Vec<u32>]) -> Conflicts {
+    use rayon::prelude::*;
     let (nx, ny) = (g.nx(), g.ny());
+    // copper added for lumped elements ("~name") joins nets on purpose: it never conflicts
+    let wild: Vec<bool> = names.iter().map(|n| n.starts_with('~')).collect();
     // element copper and net-less copper are both net 0 here
     let real = |n: u32| if wild[n as usize] { 0 } else { n };
-    let mut removed = 0usize;
+    // a net by its full name, or by the last part of a hierarchical name ("RF_ANT" for "/radio/RF_ANT") when
+    // only one net ends so
+    let net_of = |s: &str| -> Option<u32> {
+        if let Some(i) = names.iter().position(|n| n == s) {
+            return Some(i as u32);
+        }
+        let mut it = names.iter().enumerate().filter(|(_, n)| n.rsplit('/').next() == Some(s));
+        match (it.next(), it.next()) {
+            (Some((i, _)), None) => Some(i as u32),
+            _ => None,
+        }
+    };
+    let ties = Ties {
+        refs: lay.net_ties.refs.clone(),
+        pairs: lay
+            .net_ties
+            .pairs
+            .iter()
+            .filter_map(|(a, b)| Some((net_of(a)?, net_of(b)?, format!("[{a:?}, {b:?}]"))))
+            .collect(),
+    };
     // incident in-plane edges of node (i, j): (is_x, q)
     let incident = |i: usize, j: usize| -> [(bool, Option<usize>); 4] {
         [
@@ -446,14 +763,17 @@ pub fn resolve_conflicts(g: &Grid, lay: &Layout, masks: &mut [SheetMask], wild: 
     let mut barrel_net: Vec<(Vec<(usize, usize)>, usize, usize, u32)> = Vec::new();
     for b in &lay.barrels {
         let (cells, k0, k1) = barrel_nodes(g, b);
-        let mut count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        let mut count: Vec<(u32, usize)> = Vec::new();
         for m in masks.iter().filter(|m| m.k >= k0 && m.k <= k1) {
             for &(i, j) in &cells {
                 for (isx, q) in incident(i, j) {
                     if let Some(q) = q {
                         let (on, net) = if isx { (m.ex[q], real(m.exn[q])) } else { (m.ey[q], real(m.eyn[q])) };
                         if on && net != 0 {
-                            *count.entry(net).or_default() += 1;
+                            match count.iter_mut().find(|c| c.0 == net) {
+                                Some(c) => c.1 += 1,
+                                None => count.push((net, 1)),
+                            }
                         }
                     }
                 }
@@ -462,60 +782,134 @@ pub fn resolve_conflicts(g: &Grid, lay: &Layout, masks: &mut [SheetMask], wild: 
         let net = count.into_iter().max_by_key(|&(n, c)| (c, std::cmp::Reverse(n))).map(|x| x.0).unwrap_or(0);
         barrel_net.push((cells, k0, k1, net));
     }
-    for m in masks.iter_mut() {
-        // barrels first: they are drilled copper of their own net
-        for (cells, k0, k1, bnet) in &barrel_net {
-            if *bnet == 0 || m.k < *k0 || m.k > *k1 {
-                continue;
-            }
-            for &(i, j) in cells {
-                for (isx, q) in incident(i, j) {
-                    if let Some(q) = q {
-                        let (on, net) = if isx { (&mut m.ex[q], real(m.exn[q])) } else { (&mut m.ey[q], real(m.eyn[q])) };
-                        if *on && net != 0 && net != *bnet {
-                            *on = false;
-                            removed += 1;
-                        }
-                    }
+    let xmm: Vec<f64> = g.x.iter().map(|v| v * 1e3).collect();
+    let ymm: Vec<f64> = g.y.iter().map(|v| v * 1e3).collect();
+    // per node where two nets met: (net a, net b, contact, edges removed)
+    type Event = (u32, u32, Contact, usize);
+    let per_sheet: Vec<(usize, usize, Vec<Event>)> = masks
+        .par_iter_mut()
+        .enumerate()
+        .map(|(si, m)| {
+            let (mut removed, mut near_gap) = (0usize, 0usize);
+            let mut events: Vec<Event> = Vec::new();
+            // barrels first: they are drilled copper of their own net
+            for (cells, k0, k1, bnet) in &barrel_net {
+                if *bnet == 0 || m.k < *k0 || m.k > *k1 {
+                    continue;
                 }
-            }
-        }
-        // copper of two nets at one node
-        for j in 0..ny {
-            for i in 0..nx {
-                let inc = incident(i, j);
-                let mut nets: [(u32, usize); 4] = [(0, 0); 4];
-                let mut nn = 0;
-                for (isx, q) in inc {
-                    if let Some(q) = q {
-                        let (on, net) = if isx { (m.ex[q], real(m.exn[q])) } else { (m.ey[q], real(m.eyn[q])) };
-                        if on && net != 0 {
-                            if let Some(e) = nets[..nn].iter_mut().find(|e| e.0 == net) {
-                                e.1 += 1;
-                            } else {
-                                nets[nn] = (net, 1);
-                                nn += 1;
+                for &(i, j) in cells {
+                    for (isx, q) in incident(i, j) {
+                        if let Some(q) = q {
+                            let (on, net) = if isx { (&mut m.ex[q], real(m.exn[q])) } else { (&mut m.ey[q], real(m.eyn[q])) };
+                            if *on && net != 0 && net != *bnet {
+                                *on = false;
+                                removed += 1;
                             }
                         }
                     }
                 }
-                if nn < 2 {
-                    continue;
-                }
-                let keep = nets[..nn].iter().max_by_key(|e| (e.1, std::cmp::Reverse(e.0))).unwrap().0;
-                for (isx, q) in inc {
-                    if let Some(q) = q {
-                        let (on, net) = if isx { (&mut m.ex[q], real(m.exn[q])) } else { (&mut m.ey[q], real(m.eyn[q])) };
-                        if *on && net != 0 && net != keep {
-                            *on = false;
-                            removed += 1;
+            }
+            let empty: Vec<u32> = Vec::new();
+            let (prims, pnets) = match lay.sheets.get(si) {
+                Some(s) => (&s.prims[..], prim_nets.get(si).unwrap_or(&empty)),
+                None => (&[][..], &empty),
+            };
+            let pnets: Vec<u32> = (0..prims.len()).map(|p| pnets.get(p).map(|&n| real(n)).unwrap_or(0)).collect();
+            let ix = PrimIndex::new(prims, &pnets);
+            let mut buf = Vec::new();
+            // copper of two nets at one node
+            for j in 0..ny {
+                for i in 0..nx {
+                    let inc = incident(i, j);
+                    let mut nets: [(u32, usize); 4] = [(0, 0); 4];
+                    let mut nn = 0;
+                    for (isx, q) in inc {
+                        if let Some(q) = q {
+                            let (on, net) = if isx { (m.ex[q], real(m.exn[q])) } else { (m.ey[q], real(m.eyn[q])) };
+                            if on && net != 0 {
+                                if let Some(e) = nets[..nn].iter_mut().find(|e| e.0 == net) {
+                                    e.1 += 1;
+                                } else {
+                                    nets[nn] = (net, 1);
+                                    nn += 1;
+                                }
+                            }
+                        }
+                    }
+                    if nn < 2 {
+                        continue;
+                    }
+                    let keep = nets[..nn].iter().max_by_key(|e| (e.1, std::cmp::Reverse(e.0))).unwrap().0;
+                    let here: Vec<u32> = nets[..nn].iter().map(|e| e.0).collect();
+                    let loc = Local::at_node(&ix, &xmm, &ymm, i, j, &here, &mut buf);
+                    for &x in here.iter().filter(|&&x| x != keep) {
+                        let con = loc.touch(&ix, keep, x, names, &ties, &mut buf, 0);
+                        let (a, b) = (keep.min(x), keep.max(x));
+                        if let Some(c) = con.as_ref().filter(|c| c.tie.is_some()) {
+                            m.tied.push((j * nx + i, a, b));
+                            events.push((a, b, Contact { at: c.at, pads: c.pads.clone(), tie: c.tie.clone() }, 0));
+                            continue;
+                        }
+                        let mut e = 0;
+                        for (isx, q) in inc {
+                            if let Some(q) = q {
+                                let (on, net) = if isx { (&mut m.ex[q], real(m.exn[q])) } else { (&mut m.ey[q], real(m.eyn[q])) };
+                                if *on && net == x {
+                                    *on = false;
+                                    e += 1;
+                                }
+                            }
+                        }
+                        removed += e;
+                        match con {
+                            Some(c) => events.push((a, b, c, e)),
+                            None => near_gap += e,
                         }
                     }
                 }
             }
+            (removed, near_gap, events)
+        })
+        .collect();
+    // one junction per sheet, net pair and tie within 0.5 mm of each other
+    let mut rep = Conflicts::default();
+    for (si, (removed, near_gap, events)) in per_sheet.into_iter().enumerate() {
+        rep.removed += removed;
+        rep.near_gap += near_gap;
+        let sheet = lay.sheets.get(si).map(|s| s.name.clone()).unwrap_or_default();
+        let mut cl: Vec<(Junction, BBox, f64, f64)> = Vec::new();
+        for (a, b, c, e) in events {
+            let (an, bn) = (names[a as usize].clone(), names[b as usize].clone());
+            let hit = cl.iter_mut().find(|(jn, bb, _, _)| jn.a == an && jn.b == bn && jn.tie == c.tie && bb.grow(0.5).contains(c.at));
+            match hit {
+                Some((jn, bb, sx, sy)) => {
+                    jn.nodes += 1;
+                    jn.edges += e;
+                    bb.add(c.at);
+                    *sx += c.at.x;
+                    *sy += c.at.y;
+                    for p in c.pads {
+                        if !jn.pads.contains(&p) {
+                            jn.pads.push(p);
+                        }
+                    }
+                }
+                None => {
+                    let mut bb = BBox::empty();
+                    bb.add(c.at);
+                    cl.push((Junction { sheet: sheet.clone(), a: an, b: bn, at: c.at, nodes: 1, edges: e, pads: c.pads, tie: c.tie }, bb, c.at.x, c.at.y));
+                }
+            }
+        }
+        for (mut jn, _, sx, sy) in cl {
+            jn.at = P2::new(sx / jn.nodes as f64, sy / jn.nodes as f64);
+            jn.pads.sort();
+            rep.junctions.push(jn);
         }
     }
-    removed
+    let labels = lay.net_ties.refs.iter().cloned().chain(lay.net_ties.pairs.iter().map(|(a, b)| format!("[{a:?}, {b:?}]")));
+    rep.unused_ties = labels.filter(|l| !rep.junctions.iter().any(|j| j.tie.as_ref() == Some(l))).collect();
+    rep
 }
 
 /// Mesh nodes (i, j) and the z-edge range k0..k1 a barrel occupies: the nodes within its radius, or the

@@ -88,7 +88,7 @@ pub fn line(run: &Runner, w0: f64, h: f64, er: f64, hc: f64, nz: usize, inset: f
             .collect();
         (Grid { x: mm(ax.clone()), y: mm(ax), z: mm(zl) }, s, pr)
     };
-    let lay = Layout { sheets: vec![Sheet { name: "top".into(), z: h, prims: vec![strip] }], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![] };
+    let lay = Layout { sheets: vec![Sheet { name: "top".into(), z: h, prims: vec![strip] }], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     // feed: a vertical port across the strip's start
     let port = if !angle45 {
         Lumped { name: "P1".into(), axis: 2, lo: [0.0, -w / 2.0 + hc, 0.0], hi: [0.0, w / 2.0 - hc, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true }
@@ -142,7 +142,7 @@ pub fn gap(run: &Runner, w: f64, h: f64, er: f64, gap: f64, hc: f64, nz: usize, 
     let g = Grid { x: mm(xl), y: mm(yl), z: mm(zl) };
     let a = poly(&[(xp0 - 0.3, -w / 2.0), (xg0, -w / 2.0), (xg0, w / 2.0), (xp0 - 0.3, w / 2.0)]);
     let b = poly(&[(xg1, -w / 2.0), (xp1 + 0.3, -w / 2.0), (xp1 + 0.3, w / 2.0), (xg1, w / 2.0)]);
-    let lay = Layout { sheets: vec![Sheet { name: "top".into(), z: h, prims: vec![a, b] }], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![] };
+    let lay = Layout { sheets: vec![Sheet { name: "top".into(), z: h, prims: vec![a, b] }], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     let wp = (w / 2.0 - hc).max(0.0);
     let port = |name: &str, x: f64| Lumped { name: name.into(), axis: 2, lo: [x, -wp, 0.0], hi: [x, wp, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let p = build(&g, &lay, &[port("P1", xp0), port("P2", xp1)], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None, edge });

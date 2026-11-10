@@ -89,13 +89,29 @@ pub(crate) fn labels(g: &Grid, lay: &Layout) -> (Vec<u32>, Vec<Bridge>) {
         }
     }
     let has_ez = |id: usize| ez[id / 64] >> (id % 64) & 1 != 0;
+    // nodes where a declared net tie kept two nets' copper joined: not a short between that pair
+    let mut tied = vec![0u64; n.div_ceil(64)];
+    let mut tied_at: Vec<(usize, u32, u32)> = Vec::new();
+    for m in &masks {
+        for &(q, a, b) in &m.tied {
+            let id = m.k * plane + q;
+            tied[id / 64] |= 1 << (id % 64);
+            tied_at.push((id, a, b));
+        }
+    }
+    tied_at.sort_unstable();
+    let is_tied = |id: usize, a: u32, b: u32| tied[id / 64] >> (id % 64) & 1 != 0 && tied_at.binary_search(&(id, a.min(b), a.max(b))).is_ok();
     let mut label = vec![0u32; n];
     let mut pairs: rustc_hash::FxHashMap<(u32, u32), Bridge> = Default::default();
     let pos = |id: usize| -> [f64; 3] {
         let (i, j, k) = (id % nx, (id / nx) % ny, id / plane);
         [g.x[i] * 1e3, g.y[j] * 1e3, g.z[k] * 1e3]
     };
-    let mut meet = |a: u32, b: u32, id: usize, via: bool| {
+    // `from`: the node on the other end of the edge the labels met across (or `id` itself)
+    let mut meet = |a: u32, b: u32, id: usize, from: usize, via: bool| {
+        if !via && (is_tied(id, a, b) || is_tied(from, a, b)) {
+            return;
+        }
         let key = (a.min(b), a.max(b));
         let e = pairs.entry(key).or_insert_with(|| Bridge { a: names[key.0 as usize].clone(), b: names[key.1 as usize].clone(), count: 0, at: pos(id), via });
         e.count += 1;
@@ -116,7 +132,7 @@ pub(crate) fn labels(g: &Grid, lay: &Layout) -> (Vec<u32>, Vec<Bridge>) {
                         label[node] = net;
                         queue.push_back(node);
                     } else if label[node] != net {
-                        meet(label[node], net, node, false);
+                        meet(label[node], net, node, node, false);
                     }
                 }
             }
@@ -155,7 +171,7 @@ pub(crate) fn labels(g: &Grid, lay: &Layout) -> (Vec<u32>, Vec<Bridge>) {
                 label[m] = l;
                 queue.push_back(m);
             } else if label[m] != l {
-                meet(l, label[m], m, via);
+                meet(l, label[m], m, id, via);
             }
         }
     }
@@ -230,14 +246,18 @@ mod tests {
                 }
             }
         }
+        let tied: BTreeSet<(usize, u32, u32)> = masks.iter().flat_map(|m| m.tied.iter().map(move |&(q, a, b)| (m.k * nx * ny + q, a, b))).collect();
         let mut label = vec![0u32; n];
         let mut pairs: HashMap<(u32, u32), Bridge> = HashMap::new();
         let pos = |id: usize| -> [f64; 3] {
             let (i, j, k) = (id % nx, (id / nx) % ny, id / (nx * ny));
             [g.x[i] * 1e3, g.y[j] * 1e3, g.z[k] * 1e3]
         };
-        let meet = |a: u32, b: u32, id: usize, via: bool, pairs: &mut HashMap<(u32, u32), Bridge>| {
+        let meet = |a: u32, b: u32, id: usize, from: usize, via: bool, pairs: &mut HashMap<(u32, u32), Bridge>| {
             let key = (a.min(b), a.max(b));
+            if !via && (tied.contains(&(id, key.0, key.1)) || tied.contains(&(from, key.0, key.1))) {
+                return;
+            }
             let e = pairs.entry(key).or_insert_with(|| Bridge { a: names[key.0 as usize].clone(), b: names[key.1 as usize].clone(), count: 0, at: pos(id), via });
             e.count += 1;
         };
@@ -252,7 +272,7 @@ mod tests {
                         label[node] = net;
                         queue.push_back(node);
                     } else if label[node] != net {
-                        meet(label[node], net, node, false, &mut pairs);
+                        meet(label[node], net, node, node, false, &mut pairs);
                     }
                 }
             }
@@ -287,7 +307,7 @@ mod tests {
                     label[m] = l;
                     queue.push_back(m);
                 } else if label[m] != l {
-                    meet(l, label[m], m, via, &mut pairs);
+                    meet(l, label[m], m, id, via, &mut pairs);
                 }
             }
         }

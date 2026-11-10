@@ -49,6 +49,12 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   small for the mesh), that copper's edges are dropped. Before every run a connectivity check floods net
   labels through copper and barrels and warns about any remaining place where two nets meet
   (`mesh_shorts` in `result.json`). Copper added for elements (bridges, shorts) is exempt.
+  At each node where two nets meet, the source copper (the Gerber primitives) is sampled around it at
+  about 5 µm. Where the two nets really touch or overlap, the cut is a modelling error, not a clearance:
+  set-up warns with the nets, the place and the X2 pad attributes. `"net_ties": ["AE1", ["RF_ANT", "GND"]]`
+  (components, whose pads of different nets touch, and net pairs) keeps both nets' edges at such
+  junctions, and only there. The same nets stay apart where they merely come within a cell, and a tie isn't
+  reported as a mesh short.
 - **Stack-up.** Dielectric thicknesses, εr and tan δ come from the `.gbrjob`, with 4.5 / 0.02 when it gives
   none, or from the spec's `"dielectrics": [{"t": mm, "er": .., "tand": ..}, ...]` (top to bottom between
   the copper layers). The bottom copper is at z = 0 and copper thickness is ignored. Dielectric fills cells

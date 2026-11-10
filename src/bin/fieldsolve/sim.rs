@@ -1057,7 +1057,25 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         }
     }
     barrels.extend(posts);
-    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) }, bodies };
+    let net_ties = parse_net_ties(&sp)?;
+    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) }, bodies, net_ties };
+    // copper of two nets that touches in the Gerbers but that the net-aware raster cuts apart (a net tie, a
+    // feed strip into a shorted antenna's ground pad), and declared ties that joined nothing
+    {
+        let t = std::time::Instant::now();
+        let (_, _, rep) = crate::model::sheet_masks_report(&grid, &layout);
+        let (warn, info) = junction_checks(&rep, cx.kicad);
+        for l in &info {
+            eprintln!("fieldsolve: {l}");
+        }
+        for w in warn {
+            eprintln!("fieldsolve: WARNING: {w}");
+            checks.push(w);
+        }
+        if t.elapsed().as_secs_f64() > 2.0 {
+            eprintln!("fieldsolve: junction check took {:.1} s", t.elapsed().as_secs_f64());
+        }
+    }
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
     let sheet_names: Vec<String> = layout.sheets.iter().map(|s| s.name.clone()).collect();
@@ -1787,6 +1805,63 @@ pub fn apply_edits(board: &mut Board, spec: &Value, kicad: bool) -> Result<(), S
         l.prims.push(Prim { shape, dark, net: if dark { net.map(String::from) } else { None }, pad: None });
     }
     Ok(())
+}
+
+/// `"net_ties": ["AE1", ["RF_ANT", "GND"]]`: components whose pads of different nets are joined where they
+/// touch (a net-tie footprint, a printed antenna whose feed pad runs into its grounded pad), and net pairs
+/// joined wherever their copper touches. Copper of those nets that only comes close stays apart.
+pub fn parse_net_ties(sp: &Value) -> Result<crate::model::NetTies, String> {
+    let mut t = crate::model::NetTies::default();
+    let Some(v) = sp.get("net_ties").filter(|v| !v.is_null()) else {
+        return Ok(t);
+    };
+    let bad = || "\"net_ties\" is a list of reference designators (\"AE1\") and net pairs ([\"RF_ANT\", \"GND\"])".to_string();
+    for e in v.as_array().ok_or_else(bad)? {
+        match e {
+            Value::String(r) => t.refs.push(r.clone()),
+            Value::Array(p) if p.len() == 2 && p.iter().all(|x| x.is_string()) => {
+                t.pairs.push((p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string()))
+            }
+            _ => return Err(bad()),
+        }
+    }
+    Ok(t)
+}
+
+/// Report lines for conflict resolution: (warnings, plain lines). Coordinates in the user's frame.
+pub fn junction_checks(rep: &crate::model::Conflicts, kicad: bool) -> (Vec<String>, Vec<String>) {
+    let (mut warn, mut info) = (Vec::new(), Vec::new());
+    let at = |p: P2| format!("({:.3}, {:.3}) mm", p.x, if kicad { -p.y } else { p.y });
+    let pads = |j: &crate::model::Junction| if j.pads.is_empty() { String::new() } else { format!(", pads {}", j.pads.join(", ")) };
+    let cut: Vec<_> = rep.junctions.iter().filter(|j| j.tie.is_none()).collect();
+    for j in cut.iter().take(8) {
+        warn.push(format!(
+            "copper of nets {:?} and {:?} touches in the Gerbers on {} at {}{}, but the net-aware raster cut it apart \
+             ({} edge(s) at {} mesh node(s)). A net tie or a feed into a shorted antenna is then fed through a gap: \
+             declare it in \"net_ties\" ({}the pair [{:?}, {:?}]). Otherwise it is a short in the layout.",
+            j.a, j.b, j.sheet, at(j.at), pads(j), j.edges, j.nodes,
+            j.pads.first().and_then(|p| p.split('.').next()).map(|r| format!("the component \"{r}\", or ")).unwrap_or_default(), j.a, j.b
+        ));
+    }
+    if cut.len() > 8 {
+        warn.push(format!("... and {} more places where copper of two nets touches but was cut apart", cut.len() - 8));
+    }
+    for j in rep.junctions.iter().filter(|j| j.tie.is_some()) {
+        info.push(format!("net tie {}: {:?} and {:?} kept joined on {} at {} ({} mesh node(s){})", j.tie.as_ref().unwrap(), j.a, j.b, j.sheet, at(j.at), j.nodes, pads(j)));
+    }
+    for t in &rep.unused_ties {
+        warn.push(format!(
+            "\"net_ties\" entry {t} joined nothing: no copper of two of its nets touches where the raster had to separate them \
+             (check the reference designator or net names; ties act only where the copper touches in the Gerbers)"
+        ));
+    }
+    if rep.near_gap > 0 {
+        info.push(format!(
+            "raster: {} copper edge(s) removed where two nets come within a cell of each other without touching (sub-cell clearances, kept apart)",
+            rep.near_gap
+        ));
+    }
+    (warn, info)
 }
 
 /// Nets other than `net` whose copper (the last object covering a point decides, as in Gerber) lies under
