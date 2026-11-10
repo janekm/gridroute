@@ -97,8 +97,12 @@ pub struct Board {
     pub plane_regions: Vec<PlaneRegion>,
     /// Areas of plane layers kept free of pour (cutouts).
     pub fill_keepouts: Vec<(usize, Vec<P2>)>,
-    /// Rule areas that forbid vias but not tracks (e.g. along an RF line): wires pass, vias stay out.
+    /// Rule areas that forbid vias: those that forbid vias but not tracks (e.g. along an RF line: wires pass, vias
+    /// stay out), and those that forbid both (also keepout objects for the tracks, whose checks reach only near
+    /// their edge).
     pub via_keepouts: Vec<Vec<P2>>,
+    /// Bounding box of each via keepout (lo, hi).
+    pub via_keepout_bb: Vec<(P2, P2)>,
     /// RF frontend nets (bench/pcb/topor_rf.py): each kept on the one layer it starts on, no vias, with why.
     pub rf_nets: Vec<(u32, String)>,
     pub name: String,
@@ -452,10 +456,18 @@ impl Board {
                     mask |= 1 << i;
                 }
             }
+            let no_vias = a["vias"].as_bool().unwrap_or(true);
             for pg in a["polygons"].as_array().into_iter().flatten() {
                 keep(poly(pg), mask, 0.0, Kind::Keepout, "rule_area", &mut objs);
+                // one that forbids vias as well keeps them out wherever they are in it: the keepout object's checks
+                // see only its edge near a via, not a via deep inside a large area
+                if no_vias {
+                    via_keepouts.push(poly(pg));
+                }
             }
         }
+        via_keepouts.retain(|k| k.len() >= 3);
+        let via_keepout_bb = via_keepouts.iter().map(|k| bbox_of(k)).collect();
         let outline = poly(&m["outline"]);
         let outline_holes: Vec<Vec<P2>> = m["outline_holes"].as_array().into_iter().flatten().map(|h| poly(h)).collect();
         // nets with no pads still get an id via net_class (ignored)
@@ -468,6 +480,30 @@ impl Board {
                 (Some(&n), Some(l)) => (n, l),
                 _ => continue,
             };
+            plane_regions.push(PlaneRegion {
+                net,
+                layer,
+                priority: r["priority"].as_i64().unwrap_or(0),
+                poly: ppoly(&r["points"]),
+                holes: r["holes"].as_array().into_iter().flatten().map(|h| ppoly(h)).collect(),
+            });
+        }
+        // pours on signal layers (e.g. a VDD pour on an inner signal layer under a chip, filled after routing): the
+        // net becomes a plane net of that layer, so its pads drop to vias and a via inside the pour joins it, as
+        // with plane_regions; the layer stays a signal layer and other nets still route across it (the pour fills
+        // round them later). The layer list above is settled first, so the pour does not make it a plane layer.
+        for r in cold["signal_pours"].as_array().into_iter().flatten() {
+            let (net, layer) = match (r["net"].as_str().and_then(|n| net_index.get(n)), layers.iter().position(|l| Some(l.as_str()) == r["layer"].as_str())) {
+                (Some(&n), Some(l)) => (n, l),
+                _ => continue,
+            };
+            if !signal.contains(&layer) {
+                return Err(format!("signal_pours: {} is not a signal layer", layers[layer]));
+            }
+            match nets[net as usize].plane {
+                Some(p) if p != layer => return Err(format!("signal_pours: net {} is already a plane net of {}", nets[net as usize].name, layers[p])),
+                _ => nets[net as usize].plane = Some(layer),
+            }
             plane_regions.push(PlaneRegion {
                 net,
                 layer,
@@ -589,6 +625,7 @@ impl Board {
             plane_regions,
             fill_keepouts,
             via_keepouts,
+            via_keepout_bb,
             rf_nets,
             name,
             size,
@@ -691,7 +728,8 @@ impl Board {
     /// of its regions, clear of the region's edge and holes, of higher-priority pours of other nets on
     /// that layer and of fill keepouts (the pour keeps its clearance and needs room for a thermal).
     pub fn via_kept_out(&self, pos: P2, r: f64) -> bool {
-        self.via_keepouts.iter().any(|k| point_in_poly(k, pos) || poly_edge_dist(k, pos) < r + 0.01)
+        let m = r + 0.01;
+        self.via_keepouts.iter().zip(&self.via_keepout_bb).any(|(k, &(lo, hi))| pos.x > lo.x - m && pos.x < hi.x + m && pos.y > lo.y - m && pos.y < hi.y + m && (point_in_poly(k, pos) || poly_edge_dist(k, pos) < m))
     }
 
     pub fn in_plane(&self, net: u32, pos: P2, r: f64) -> bool {
@@ -792,7 +830,20 @@ fn place_necks(objs: &mut Vec<ObjSpec>, escapes: &[(usize, f64, Option<P2>, f64)
     }
     // stub ends laid so far: (end, class half-width, clearance, net)
     let mut ends: Vec<(P2, f64, f64, u32)> = Vec::new();
-    for &(pi, e, axis, ec) in escapes {
+    // the stubs narrower than their class first, then those at the class width with a smaller clearance (an RF
+    // line's first stretch at a fine-pitch radio): the wire from such a stub's end needs its class clearance, so
+    // that end is placed clear of the narrow stubs beside it (laid the other way round, a neighbour's stub can
+    // come within the small clearance of it, and no wire can ever leave it; TOPOR_NECK_ORDER_OFF: in model order)
+    let class_width = |&(pi, e, _, _): &(usize, f64, Option<P2>, f64)| -> bool {
+        let o = &objs[pi];
+        let ni = &nets[o.net as usize];
+        (0..32).find(|&l| o.layers == 1 << l).map_or(false, |l| e <= 0.0 || e >= ni.wmin[l].max(ni.wpref[l]))
+    };
+    let mut order = escapes.to_vec();
+    if std::env::var("TOPOR_NECK_ORDER_OFF").is_err() {
+        order.sort_by_key(|x| class_width(x));
+    }
+    for &(pi, e, axis, ec) in &order {
         let pad = objs[pi].clone();
         let net = pad.net;
         let ni = &nets[net as usize];
@@ -867,32 +918,48 @@ fn place_necks(objs: &mut Vec<ObjSpec>, escapes: &[(usize, f64, Option<P2>, f64)
         if 2.0 * across >= wide && gap(pad.center, pad.center, wide / 2.0, my_clear) >= 0.0 {
             continue;
         }
-        // where the pad's copper ends along the stub
-        let core = pad.pts.iter().map(|&q| (q - pad.center).dot(dir)).fold(0.0, f64::max);
-        let reach = core + pad.r;
-        // a stub as narrow as the pad runs in from its centre, over its copper, and is modelled from just past
-        // the pad (touching copper); one wider than the pad would stand out along its sides, so it starts, in the
-        // model and on the board, just past the pad's core, inside its rounded end, and ends round there
-        let wider = e > 2.0 * across + 1e-9;
-        let start = if wider { pad.center + dir * (core + 0.01) } else { pad.center + dir * (reach + e / 2.0 + 0.01) };
-        // (KiCad joins a track to a pad its end lies in: on a square-cornered pad that end stays just inside)
-        let from = if wider { pad.center + dir * (core + 0.01).min(reach - 0.005) } else { pad.center };
-        let mut found = None;
-        let mut why = "no room for the class width within 2.5 mm";
-        let mut t = (start - pad.center).dot(dir) + 0.01;
-        while t < reach + 2.5 {
-            let j = pad.center + dir * t;
-            if gap(start, j, e / 2.0, stub_clear) < 0.0 {
-                why = "the stub runs into other copper first";
-                break;
+        // out along the pad's axis; where that runs into other copper (a corner pin whose neighbour's stub is in the
+        // way), off its side that faces out of the part too (TOPOR_NECK_SIDE_OFF: the axis only)
+        let mut dirs = vec![dir];
+        if axis.is_some() && out_dir.norm() > 1e-6 && std::env::var("TOPOR_NECK_SIDE_OFF").is_err() {
+            for d in [dir.perp(), dir.perp() * -1.0] {
+                if d.dot(out_dir) > 0.25 * out_dir.norm() {
+                    dirs.push(d);
+                }
             }
-            if gap(j, j, wide / 2.0, my_clear) >= 0.005 {
-                found = Some(j);
-                break;
-            }
-            t += 0.01;
         }
-        let Some(j) = found else {
+        let mut why = "no room for the class width within 2.5 mm";
+        let mut laid = None;
+        for &dir in &dirs {
+            let across = pad.pts.iter().map(|&q| (q - pad.center).dot(dir.perp()).abs()).fold(0.0, f64::max) + pad.r;
+            // where the pad's copper ends along the stub
+            let core = pad.pts.iter().map(|&q| (q - pad.center).dot(dir)).fold(0.0, f64::max);
+            let reach = core + pad.r;
+            // a stub as narrow as the pad runs in from its centre, over its copper, and is modelled from just past
+            // the pad (touching copper); one wider than the pad would stand out along its sides, so it starts, in the
+            // model and on the board, just past the pad's core, inside its rounded end, and ends round there
+            let wider = e > 2.0 * across + 1e-9;
+            let start = if wider { pad.center + dir * (core + 0.01) } else { pad.center + dir * (reach + e / 2.0 + 0.01) };
+            // (KiCad joins a track to a pad its end lies in: on a square-cornered pad that end stays just inside)
+            let from = if wider { pad.center + dir * (core + 0.01).min(reach - 0.005) } else { pad.center };
+            let mut t = (start - pad.center).dot(dir) + 0.01;
+            while t < reach + 2.5 {
+                let j = pad.center + dir * t;
+                if gap(start, j, e / 2.0, stub_clear) < 0.0 {
+                    why = "the stub runs into other copper first";
+                    break;
+                }
+                if gap(j, j, wide / 2.0, my_clear) >= 0.005 {
+                    laid = Some((start, from, j));
+                    break;
+                }
+                t += 0.01;
+            }
+            if laid.is_some() {
+                break;
+            }
+        }
+        let Some((start, from, j)) = laid else {
             failed.push(format!("{} ({})", pad.name, why));
             continue;
         };
@@ -922,6 +989,12 @@ fn clip_half(poly: &[P2], o: P2, n: P2) -> Vec<P2> {
     dedup_hull(&out)
 }
 
+fn bbox_of(pts: &[P2]) -> (P2, P2) {
+    let lo = pts.iter().fold(p2(f64::INFINITY, f64::INFINITY), |a, q| p2(a.x.min(q.x), a.y.min(q.y)));
+    let hi = pts.iter().fold(p2(f64::NEG_INFINITY, f64::NEG_INFINITY), |a, q| p2(a.x.max(q.x), a.y.max(q.y)));
+    (lo, hi)
+}
+
 fn dedup_hull(pts: &[P2]) -> Vec<P2> {
     let mut v: Vec<P2> = Vec::new();
     for &p in pts {
@@ -933,5 +1006,48 @@ fn dedup_hull(pts: &[P2]) -> Vec<P2> {
         convex_hull(&v)
     } else {
         v
+    }
+}
+
+#[cfg(test)]
+mod signal_pour_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn model(pours: serde_json::Value) -> serde_json::Value {
+        json!({
+            "name": "t", "size": [20.0, 20.0], "origin": [0.0, 0.0],
+            "outline": [[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], "outline_holes": [],
+            "layers": ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], "rules": [0.15, 0.15, 0.5, 0.3],
+            "classes": {"Default": [0.15, 0.15, 0.5, 0.3]}, "net_class": {"VDD": "Default", "GND": "Default"},
+            "pads": [
+                {"ref": "C1", "num": "1", "x": 2.0, "y": 2.0, "w": 0.5, "h": 0.5, "rot": 0, "shape": "rect", "layers": "F", "net": "VDD"},
+                {"ref": "C2", "num": "1", "x": 8.0, "y": 8.0, "w": 0.5, "h": 0.5, "rot": 0, "shape": "rect", "layers": "F", "net": "VDD"}
+            ],
+            "zones": [], "rule_areas": [], "routable_nets": 1,
+            "global_rules": {"min_track_width": 0.1, "min_copper_edge_clearance": 0.3},
+            "cold_routing": {"planes": {"GND": "B.Cu"}, "signal_pours": pours}
+        })
+    }
+
+    /// A pour on a signal layer makes its net a plane net of that layer (vias inside join it) while the layer
+    /// stays a signal layer for every other net.
+    #[test]
+    fn a_signal_layer_pour_joins_vias_inside_it_and_keeps_the_layer_routable() {
+        let m = model(json!([{"net": "VDD", "layer": "In2.Cu", "points": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]}]));
+        let b = Board::load(&m).expect("model");
+        let in2 = b.layers.iter().position(|l| l == "In2.Cu").unwrap();
+        assert!(b.signal.contains(&in2), "In2 stays a signal layer");
+        let vdd = b.net_index["VDD"];
+        assert_eq!(b.nets[vdd as usize].plane, Some(in2));
+        assert!(b.in_plane(vdd, p2(5.0, 5.0), 0.3), "a via inside the pour joins it");
+        assert!(!b.in_plane(vdd, p2(15.0, 15.0), 0.3), "outside it does not");
+        assert!(!b.in_plane_on(vdd, p2(5.0, 5.0), 0.25, Some(0)), "an F.Cu pad over it still needs a via");
+    }
+
+    #[test]
+    fn a_signal_pour_on_a_plane_layer_is_refused() {
+        let m = model(json!([{"net": "VDD", "layer": "B.Cu", "points": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]}]));
+        assert!(Board::load(&m).is_err());
     }
 }

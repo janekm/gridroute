@@ -190,6 +190,11 @@ candidates in about a minute.
 ## Caveats
 
 - **Free-space values only.** No enclosure, solder mask or battery; the antenna will also be trimmed.
+- **The feed-to-antenna junction is intact (checked Nov 2026).** The same PIFA footprint on the eBUS B
+  board was fed through a raster gap: its feed pad (RF_ANT) and grounded pad (GND) touch, and the
+  net-aware raster cut them apart. Here, the KiCad conversion's Gerbers label ANT1's pads 1 and 2, R70.1
+  and C20 all GND. The raster therefore never separated the feed from the antenna, and the junction
+  check reports nothing near ANT1 on any of the MTH specs.
 - **The mesh isn't fully converged.**
   - From 0.05 to 0.035 mm, the antenna's resistance rises by about 6 Ω and its radiated share at
     2.40 GHz by up to 8 points.

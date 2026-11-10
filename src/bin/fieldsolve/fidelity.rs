@@ -15,6 +15,10 @@
 //!   of `min_settle_periods` periods. The energy/port decay rule is then only recorded (`standard_rule_step`),
 //!   since on a resonant antenna it can fire while the radiated power still creeps; a run that reaches
 //!   `max_steps` is reported as incomplete.
+//! - at `screening`, also stops on the late-time extrapolation of the objective (`objective.extrapolate`,
+//!   src/bin/fieldsolve/extrap.rs) and reports the extrapolated values: on the MTH PIFA it stops at about
+//!   0.4x the steps of the stability rule, within 0.08 dB of the run's late-time value. The other levels
+//!   keep the plain stability rule; `"fidelity": {"extrapolate": false}` turns it off, `true` turns it on.
 //!
 //! Every override is recorded (`"fidelity"` in result.json) together with the actual mesh, time step,
 //! excitation count, stop reasons and objective stability. Policy numbers can be overridden in the spec's
@@ -33,11 +37,12 @@ pub struct Policy {
     pub tol_db: f64,
     pub window_periods: f64,
     pub min_settle_periods: f64,
+    pub extrapolate: bool,
 }
 
 impl Policy {
     pub fn defaults(level: &str) -> Result<Policy, String> {
-        let p = |cell_scale, tol_db, window_periods, min_settle_periods| Policy { level: level.to_string(), cell_scale, protect_margin: 0.25, tol_db, window_periods, min_settle_periods };
+        let p = |cell_scale, tol_db, window_periods, min_settle_periods| Policy { level: level.to_string(), cell_scale, protect_margin: 0.25, tol_db, window_periods, min_settle_periods, extrapolate: level == "screening" };
         match level {
             // stop rules from replays on the MTH PIFA's full-mesh history (docs/fieldsolve-fast-mode.md)
             "screening" => Ok(p(2.0, 0.2, 4.0, 8.0)),
@@ -61,6 +66,10 @@ pub fn resolve(spec: &Value, level: &str) -> Result<Value, String> {
                 *slot = v;
                 user_set.push(k);
             }
+        }
+        if let Some(v) = user.get("extrapolate").and_then(|v| v.as_bool()) {
+            pol.extrapolate = v;
+            user_set.push("extrapolate");
         }
     }
     let mut s = spec.clone();
@@ -130,6 +139,10 @@ pub fn resolve(spec: &Value, level: &str) -> Result<Value, String> {
         o["tol_db"] = json!(pol.tol_db);
         o["window_periods"] = json!(pol.window_periods);
         o["min_settle_periods"] = json!(pol.min_settle_periods);
+        // the spec's own objective.extrapolate wins over the policy
+        if pol.extrapolate && o.get("extrapolate").is_none() {
+            o["extrapolate"] = json!(true);
+        }
         set(&mut s, &mut overrides, "objective", o, "stop rule parameters of the policy");
     }
     // per-level spec switches, e.g. {"set": {"screening": {"conformal": true}}}: model corrections that help
@@ -142,7 +155,7 @@ pub fn resolve(spec: &Value, level: &str) -> Result<Value, String> {
     }
     s["fidelity_record"] = json!({
         "level": level,
-        "policy": {"cell_scale": pol.cell_scale, "protect_margin_mm": pol.protect_margin, "tol_db": pol.tol_db, "window_periods": pol.window_periods, "min_settle_periods": pol.min_settle_periods},
+        "policy": {"cell_scale": pol.cell_scale, "protect_margin_mm": pol.protect_margin, "tol_db": pol.tol_db, "window_periods": pol.window_periods, "min_settle_periods": pol.min_settle_periods, "extrapolate": pol.extrapolate},
         "user_overrides": user_set,
         "overrides": overrides,
         "physics_kept": "whole board, materials, loss model, ports, PML and air as in the spec",
@@ -204,6 +217,11 @@ mod tests {
         assert_eq!(s["farfield"]["freqs"], json!([2.4e9, 2.44e9, 2.48e9, 4.88e9]));
         assert_eq!(s["stop"], "objective");
         assert_eq!(s["objective"]["tol_db"], json!(0.2));
+        assert_eq!(s["objective"]["extrapolate"], json!(true));
+        let mut off = spec();
+        off["fidelity"]["extrapolate"] = json!(false);
+        assert!(resolve(&off, "screening").unwrap()["objective"].get("extrapolate").is_none());
+        assert!(resolve(&spec(), "refined").unwrap()["objective"].get("extrapolate").is_none());
         // ports and protected features keep the spec's 0.05 mm; the user's own refine box is kept
         let r = s["refine"].as_array().unwrap();
         assert_eq!(r[0], json!({"box": [0, 0, 1, 1], "cell": 0.02}));

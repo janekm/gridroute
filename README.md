@@ -6,6 +6,8 @@ Fast building blocks for grid-based PCB routers, and a board toolkit built on th
 - **`gridroute.board`**: a scriptable layout toolkit for "routing by program". Layout scripts place footprints explicitly and route nets in an order and on layers they choose. The toolkit provides the rasters, the router, plane drops, rip-up and reroute, speculative search and a persistent route cache. It saves the result as JSON for a board writer.
 - **`gridroute.kicad`**: KiCad XML netlist loader, and a footprint-geometry dump that runs under KiCad's Python.
 
+**Routing whole boards: topor is the default engine.** `src/bin/topor` is a topological (rubber-band, TopoR-style) router with exact geometry; `bench/pcb/run.py` and `suite.py` use it unless given `--engine grid`. It also has a `--fast` mode that reports what blocks the unrouted nets. The grid router below remains for layout scripts and as `--engine grid`. See [bench/pcb/README.md](bench/pcb/README.md).
+
 It was built for a scripted KiCad layout flow, a 4-signal-layer, 483-part, 170 × 111 mm board on a 0.05 mm grid. On it, the full placement-and-routing script went from **390 s to 5.7 s** cold and **1.0 s** for an unchanged re-run. The resulting board passes KiCad DRC.
 
 ## Build

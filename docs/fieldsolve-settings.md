@@ -53,6 +53,12 @@ then start the long run.
 | `port X reached max_steps before any stop rule` | The run was cut off before it converged, so the S-parameters are an estimate. | Raise `max_steps`, or loosen `end_db` |
 | `power balance ... check the port's placement` (on a full run) | The port's energy does not add up. The port bridge may miss a pad, or short the port. | Check the printed nets under each port, and `fieldsolve raster` |
 | `edit ... (net X) overlaps copper of net Y` | An `"add"` edit carries a net and lies on another net's copper. The net-aware raster cuts copper of two nets apart where they touch, so the added copper is **not** connected to it. | Leave `"net"` out of edits that must join existing copper (an inverted-F's short into the ground pour). Net-less copper never conflicts. |
+| `copper of nets X and Y touches in the Gerbers ... but the net-aware raster cut it apart` | Copper of two nets touches or overlaps in the source geometry (gap under about 5 µm), and the raster separated it as if it were a sub-cell clearance. A net-tie footprint, or a printed antenna whose feed pad (net RF_ANT) runs into its grounded pad, is then fed through a gap capacitance. The warning gives the layer, the place and the pads (X2 `.P`). | If the layout joins them on purpose: `"net_ties": ["AE1"]` (the component) or `[["RF_ANT", "GND"]]` (the pair). The run then prints `net tie ...: kept joined at ...`. Otherwise it is a real short in the Gerbers (zones of two nets overlapping, a pad drawn over a track); check it in the layout. |
+| `"net_ties" entry X joined nothing` | No copper of two of its nets touches where the raster had to separate them. | Check the reference designator and net names (as in the Gerbers' X2 attributes). |
+
+Sub-cell clearances (two nets within a cell but not touching) are cut as always. They aren't warned
+about: set-up prints one plain `raster: N copper edge(s) removed where two nets come within a cell ...`
+line.
 
 ## Geometry: the fine region
 
@@ -117,6 +123,23 @@ then start the long run.
   - The loads sit on the nearest mesh node, so they add no mesh lines.
   - The run prints how many pins were loaded, and how many land on no ground copper (those loads float).
   - Use the chip's pad capacitance from its datasheet: about 3 pF for nRF52840 GPIOs.
+- **Net ties and printed antennas:** the raster cuts copper of two nets apart wherever they meet in the
+  mesh. Where the layout joins two nets on purpose, declare it:
+
+  ```json
+  "net_ties": ["AE1", ["RF_ANT", "GND"]]
+  ```
+
+  - A string is a component: its pads of different nets stay joined where they touch each other (a
+    net-tie footprint; a PIFA whose feed pad reaches into its grounded pad, such as
+    `WCH_24G_PIFA_10mm_mod` with `net_tie_pad_groups "1,2"`).
+  - A pair joins those two nets wherever their copper touches. Names are the X2 net names; the last part
+    of a hierarchical name is enough when only one net ends that way (`"RF_ANT"` for
+    `/MCU and radio/RF_ANT`).
+  - Either way, only where the source copper touches. The RF track beside the GND pour elsewhere stays
+    apart.
+  - A net-less `"add"` edit over the junction does the same job (net-less copper never conflicts), but
+    it has to be placed by hand.
 - **Enclosures and off-board antennas** (`"bodies"`, `"layers"`; see [fieldsolve.md](fieldsolve.md#usage)):
   - Set `"f_loss"` to the band centre (e.g. 2.44e9). Bodies take a constant conductivity from `tand` at
     `f_loss`, not the wideband model.
@@ -136,6 +159,9 @@ then start the long run.
   and `tune` can place any part without a new EM run. Check the printed nets under each port. A
   rotated-part port gets a staircase bridge, and both pads must be reached.
 - **Band:** `fmax` at least 3.2× the operating frequency if you want H2 and H3. `nf` 300-400.
+  A run refuses any `"farfield"`, `"fields"` or `"objective"` frequency above `fmax`: the far-field box is
+  sampled at 3 × `fmax`, and a result above `fmax` is aliased (14 % wrong at 1.3 × `fmax`). The default
+  `fmax` is 3 GHz, so a spec that lists 4.88 GHz without setting `fmax` used to return a wrong number.
 - **Far field:** list frequencies on a dense grid across the band, 0.02-0.05 GHz apart, plus the
   harmonics. A board can carry a narrow, lossy resonance about 0.05 GHz wide that removes 5-12 points of
   efficiency at one frequency and moves between meshes. Three spot frequencies (2.40 / 2.44 / 2.48 GHz) can
@@ -179,6 +205,31 @@ then start the long run.
     capacitors outside the ROI into shorts (`"decouple"`) changed nothing.
 
 ## Fixed issues (keep in mind when reading older results)
+
+- **A net tie cut by the raster (warned since Nov 2026; `"net_ties"`).** The eBUS_IF B board's printed PIFA
+  AE1 (`WCH_24G_PIFA_10mm_mod`, `net_tie_pad_groups "1,2"`) has its feed pad (RF_ANT) reaching 0.1 mm
+  into its grounded pad. The raster cut the two apart at 12 mesh nodes without any warning, and the
+  antenna was fed through a ~0.85 pF series gap: a constant reactance of about −80 Ω and R peaks of
+  20-50 Ω instead of about 360 Ω. The eBUS B runs since then bridge it with a net-less edit (`TIE` in
+  `tools/ebus_b_rf.py`); `"net_ties": ["AE1"]` does the same job.
+  - **Audit of the earlier specs (186 of them, dry set-up):**
+    - **MTH R7A PIFA: not affected.** In the KiCad conversion's X2 Gerbers, ANT1's pads 1 and 2, R70.1
+      and C20 all carry net GND: the converter merged feed and short into one net, so the raster never
+      had two nets to cut there. What it does flag on MTH is far from the antenna: a few points where
+      the B.Cu GND and VCC3V3 zone fills touch, and U4 pad 3 touching VCC_S18. Cutting these is what the
+      layout means.
+    - **eBUS B:** the two runs without the bridge (`b_free`, `b_dry`) are affected. The runs with it
+      are not.
+    - **Earlier eBUS IFA studies** with `"net": "ANT"` edits over the GND pour: the case above, already
+      warned about and re-run.
+    - **1BP `1bp_gbr_nordic` (the first Nordic-layout transplant):** its ANT pad abuts the GND pour
+      with zero clearance. The cut models the intended gap, and the tidied transplant
+      (`1bp_gbr_nordic2`) is clean.
+    - **Elsewhere on 1BP:** two names for one signal (SCL2 and `/Page 2: .../SCL2`) at U1's pads, and
+      DCC/DEC4 against GND (1-3 edges each). None of it is on the RF path.
+    - **eBUS chip-antenna `ebus_chip_in1`:** its In1 GND patch is drawn over signal tracks, which end at
+      the patch's edge. That is the intent, and the edit warning already reported it.
+    - **AMOLED, nRF52840 DK, Nordic reference boards, eBUS FPC/YL1439/chip runs:** clean.
 
 - **An antenna short drawn with its own net (warned since Nov 2026).** Two eBUS inverted-F studies drew the
   whole antenna, short included, as `"net": "ANT"` over the GND pour. The raster cut the short off, so the

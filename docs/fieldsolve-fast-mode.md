@@ -485,6 +485,81 @@ Caveats:
 - **Mesh convergence of the widened-ROI model is not demonstrated** (calibration note above).
 - **Fabrication tolerance.** Each move is a fraction of a millimetre, so the result should be checked at
   ±0.1 mm on each parameter before the last tenth of a dB is trusted.
+- **The arm tip was in coarse cells.** The ROI starts at x 141.5, so the tuned arm tip (x 140.5) sat in
+  graded 0.3–0.4 mm cells. The `arm` values of this search are therefore suspect; the second search below
+  uses an ROI from x 140.0.
+- **Loss model:** the calibration and this search used `"loss": {"copper": true}`, the plane-pair stand-in
+  (`fieldsolve-settings.md`), which leaves the copper lossless. Their absolute values are optimistic.
+
+### Second MTH search: raised radiator, straight feed, real copper
+
+The first search's best point cut the ground pour back by 0.9 mm, which left C20's pads standing out of
+the ground edge, and it moved the feed strip off the ladder line. The second search changes the geometry
+differently:
+- **The radiator is raised** towards the board edge instead (`raise`, 0 to 0.3 mm in 0.05 mm steps). At
+  0.3 mm, the radiator's top is 0.2 mm from the board edge at y 70.0. The ground pour is not touched.
+- **The feed is a straight strip at the as-built x** (153.95–154.45), in line with the ladder, and is no
+  longer a parameter. The feed and the short leg grow with `raise`.
+- **The arm length** stays a parameter (−1.5 to +1.7 mm in 0.1 mm steps).
+- **ROI from x 140.0**, so the arm tip stays in the fine region over the whole range.
+- **`"conductor": true`** (surface-impedance copper) with the wideband dielectric, as for every
+  far-field run since the settings guide.
+
+Surrogate search, budget 12 screening + 4 full solves (5.72e12 cells × steps). The GPU was shared with
+another session's runs for most of it, so the 4 h 35 min wall time says nothing about the method.
+
+| full solve at (arm, raise) mm | predicted | full | why |
+|---|---|---|---|
+| (−0.2, +0.20) | −0.85 | −1.030 | periodic promotion |
+| (+0.1, +0.25) | −0.84 | −0.836 | final |
+| **(+0.2, +0.30)** | −0.81 | **−0.823** | final |
+| (+0.2, +0.25) | −0.84 | −0.845 | final |
+
+The search model shorts C6, C7 and C23, which the R7A production BOM does not fit, and it leaves U12's
+pins open. The values are antenna-alone worst-in-band values, as in the first search. They are not
+comparable with the first search's values (lossless copper, coarse arm tip, a different feed). The
+optimum sits at the upper bound of `raise`: the radiator wants to be further from the ground than the
+board allows. Once `raise` is high enough, the arm length matters little (±0.1 mm changes the value by
+about 0.02 dB). The search was not repeated with the BOM-correct model below.
+
+**7-port extraction and ladder re-tune.** Both geometries were extracted as 7-ports (CHIP and the six
+ladder positions) with the BOM-correct model:
+- only the fitted shorts;
+- `"pin_loads": [{"ref": "U12", "c": 3e-12}]`, which loads 60 pins;
+- `"decouple"` for VCC_S18, which shorts C43 outside the ROI;
+- `"preset": "antenna"`;
+- far field every 0.02 GHz from 2.40 to 2.48 GHz, plus H2 and H3.
+
+Each run took 29–30 min (12.9 M cells, 51–60k steps per port, idle GPU). Then `tune` ran on each with the
+Stage 1 set-up: CHIP drive, the Nordic reference network as target, the five band frequencies, and H2 and
+H3 radiated no worse than with the as-built BOM. The values are radiated power per watt available.
+
+| geometry | ladder | 2.40 | 2.42 | 2.44 | 2.46 | 2.48 GHz | worst | H2 / H3 radiated |
+|---|---|---|---|---|---|---|---|---|
+| as built | as-built BOM (C59 1p, L4 4.7n, C60 1.2p, L5 2.2n, R70 0R, C20 open) | −1.91 | −1.93 | −2.09 | −2.39 | −2.82 | −2.82 dB | −23.1 / −22.2 dB |
+| as built | re-tuned: C59 open, L4 1n, C60 0.6p, L5 1.2n, R70 1.6n, C20 open | −1.40 | −1.39 | −1.39 | −1.39 | −1.41 | **−1.41 dB** | −23.3 / −29.4 dB |
+| v2 (+0.2, +0.3) | as-built BOM | −2.30 | −2.10 | −2.00 | −2.04 | −2.22 | −2.30 dB | −23.0 / −22.3 dB |
+| v2 (+0.2, +0.3) | re-tuned: C59 open, L4 0R, C60 0.7p, L5 2n, R70 2n, C20 0.5p | −1.23 | −1.18 | −1.17 | −1.19 | −1.28 | **−1.28 dB** | −23.1 / −23.5 dB |
+
+- **The ladder is worth far more than the geometry.** Re-tuning gains 1.41 dB on the as-built antenna.
+  With re-tuned ladders, v2 is 0.13 dB better. That is less than the unproven mesh error of this model, so
+  the geometry change is not shown to help. With the as-built BOM, v2 is 0.52 dB better.
+- **The as-built re-tune is close to Stage 1's answer** (C59 open, L4 1.0n, C60 0.8p, L5 1.5n, R70 0R),
+  and it is flat across the band (−1.39 to −1.41 dB). R70 becomes a 1.6 nH series inductor. H3 drops by
+  7 dB.
+- **The ranks below the top are within 0.02–0.07 dB** of it on both geometries. Pick by part
+  availability and tolerance, not by rank.
+- **These results replace an earlier table** from extractions that shorted C6, C7 and C23 and left U12
+  open. That table had other ladders (as built −1.41 dB with C59 0.9p, L4 2.2n; v2 −1.24 dB with L5 3.9n)
+  and a 9 dB H3 drop on v2 that this model does not show.
+- **H2 is mesh-sensitive.** Both runs ring at a mode near 4.95 GHz (Q about 65–69), 70 MHz from H2. The
+  H2 limit compares values that this mode can move.
+- **The coarse-copper warning was not acknowledged.** It lists 59 F.Cu areas at y 87.75–95.5, below the
+  fine region, in cells up to 1.5 mm. The RF path (CHIP pin at y 83.25 to C20) is inside the fine
+  region; which nets the flagged tracks carry is not checked. The withdrawn extractions did not print
+  this warning.
+- The same caveats hold: the mesh convergence of the widened ROI is not demonstrated, and ±0.1 mm
+  tolerances are unchecked. The re-tuned values use the Murata part models of Stage 1.
 
 ## Stage 4: where the remaining time goes
 
@@ -557,19 +632,95 @@ What each option could and could not buy:
 3. **Adjoint** only if free-form geometry becomes a goal.
 4. **No frequency-domain backend** for now.
 
-None of these is implemented here.
+Step 1 is implemented below ("Late-time extrapolation"). Step 2 was prototyped and is not in the tree
+("Subgridding: status").
+
+### Late-time extrapolation
+
+`"objective": {..., "extrapolate": true}` (or an object with `snapshots`, `window`, `order`, `tol_db`,
+`stable_checks`, `stop`) estimates where the objective is heading, and can stop the run there.
+Implementation: `src/bin/fieldsolve/extrap.rs`.
+
+Why not extrapolate the objective's dB history directly: a scalar matrix-pencil fit on the saved
+histories was off by 0.1–1 dB. The objective is a ratio of spectra, not a sum of decaying exponentials.
+The fit therefore works on quantities that are:
+- **Poles:** after the source, the excited port's voltage is a sum of damped modes. The fit is linear
+  prediction on that voltage, sampled every `dft_every` steps over the last `window` samples, order 24.
+  Its roots come from Aberth–Ehrlich iteration, and its amplitudes from least squares with unit-norm
+  columns. Without that normalisation, fast spurious poles swamp the ridge term.
+- **Accumulator limits:** every running DFT (port spectra and the far-field box) tends to its limit X∞
+  as X(t) = X∞ + Σ_p c_p e^{λ_p t}, with λ_p = s_p − iω. Ten snapshots of all accumulators, taken at
+  the objective checks, give the weights w for X∞ = Σ w_m X(t_m), by least squares on [1, e^{λ_p t_m}].
+  The same weights apply to every accumulator.
+- **Port voltages:** these are continued with the fitted modes, so the port spectra and the far field
+  stay consistent.
+
+The objective is evaluated on the extrapolated accumulators at every check, and recorded as
+`objective_extrap_history` in result.json. With `stop` on, the run stops when the extrapolated values
+have stayed within `tol_db` (0.05 dB) over `stable_checks` (4) checks. It then reports the
+extrapolated port spectra and far field, with `"extrapolated": true`.
+
+**Test case: a printed dipole over ground** (`extrapolated_stop_matches_a_long_run`). The run stops at
+14 000 steps against 57 000 for the port-decay rule. Total radiated power stays within 0.0004 dB, and
+accepted power within 0.009 dB.
+
+**MTH PIFA, as built.** These two runs used the same model as the Stage 2 calibration: ROI from x 141.5
+and the lossless-copper stand-in, so they compare directly with the 150 000-step reference. Both ran
+long, recording the extrapolated history with the stop off.
+
+| run | extrapolated stop at | error then, per frequency | raw objective's error then | stop without it |
+|---|---|---|---|---|
+| screening (4.45 M cells) | 20 224 steps | −0.045 / −0.058 / −0.081 dB | 1.07 dB | 49 152 steps (stability rule) |
+| full (13 M cells) | 24 064 steps | −0.121 / −0.140 / −0.131 dB | 1.21 dB | about 55 000 steps |
+
+The errors are taken against each run's late-time mean: screening from 70 000 to 120 000 steps, full
+from the 150 000-step reference's 100 000–150 000 steps.
+
+- **Screening:** the extrapolation stops 2.4× sooner. Its error is small next to screening's own error
+  against full fidelity (standard deviation 0.57 dB, Stage 2), and space mapping absorbs a steady bias.
+  Between 17 000 and 120 000 steps the extrapolated value stays within ±0.12 dB of the late-time value,
+  apart from one check at +0.21 dB.
+- **Full fidelity:** the stop comes 2.3× sooner but 0.12–0.14 dB low, and the estimate does not keep
+  improving. Between 34 000 and 54 000 steps some fits jump by up to 1 dB, and at about 48 000 steps
+  three checks agree within 0.02 dB while all of them are 0.11 dB high. The stop rule's 0.05 dB spread
+  measures whether the fit is stable, not whether it is right.
+- **Failed fits** give values near the −30 dB floor; the spread test rejects them.
+
+**Policy:** `screening` turns extrapolation on by default (`"fidelity": {"extrapolate": false}` turns
+it off). `refined`, `validated` and plain runs keep the stability or port-decay rule. Extrapolated
+full-fidelity values are recorded but are not trusted for a stop. The surrogate search's full solves,
+which pick the final geometry, are therefore unchanged.
+
+
+### Subgridding: status
+
+A prototype refined a box around the feed by 3× in space and time, overlapping the coarse grid. The fine
+grid's boundary E came from the coarse grid by interpolation in space and time, and the coarse E inside
+the box was restricted from the fine grid. It was unstable on a lossless test cavity: energy grew after a
+few thousand steps, and a one-cell buffer made it grow faster. One-way coupling (coarse drives fine, no
+feedback) was stable, which places the fault in the feedback through the interface.
+
+A scheme that is stable by construction needs an interface with a provable discrete energy balance:
+- Collino, Fouquet and Joly (JCP 2006) use a conservative space-time mortar;
+- Bekmambetova, Zhang and Triverio (IEEE TAP 2017) use a dissipative subgridding that passes a passivity
+  check.
+
+That is several days of work for at most about 1.9× on screening runs. The prototype and a brief for that
+work are kept with the session notes, not in the tree.
 
 ## Follow-ups
 
 - **Re-calibrate with the model corrections** from `fieldsolve-adaptive-mesh` (`make_specs.py --edges`),
-  then decide whether `refined` earns its place and drop its window to 4 periods.
+  then decide whether `refined` earns its place and drop its window to 4 periods. Use `"conductor": true`
+  for the calibration too.
 - **Mesh convergence of the widened-ROI MTH model** (a 0.035 mm run, or the corrections on), before
   geometry results are compared with measurements.
-- **MTH geometry:**
-  - widen the `arm` and `clr` ranges;
-  - check fabrication tolerance (±0.1 mm) at the best point;
-  - take a 7-port extraction of it for `tune`, so the ladder is retuned for the new geometry.
-- **Late-time extrapolation** of the objective (Stage 4), offline on the saved histories first.
-- **Subgridding or local time stepping** of protected features (up to 2.1× on screening).
+- **MTH v2 geometry:**
+  - with re-tuned ladders, v2 gains only 0.13 dB over the as-built geometry. A two-mesh check (0.7 ×
+    `cell`) of both 7-ports would show whether that is real;
+  - check fabrication tolerance (±0.1 mm on `arm` and `raise`) with the re-tuned ladder;
+  - `raise` is limited by the board edge. More clearance would have to come from the outline;
+  - acknowledge or resolve the coarse-copper warning of the BOM-correct 7-ports.
+- **Subgridding with an energy-stable interface** (above), for up to about 1.9× on screening.
 - **A single-feed screening option for multiport tuning extractions**, since all-port screening saves only
   1.8× in cells × steps.

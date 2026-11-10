@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Route an immutable fixture, saving the exact inputs beside the candidate."""
+"""Route an immutable fixture, saving the exact inputs beside the candidate.
+
+The engine is topor (target/release/topor, via topor_engine.route) unless --engine grid, or "engine": "grid"
+in --options-json, picks the grid router (gridroute.router). For topor only the deadline is used from the
+options, plus "topor_args" (extra arguments for topor route); the grid flags and options do not apply.
+"""
 import argparse,dataclasses,hashlib,json,os,pathlib,shutil,sys,resource,time
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT.parents[1]/'python'))
@@ -52,9 +57,15 @@ def run(case,out,options,margin_factor=.5,copper_grow_factor=0.,continuous_check
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('case');p.add_argument('--out',type=pathlib.Path,required=True)
+    p.add_argument('--engine',choices=['topor','grid'],help='routing engine (default topor, or "engine" in --options-json)')
     p.add_argument('--deadline',type=float,default=60);p.add_argument('--no-fanout',action='store_true')
     p.add_argument('--no-refinement',action='store_true');p.add_argument('--pitch',type=float,default=.05)
-    p.add_argument('--options-json',default='{}',help='Options fields, plus margin_factor and copper_grow_factor')
-    a=p.parse_args();kw=dict(pitch=a.pitch,fallback_pitches=() if a.no_refinement else (a.pitch/2,),fanout=not a.no_fanout,deadline_seconds=a.deadline)
-    kw.update(json.loads(a.options_json));margin=kw.pop('margin_factor',.5);grow=kw.pop('copper_grow_factor',0.);continuous=kw.pop('continuous_check',False)
+    p.add_argument('--options-json',default='{}',help='Options fields, plus margin_factor and copper_grow_factor (grid); deadline_seconds and topor_args (topor)')
+    a=p.parse_args();opts=json.loads(a.options_json);engine=a.engine or opts.pop('engine','topor');opts.pop('engine',None)
+    if engine=='topor':
+        import topor_engine
+        raise SystemExit(topor_engine.route(a.case,a.out,opts.get('deadline_seconds',a.deadline),engine_args=opts.get('topor_args','')))
+    opts.pop('topor_args',None)
+    kw=dict(pitch=a.pitch,fallback_pitches=() if a.no_refinement else (a.pitch/2,),fanout=not a.no_fanout,deadline_seconds=a.deadline)
+    kw.update(opts);margin=kw.pop('margin_factor',.5);grow=kw.pop('copper_grow_factor',0.);continuous=kw.pop('continuous_check',False)
     run(a.case,a.out,Options(**kw),margin,grow,continuous)

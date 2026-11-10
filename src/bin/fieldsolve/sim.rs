@@ -318,7 +318,7 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         bodies.push(crate::bodies::Body { name, eps, tand, shape, metal });
     }
     let cell = num(&sp, "cell", 0.1);
-    let fmax = num(&sp, "fmax", 3e9);
+    let fmax = spec_fmax(&sp);
     let air = num(&sp, "air", 3.0);
     let air_z = num(&sp, "air_z", 4.0);
     let npml = num(&sp, "pml", 8.0) as usize;
@@ -1057,7 +1057,25 @@ pub fn setup(cx: &mut Ctx) -> Result<Setup, String> {
         }
     }
     barrels.extend(posts);
-    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) }, bodies };
+    let net_ties = parse_net_ties(&sp)?;
+    let layout = Layout { sheets, slabs, barrels, outline: cx.board.outline.clone(), copper_window: if extent_board { None } else { Some(dom) }, bodies, net_ties };
+    // copper of two nets that touches in the Gerbers but that the net-aware raster cuts apart (a net tie, a
+    // feed strip into a shorted antenna's ground pad), and declared ties that joined nothing
+    {
+        let t = std::time::Instant::now();
+        let (_, _, rep) = crate::model::sheet_masks_report(&grid, &layout);
+        let (warn, info) = junction_checks(&rep, cx.kicad);
+        for l in &info {
+            eprintln!("fieldsolve: {l}");
+        }
+        for w in warn {
+            eprintln!("fieldsolve: WARNING: {w}");
+            checks.push(w);
+        }
+        if t.elapsed().as_secs_f64() > 2.0 {
+            eprintln!("fieldsolve: junction check took {:.1} s", t.elapsed().as_secs_f64());
+        }
+    }
     let fmin = num(&sp, "fmin", fmax / 300.0);
     let nf = num(&sp, "nf", 300.0) as usize;
     let sheet_names: Vec<String> = layout.sheets.iter().map(|s| s.name.clone()).collect();
@@ -1367,12 +1385,50 @@ impl RunOpts {
             fidelity: spec.get("fidelity_record").cloned().unwrap_or(Value::Null),
         }
     }
+
+    /// Every frequency a run evaluates besides the port sweep must lie at or below `fmax`. The far-field box
+    /// and the field snapshots are transformed from samples taken at 3 fmax (`dft_every`), so a frequency f
+    /// above fmax aliases with 3 fmax - f, where the Gaussian still carries energy: about 3.5 % of the power
+    /// at 1.2 fmax, 14 % at 1.3 fmax, and nothing meaningful from 1.5 fmax. The objective's port powers are
+    /// transformed at the full rate, but the excitation is 20 dB down at fmax and falls fast above it.
+    pub fn check_freqs(&self, fmax: f64) -> Result<(), String> {
+        let far = self.farfield.as_ref().map(|f| f.freqs.as_slice()).unwrap_or(&[]);
+        let (band, harm) = self.objective.as_ref().map(|o| (o.band.as_slice(), o.harmonics.as_slice())).unwrap_or((&[], &[]));
+        for (key, list, sampled) in [("farfield.freqs", far, true), ("fields.freqs", self.fields.as_slice(), true), ("objective.band", band, false), ("objective.harmonics", harm, false)] {
+            let over: Vec<String> = list.iter().filter(|&&f| f > fmax * (1.0 + 1e-9)).map(|f| format!("{:.3}", f * 1e-9)).collect();
+            if over.is_empty() {
+                continue;
+            }
+            let top = list.iter().cloned().fold(0.0, f64::max);
+            return Err(format!(
+                "\"{key}\": {} GHz is above \"fmax\" ({:.3} GHz). {} Set \"fmax\" to at least {:.3e} (the highest frequency asked for), \
+                 or drop the frequency.",
+                over.join(", "),
+                fmax * 1e-9,
+                if sampled {
+                    "These transforms sample the fields at 3 x fmax, so a result above fmax is aliased with a lower frequency and wrong."
+                } else {
+                    "The excitation has almost no energy above fmax, so the objective there is not meaningful."
+                },
+                top
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `"fmax"` of a run spec: the top of the port sweep and of the excitation's band (default 3 GHz).
+pub fn spec_fmax(spec: &Value) -> f64 {
+    num(spec, "fmax", 3e9)
 }
 
 /// Run every excitation of a board spec, write results to `out`.
 pub fn run(cx: &mut Ctx, out: &Path, backend: Backend) -> Result<Value, String> {
+    // before the set-up: a frequency above fmax should fail at once, not after the mesh is built
+    let ro = RunOpts::from_spec(&cx.spec);
+    ro.check_freqs(spec_fmax(&cx.spec))?;
     let st = setup(cx)?;
-    run_setup(&st, out, backend, &RunOpts::from_spec(&cx.spec))
+    run_setup(&st, out, backend, &ro)
 }
 
 /// Frequency of the strongest component in the last third of a port signal, between `f0` and `f1` (the
@@ -1431,6 +1487,7 @@ pub fn z_from_s(s: &[Vec<Cx>], z0: f64) -> Option<Vec<Vec<Cx>>> {
 
 /// Run a prepared set-up, write `scene.json`, `result.json`, Touchstone and fields to `out`.
 pub fn run_setup(st: &Setup, out: &Path, backend: Backend, ro: &RunOpts) -> Result<Value, String> {
+    ro.check_freqs(st.fmax)?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let t0 = std::time::Instant::now();
     let p = build(&st.grid, &st.layout, &st.lumped, &st.opts);
@@ -1787,6 +1844,63 @@ pub fn apply_edits(board: &mut Board, spec: &Value, kicad: bool) -> Result<(), S
         l.prims.push(Prim { shape, dark, net: if dark { net.map(String::from) } else { None }, pad: None });
     }
     Ok(())
+}
+
+/// `"net_ties": ["AE1", ["RF_ANT", "GND"]]`: components whose pads of different nets are joined where they
+/// touch (a net-tie footprint, a printed antenna whose feed pad runs into its grounded pad), and net pairs
+/// joined wherever their copper touches. Copper of those nets that only comes close stays apart.
+pub fn parse_net_ties(sp: &Value) -> Result<crate::model::NetTies, String> {
+    let mut t = crate::model::NetTies::default();
+    let Some(v) = sp.get("net_ties").filter(|v| !v.is_null()) else {
+        return Ok(t);
+    };
+    let bad = || "\"net_ties\" is a list of reference designators (\"AE1\") and net pairs ([\"RF_ANT\", \"GND\"])".to_string();
+    for e in v.as_array().ok_or_else(bad)? {
+        match e {
+            Value::String(r) => t.refs.push(r.clone()),
+            Value::Array(p) if p.len() == 2 && p.iter().all(|x| x.is_string()) => {
+                t.pairs.push((p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string()))
+            }
+            _ => return Err(bad()),
+        }
+    }
+    Ok(t)
+}
+
+/// Report lines for conflict resolution: (warnings, plain lines). Coordinates in the user's frame.
+pub fn junction_checks(rep: &crate::model::Conflicts, kicad: bool) -> (Vec<String>, Vec<String>) {
+    let (mut warn, mut info) = (Vec::new(), Vec::new());
+    let at = |p: P2| format!("({:.3}, {:.3}) mm", p.x, if kicad { -p.y } else { p.y });
+    let pads = |j: &crate::model::Junction| if j.pads.is_empty() { String::new() } else { format!(", pads {}", j.pads.join(", ")) };
+    let cut: Vec<_> = rep.junctions.iter().filter(|j| j.tie.is_none()).collect();
+    for j in cut.iter().take(8) {
+        warn.push(format!(
+            "copper of nets {:?} and {:?} touches in the Gerbers on {} at {}{}, but the net-aware raster cut it apart \
+             ({} edge(s) at {} mesh node(s)). A net tie or a feed into a shorted antenna is then fed through a gap: \
+             declare it in \"net_ties\" ({}the pair [{:?}, {:?}]). Otherwise it is a short in the layout.",
+            j.a, j.b, j.sheet, at(j.at), pads(j), j.edges, j.nodes,
+            j.pads.first().and_then(|p| p.split('.').next()).map(|r| format!("the component \"{r}\", or ")).unwrap_or_default(), j.a, j.b
+        ));
+    }
+    if cut.len() > 8 {
+        warn.push(format!("... and {} more places where copper of two nets touches but was cut apart", cut.len() - 8));
+    }
+    for j in rep.junctions.iter().filter(|j| j.tie.is_some()) {
+        info.push(format!("net tie {}: {:?} and {:?} kept joined on {} at {} ({} mesh node(s){})", j.tie.as_ref().unwrap(), j.a, j.b, j.sheet, at(j.at), j.nodes, pads(j)));
+    }
+    for t in &rep.unused_ties {
+        warn.push(format!(
+            "\"net_ties\" entry {t} joined nothing: no copper of two of its nets touches where the raster had to separate them \
+             (check the reference designator or net names; ties act only where the copper touches in the Gerbers)"
+        ));
+    }
+    if rep.near_gap > 0 {
+        info.push(format!(
+            "raster: {} copper edge(s) removed where two nets come within a cell of each other without touching (sub-cell clearances, kept apart)",
+            rep.near_gap
+        ));
+    }
+    (warn, info)
 }
 
 /// Nets other than `net` whose copper (the last object covering a point decides, as in Gerber) lies under

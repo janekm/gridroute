@@ -49,6 +49,12 @@ Roden and Gedney). openEMS is only run externally as a cross-check, so its GPL d
   small for the mesh), that copper's edges are dropped. Before every run a connectivity check floods net
   labels through copper and barrels and warns about any remaining place where two nets meet
   (`mesh_shorts` in `result.json`). Copper added for elements (bridges, shorts) is exempt.
+  At each node where two nets meet, the source copper (the Gerber primitives) is sampled around it at
+  about 5 µm. Where the two nets really touch or overlap, the cut is a modelling error, not a clearance:
+  set-up warns with the nets, the place and the X2 pad attributes. `"net_ties": ["AE1", ["RF_ANT", "GND"]]`
+  (components, whose pads of different nets touch, and net pairs) keeps both nets' edges at such
+  junctions, and only there. The same nets stay apart where they merely come within a cell, and a tie isn't
+  reported as a mesh short.
 - **Stack-up.** Dielectric thicknesses, εr and tan δ come from the `.gbrjob`, with 4.5 / 0.02 when it gives
   none, or from the spec's `"dielectrics": [{"t": mm, "er": .., "tand": ..}, ...]` (top to bottom between
   the copper layers). The bottom copper is at z = 0 and copper thickness is ignored. Dielectric fills cells
@@ -321,12 +327,19 @@ Outputs:
 
 ### Far field: near-to-far-field transform
 
-`"farfield": {"freqs": [2.44e9, 4.88e9], "step_deg": 5, "gap": 3}` in a run spec puts a closed box of
+`"farfield": {"freqs": [2.40e9, 2.44e9, 2.48e9], "step_deg": 5, "gap": 3}` in a run spec puts a closed box of
 mesh planes `gap` cells inside the absorbing boundary on every side. Every excitation records the
 tangential E and H on its faces as running DFTs at those frequencies. The engines' gathered DFT does this
 on Metal and on the CPU, touching only the face samples. Afterwards each face cell carries the equivalent
 currents J = n × H and M = −n × E. The radiation integrals give r·E_θ and r·E_φ on a θ/φ grid
 (Balanis, *Advanced Engineering Electromagnetics* 6.8; e^{jωt}, the sign of the field DFT).
+
+**Every far-field frequency must be at or below `fmax`.** The box DFT samples the fields at 3 × `fmax`, so
+a frequency f above `fmax` is mixed with its alias at 3 × `fmax` − f, where the excitation still has energy.
+The radiated power is then off by about 3.5 % at 1.2 × `fmax` and 14 % at 1.3 × `fmax`, and from
+1.5 × `fmax` it means nothing. The default `fmax` is 3 GHz, so the harmonics of a 2.44 GHz radio need
+`"fmax": 8e9`. A run that lists a far-field frequency above `fmax` is refused before the mesh is built, and so is
+one with `"fields"` or `"objective"` frequencies (band or harmonics) above it.
 
 **The box must be in free space, with everything that radiates inside it.** The run warns when tangential E
 edges on its faces are not free space. A window of a board (the default `roi` domain) is cut at the domain
@@ -387,8 +400,8 @@ are at the default mesh; Metal and CPU agree to about 1e-6 relative.
 | Hertzian dipole, exact fields on a box (unit test) | P_rad, Poynting flux, D | within 3 % | analytic | |
 | Cavity filled with tan δ 0.02 (`loss-check`), constant σ at 1 GHz | Q at 4.5 / 6.2 / 8.4 GHz | 218 / 310 / 408 | 1/tan δ = 50 | 4-8× |
 | same, wideband (Debye) | Q at 4.55 / 6.32 / 8.49 GHz | 47.5 / 47.9 / 44.5 | 50 (port loading alone: Q ≥ 894) | −5 to −11 % |
-| Copper cavity 30×20 mm, plates 0.5 mm apart, smooth copper (`copper-check`) | Q at 4.50 / 6.24 / 8.37 GHz | 528 / 624 / 717 | h/δ = 508 / 598 / 692 | +3.6 to +4.4 % |
-| same, 1 µm rms roughness | Q | 337 / 369 / 406 | h/δ/K = 315 / 351 / 391 | +3.9 to +7.2 % |
+| Copper cavity 30×20 mm, plates 0.5 mm apart, smooth copper (`copper-check`) | Q at 4.50 / 6.24 / 8.37 GHz | 505 / 601 / 692 | h/δ = 508 / 598 / 692 | −0.4 / +0.6 / +0.1 % |
+| same, 1 µm rms roughness | Q | 323 / 355 / 392 | h/δ/K = 314 / 351 / 390 | +2.8 / +1.4 / +0.4 % |
 | Matched 30 mm microstrip, tan δ 0.015, wideband (`debye-port-check`) | 1 − \|S11\|² − \|S21\|² at 0.1 / 1.1 / 3.1 / 5.1 GHz | 0.3 / 2.1 / 5.8 / 9.7 % | passive, rising ∝ f | CPU and Metal agree to 0.001 |
 
 Lessons from building these, which also apply to board runs:

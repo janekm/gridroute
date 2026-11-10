@@ -72,7 +72,7 @@ pub fn microstrip(run: &Runner, scale: f64) -> CaseResult {
     let z = lines_1d(0.0, 14.0, &[h], &[Refine { a: 0.0, b: h + 0.4, h: h / (4.0 * scale) }], 1.3, 2.0, &[(0.0, h, (4.0 * scale).round() as usize)]);
     let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
     let strip = Sheet { name: "top".into(), z: h, prims: vec![rect(0.0, -w / 2.0, len, w / 2.0)] };
-    let lay = Layout { sheets: vec![strip], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![] };
+    let lay = Layout { sheets: vec![strip], slabs: vec![Slab { z0: 0.0, z1: h, eps: er, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [0.0, -w / 2.0, 0.0], hi: [0.0, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let fmax = 3e9;
     let pml = [8, 8, 8, 8, 0, 8];
@@ -128,6 +128,7 @@ pub fn patch_capacitance(run: &Runner, scale: f64) -> CaseResult {
         outline: vec![],
         copper_window: None,
         bodies: vec![],
+        net_ties: Default::default(),
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [a / 2.0, a / 2.0, 0.0], hi: [a / 2.0, a / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 1e9, cfl: 0.95, wideband: None, conductor: None, edge: None });
@@ -178,6 +179,7 @@ pub fn cavity(run: &Runner, scale: f64) -> CaseResult {
         outline: vec![],
         copper_window: None,
         bodies: vec![],
+        net_ties: Default::default(),
     };
     let port = Lumped { name: "P1".into(), axis: 2, lo: [3.0, 3.0, 0.0], hi: [3.0, 3.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     let p = build(&g, &lay, &[port], &BuildOpts { pml: [8, 8, 8, 8, 0, 8], fmax: 4e9, f_loss: 2e9, cfl: 0.95, wideband: None, conductor: None, edge: None });
@@ -269,6 +271,7 @@ pub fn port_loop_setup(cell: f64, footprint: bool, swap: bool) -> crate::sim::Se
         outline: vec![],
         copper_window: None,
         bodies: vec![],
+        net_ties: Default::default(),
     };
     let vert = |name: &str, xc: f64, port: bool| Lumped {
         name: name.into(),
@@ -337,6 +340,7 @@ pub fn gap_setup(slot: bool, cell: f64, fmax: f64) -> crate::sim::Setup {
         outline: vec![vec![P2::new(-2.0, -pw / 2.0), P2::new(len + 2.0, -pw / 2.0), P2::new(len + 2.0, pw / 2.0), P2::new(-2.0, pw / 2.0)]],
         copper_window: None,
         bodies: vec![],
+        net_ties: Default::default(),
     };
     let port = |name: &str, x: f64| Lumped { name: name.into(), axis: 2, lo: [x, -w / 2.0, 0.0], hi: [x, w / 2.0, h], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     crate::sim::Setup {
@@ -366,7 +370,7 @@ pub fn dipole_setup(len: f64, cell: f64, fmax: f64, air: f64) -> crate::sim::Set
     let z = lines_1d(-len / 2.0 - air - pml_w, len / 2.0 + air + pml_w, &fz, &[Refine { a: -len / 2.0 - 3.0 * cell, b: len / 2.0 + 3.0 * cell, h: cell }], 1.25, hmax, &[]);
     let grid = Grid { x: mm(x), y: mm(y), z: mm(z) };
     let wire = |z0: f64, z1: f64| Barrel { c: P2::new(0.0, 0.0), r: 0.01, z0, z1 };
-    let layout = Layout { sheets: vec![], slabs: vec![], barrels: vec![wire(-len / 2.0, -g / 2.0), wire(g / 2.0, len / 2.0)], outline: vec![], copper_window: None, bodies: vec![] };
+    let layout = Layout { sheets: vec![], slabs: vec![], barrels: vec![wire(-len / 2.0, -g / 2.0), wire(g / 2.0, len / 2.0)], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     let port = Lumped { name: "FEED".into(), axis: 2, lo: [0.0, 0.0, -g / 2.0], hi: [0.0, 0.0, g / 2.0], plus_at_hi: true, r: 50.0, c: 0.0, port: true };
     crate::sim::Setup {
         grid,
@@ -441,7 +445,7 @@ pub fn lossy_cavity(be: &Runner, wideband: bool, tand: f64) -> Vec<(f64, f64)> {
     let y = lines_1d(0.0, b, &[6.0], &[], 1.2, h, &[]);
     let z = lines_1d(0.0, c, &[], &[], 1.2, h, &[]);
     let g = Grid { x: mm(x), y: mm(y), z: mm(z) };
-    let lay = Layout { sheets: vec![], slabs: vec![Slab { z0: 0.0, z1: c, eps: 4.0, tand }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![] };
+    let lay = Layout { sheets: vec![], slabs: vec![Slab { z0: 0.0, z1: c, eps: 4.0, tand }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     let port = Lumped { name: "P".into(), axis: 2, lo: [7.0, 6.0, 0.0], hi: [7.0, 6.0, c], plus_at_hi: true, r: 1e4, c: 0.0, port: true };
     let wb = wideband.then(|| crate::disp::Wideband { f_lo: 0.3e9, f_hi: 10e9, f_ref: 1e9, copper: false });
     let p = build(&g, &lay, &[port], &BuildOpts { pml: [0; 6], fmax: 10e9, f_loss: 1e9, cfl: 0.95, wideband: wb, conductor: None, edge: None });
@@ -485,7 +489,7 @@ pub fn copper_cavity(be: &Runner, rough_um: f64) -> Vec<(f64, f64, f64)> {
         z: zz,
         prims: vec![Prim { shape: Shape::Polygon(vec![P2::new(-1.0, -1.0), P2::new(a + 1.0, -1.0), P2::new(a + 1.0, b + 1.0), P2::new(-1.0, b + 1.0)]), dark: true, net: None, pad: None }],
     };
-    let lay = Layout { sheets: vec![plate(h), plate(0.0)], slabs: vec![Slab { z0: 0.0, z1: h, eps: 4.0, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![] };
+    let lay = Layout { sheets: vec![plate(h), plate(0.0)], slabs: vec![Slab { z0: 0.0, z1: h, eps: 4.0, tand: 0.0 }], barrels: vec![], outline: vec![], copper_window: None, bodies: vec![], net_ties: Default::default() };
     // a weakly coupled probe port (1 Mohm): its loading Q is ~1e5, so the plates set the Q
     let rp = 1e6;
     let port = Lumped { name: "P".into(), axis: 2, lo: [7.0, 6.0, 0.0], hi: [7.0, 6.0, h], plus_at_hi: true, r: rp, c: 0.0, port: true };

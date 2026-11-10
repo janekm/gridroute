@@ -1,8 +1,10 @@
 # Native PCB routing benchmark
 
-This harness routes immutable placed boards with gridroute and checks the exported
-copper in KiCad. The original JLink-SWD, FT231X and 1Bitsy cases are regression
-fixtures. Further PCBench cases and the supplied six-layer AMOLED board exercise
+This harness routes immutable placed boards and checks the exported copper in KiCad.
+The default engine is topor (`src/bin/topor`, the topological router; `topor_engine.py`).
+`--engine grid` on `run.py` and `suite.py` uses the original grid router
+(`gridroute.router`) instead; `portfolio.py` and `--native-feedback` are grid-only.
+The original JLink-SWD, FT231X and 1Bitsy cases are regression fixtures. Further PCBench cases and the supplied six-layer AMOLED board exercise
 additional geometry, congestion and constraint handling.
 
 ## Acceptance
@@ -27,8 +29,9 @@ experiments have distinct case IDs and cannot count as unchanged-input passes.
 
 ## Run
 
-Build the native library with `cargo build --release` from the repository root.
-Install NumPy in the routing Python environment. KiCad's `pcbnew` bindings run in
+Build the native library and the `topor` binary with `cargo build --release` from the
+repository root (`$TOPOR` overrides the binary). Install NumPy in the routing Python
+environment for the grid router. KiCad's `pcbnew` bindings run in
 KiCad's own Python environment; the routing process does not require them.
 
 ```sh
@@ -43,7 +46,12 @@ CPU fallback is valid, but must not be compared with Metal timings as the same
 configuration. Runs are serial because Board configuration is process-global.
 Use a fresh output directory for every run; existing evidence is never overwritten.
 
-The preferred validation option is `--options-json '{"continuous_check":true}'`.
+With topor, `--options-json` is read for `deadline_seconds` and `topor_args` (extra
+arguments for `topor route`, for example `"--fast"`); a case's manifest
+`routing_options` are grid options and are otherwise ignored. The rest of this
+section, from continuous checks to `--native-feedback`, is about the grid router.
+
+With `--engine grid`, the preferred validation option is `--options-json '{"continuous_check":true}'`.
 It runs continuous copper connectivity and standard clearance checks in the routing
 process, then tries bounded repairs before a single final KiCad export and DRC.
 The checker includes orphan copper islands, rotated/rounded/polygon pads, slotted
@@ -72,17 +80,19 @@ the continuous option above for normal iteration. Per-case wall time includes
 all attempts and CAD checks; routing time includes continuous checks and accepted
 or rejected in-process repair attempts. Warnings remain separate.
 
-For one candidate:
+For one candidate (topor; `topor_engine.py CASE --out DIR --kicad` does all four steps):
 
 ```sh
-python3 bench/pcb/run.py 1Bitsy_1bitsy --out /absolute/path/to/result \
-  --options-json '{"fallback_pitches":[0.025],"deadline_seconds":60,"continuous_check":true}'
+python3 bench/pcb/run.py 1Bitsy_1bitsy --out /absolute/path/to/result --deadline 60
 /path/to/kicad-python bench/pcb/kicad_io.py export 1Bitsy_1bitsy \
   --out /absolute/path/to/result
 kicad-cli pcb drc --format json --severity-all --all-track-errors \
   -o /absolute/path/to/result/routed-drc.json /absolute/path/to/result/routed.kicad_pcb
 python3 bench/pcb/accept.py 1Bitsy_1bitsy --out /absolute/path/to/result
 ```
+
+The same with the grid router: `run.py 1Bitsy_1bitsy --out DIR --engine grid --options-json
+'{"fallback_pitches":[0.025],"deadline_seconds":60,"continuous_check":true}'`.
 
 Routing time includes board construction, search and cleanup. It excludes process
 startup and the native export/DRC gate. `suite.py` also reports complete wall time.
@@ -117,7 +127,7 @@ relaxation is conservatively unused. Cold routing removes all copper zones; a
 separate plane profile retains the four original zone definitions and refills them
 in KiCad. Neither is equivalent to preserving the supplied routed copper.
 
-## Policy and performance
+## Grid router: policy and performance
 
 `gridroute.router.RoutingController` starts with the normal grid and retries failed
 nets at the configured finer pitches. Physical rules remain constant while the
