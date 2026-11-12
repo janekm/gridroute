@@ -112,10 +112,9 @@ A corpus is a directory of `.npz` instances: `blk`, `vok` and `tgt` bit-packed, 
 
 ## Field solver
 
-`fieldsolve` (`src/bin/fieldsolve/`) is a 3-D FDTD field solver for the boards this flow produces. It reads KiCad
-Gerbers, runs on Metal or the CPU, and gives port impedance, S-parameters, decoupling-loop inductance and field
-snapshots for ParaView and Blender. It is cross-checked against closed-form cases and openEMS. See
-[docs/fieldsolve.md](docs/fieldsolve.md).
+`fieldsolve`, the 3-D FDTD field solver that lived in `src/bin/fieldsolve/`, moved to its own repository on
+2026-11-12, together with its docs and the Python tools in `tools/`. Its history up to then is still in this
+repository.
 
 ## License
 
