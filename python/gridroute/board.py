@@ -589,7 +589,7 @@ class Board:
         win, mask = self._polygon_mask([dict(points=[tuple(q) for q in points])], -inset)
         Ls = [LAYERS.index(l) for l in (layers or LAYERS) if l in LAYERS]
         if mask.any() and Ls:
-            self.__dict__.setdefault('necks', []).append(dict(win=win, mask=mask, layers=Ls, width=width,
+            self.__dict__.setdefault('necks', []).append(dict(win=win, mask=mask, points=tuple(map(tuple,points)), layers=Ls, width=width,
                                                               nets=frozenset(nets)))
 
     def _neck_widths(self, net, win):

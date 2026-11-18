@@ -58,13 +58,23 @@ def project(path, rules, classes=None, net_class=None):
         path.with_suffix('.kicad_dru').write_text('\n'.join(rules_text)+'\n')
 
 
-def prepare(name, source_dir):
-    source = pathlib.Path(source_dir) / name / 'processed.kicad_pcb'
+def prepare(name, source_dir=None, native_source=None, preserve_zones=False):
+    source = pathlib.Path(native_source) if native_source else pathlib.Path(source_dir) / name / 'processed.kicad_pcb'
     out = ROOT / 'cases' / name
     out.mkdir(parents=True, exist_ok=True)
     b = pcbnew.LoadBoard(str(source))
     zones = list(b.Zones())
-    rdl = json.loads((source.parent / 'final.json').read_text())
+    if native_source:
+        rdl = {'layers': [b.GetStandardLayerName(i) for i in b.GetEnabledLayers().CuStack()],
+               'rules': {'net_classes': []}, 'differential_pairs': []}
+        grouped = collections.defaultdict(list)
+        for net in b.GetNetsByNetcode().values():
+            if net.GetNetCode(): grouped[net.GetNetClassName()].append(net.GetNetCode())
+        for cls_name, cls in b.GetAllNetClasses().items():
+            rdl['rules']['net_classes'].append(dict(indices=grouped[str(cls_name)],
+                width=MM(cls.GetTrackWidth()),clearance=MM(cls.GetClearance()),via_diameter=MM(cls.GetViaDiameter())))
+    else:
+        rdl = json.loads((source.parent / 'final.json').read_text())
     routing_layers=[b.GetStandardLayerName(b.GetLayerID(n)) for n in rdl['layers']]
     nc = b.GetDesignSettings().m_NetSettings.GetDefaultNetclass()
     rules = [MM(nc.GetTrackWidth()), MM(nc.GetClearance()), MM(nc.GetViaDiameter()), MM(nc.GetViaDrill())]
@@ -97,7 +107,8 @@ def prepare(name, source_dir):
         for pad_index, p in enumerate(fp.Pads()):
             ls = p.GetLayerSet()
             layers = [name for name in routing_layers if ls.Contains(b.GetLayerID(name))]
-            if not layers:
+            # A mask-only NPTH is still a physical hole through every layer.
+            if not layers and not p.GetDrillSize().x:
                 ignored.append([fp.GetReference(), p.GetNumber(), 'no copper layers'])
                 continue
             tht = p.GetAttribute() in (pcbnew.PAD_ATTRIB_PTH, pcbnew.PAD_ATTRIB_NPTH)
@@ -169,21 +180,47 @@ def prepare(name, source_dir):
     model['outline_holes'] = outline_holes
     model['classes'],model['net_class'] = classes,net_class
     model['source_min_track_width'] = MM(b.GetDesignSettings().m_TrackMinWidth)
+    model['rule_areas'] = []
+    for z in zones:
+        if not z.GetIsRuleArea():continue
+        ps=z.Outline()
+        if any(ps.HoleCount(i) for i in range(ps.OutlineCount())):
+            raise ValueError('Rule-area polygon holes require explicit support')
+        model['rule_areas'].append(dict(
+            layers=[b.GetStandardLayerName(l) for l in z.GetLayerSet().CuStack()],
+            tracks=z.GetDoNotAllowTracks(),vias=z.GetDoNotAllowVias(),
+            polygons=[[[MM(ps.Outline(i).CPoint(j).x)-x0,MM(ps.Outline(i).CPoint(j).y)-y0]
+                       for j in range(ps.Outline(i).PointCount())] for i in range(ps.OutlineCount())]))
+    if preserve_zones:model['plane_export']=True
+    if native_source:
+        project_source=source.with_suffix('.kicad_pro')
+        project_data=json.loads(project_source.read_text())
+        model['global_rules']=project_data['board']['design_settings']['rules']
+        model['native_source']=str(source)
+        model['project_sha256']=hashlib.sha256(project_source.read_bytes()).hexdigest()
+        # Keep the actual class identity even when two classes share dimensions.
+        model['classes']={str(n):[MM(c.GetTrackWidth()),MM(c.GetClearance()),MM(c.GetViaDiameter()),MM(c.GetViaDrill())] for n,c in b.GetAllNetClasses().items()}
+        model['net_class']={n.GetNetname():n.GetNetClassName() for n in b.GetNetsByNetcode().values() if n.GetNetCode()}
+        def save_project(dest):
+            import shutil
+            shutil.copyfile(project_source,dest.with_suffix('.kicad_pro'))
+            if source.with_suffix('.kicad_dru').exists():shutil.copyfile(source.with_suffix('.kicad_dru'),dest.with_suffix('.kicad_dru'))
+    else:
+        def save_project(dest):project(dest,rules,classes,net_class)
     (out/'model.json').write_text(json.dumps(model,indent=2))
     reference = out/'reference.kicad_pcb'
     pcbnew.SaveBoard(str(reference),b)
     normalize_nil_uuids(reference,model['source_sha256'])
-    project(reference,rules,classes,net_class)
+    save_project(reference)
     for t in list(b.GetTracks()): b.Remove(t)
     for z in zones:
-        if z.GetIsRuleArea():
-            raise ValueError('PCBench importer needs explicit rule-area extraction for this case')
+        if z.GetIsRuleArea() or preserve_zones:continue
         b.Remove(z)
     stripped = out/'unrouted.kicad_pcb'
     pcbnew.SaveBoard(str(stripped),b)
     model['normalized_nil_uuids']=normalize_nil_uuids(stripped,model['source_sha256'])
     (out/'model.json').write_text(json.dumps(model,indent=2))
-    project(stripped,rules,classes,net_class)
+    save_project(stripped)
     print(name, len(pads), model['routable_nets'], model['required_pad_connections'], flush=True)
 
 
@@ -267,9 +304,9 @@ def immutable_board_tokens(path):
 
 if __name__=='__main__':
     import argparse
-    p=argparse.ArgumentParser();p.add_argument('command',choices=['prepare','export','verify']);p.add_argument('case');p.add_argument('--out');p.add_argument('--source-dir')
+    p=argparse.ArgumentParser();p.add_argument('command',choices=['prepare','export','verify']);p.add_argument('case');p.add_argument('--out');p.add_argument('--source-dir');p.add_argument('--native-source');p.add_argument('--preserve-zones',action='store_true')
     a=p.parse_args()
-    if a.command=='prepare':prepare(a.case,a.source_dir)
+    if a.command=='prepare':prepare(a.case,a.source_dir,a.native_source,a.preserve_zones)
     elif a.command=='export':export(a.case,a.out)
     else:verify(a.case,a.out)
     sys.stdout.flush();sys.stderr.flush();os._exit(0)

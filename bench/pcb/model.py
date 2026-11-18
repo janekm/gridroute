@@ -15,17 +15,23 @@ def build(model,pitch=0.05,margin=None,pad_grow=None,shifts=None,copper_grow=0.)
             dx,dy=shifts.get(p['original_ref'],(0,0));p['x']+=dx;p['y']+=dy
     rules=model['rules']
     net_classes=model.get('net_class',{})
+    global_rules=model.get('global_rules',{})
+    edge_clear=global_rules.get('min_copper_edge_clearance',.5)
     board.configure(layers=model['layers'],pitch=pitch,margin=margin,pad_grow=pad_grow,classes=model.get('classes',{'Default':tuple(rules)}),
                     net_class=lambda n:net_classes.get(n,'Default'),
-                    edge_clear=0.5,hole_clear=0.25,copper_grow=copper_grow,cache='off',spec=0,search='hybrid',budget=50000,field=2)
+                    edge_clear=edge_clear,hole_clear=global_rules.get('min_hole_clearance',.25),
+                    hole_to_hole=global_rules.get('min_hole_to_hole',.25),
+                    copper_grow=copper_grow,cache='off',spec=0,search='hybrid',budget=50000,field=2)
     assert gr.available(), 'native library failed to load'
     comps={p['ref']:dict(footprint=p['ref']) for p in model['pads']}
     pin_net={(p['ref'],'1'):p['net'] for p in model['pads'] if p['net']}
     fps={p['ref']:dict(pads=[dict(p,x=0,y=0)],courtyard=[0,0,0,0]) for p in model['pads']}
     bd=board.Board(*model['size'],comps,pin_net,fps)
+    bd.minimum_track_width=global_rules.get('min_track_width',min(v[0] for v in bd.config['classes'].values())) or .1
+    bd.outline=model['outline'];bd.outline_holes=model.get('outline_holes',[])
     # Respect the real polygon, including rounded and bevelled corners. The pad/trace
     # clearance dilation supplies the remaining distance to the outline.
-    edge_mask=outline_mask(tuple(map(tuple,model['outline'])),bd.ny,bd.nx,pitch,.5,board.CLEAR,
+    edge_mask=outline_mask(tuple(map(tuple,model['outline'])),bd.ny,bd.nx,pitch,edge_clear,board.CLEAR,
                            tuple(tuple(map(tuple,h)) for h in model.get('outline_holes',[])))
     def edges(self):
         board.Board._edges(self);self.occ[:,edge_mask]=board.KEEP
@@ -33,12 +39,16 @@ def build(model,pitch=0.05,margin=None,pad_grow=None,shifts=None,copper_grow=0.)
     for p in model['pads']: bd.place(p['ref'],p['x'],p['y'],gap=0)
     # Unassigned solder-mask apertures must not expose unrelated routed copper.
     # Treat them conservatively as obstacles, never as electrical connectivity.
+    bd.non_copper_openings=[dict(points=g['points'],layers=[g['layer']]) for g in model.get('mask_graphics',[]) if 'points' in g]
     for g in model.get('copper_graphics',[])+model.get('mask_graphics',[]):
         if 'circle' in g:bd.keepout_ring(**g['circle'],layers=[g['layer']])
         else:bd.keepout_polygon(g['points'],layers=[g['layer']],holes=g['holes'])
     for g in model.get('edge_graphics',[]):
-        if 'circle' in g:bd.keepout_ring(**g['circle'],clearance=.5)
-        else:bd.keepout_polygon(g['points'],holes=g['holes'],clearance=.5)
+        if 'circle' in g:bd.keepout_ring(**g['circle'],clearance=edge_clear)
+        else:bd.keepout_polygon(g['points'],holes=g['holes'],clearance=edge_clear)
+    for area in model.get('rule_areas',[]):
+        for poly in area['polygons']:
+            bd.keepout_polygon(poly,layers=area['layers'],tracks=area['tracks'],vias=area['vias'])
     return bd
 
 

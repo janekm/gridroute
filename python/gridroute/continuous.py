@@ -30,7 +30,8 @@ class Shape:
             raise ValueError('Invalid continuous geometry')
         xs,ys=zip(*self.points);r=self.radius
         self.box=(min(xs)-r,min(ys)-r,max(xs)+r,max(ys)+r)
-        self.edges=tuple(zip(self.points,self.points[1:]+self.points[:1])) if self.closed else ((self.points[0],self.points[-1]),)
+        self.edges=(tuple(zip(self.points,self.points[1:]+self.points[:1])) if self.closed else
+                    tuple(zip(self.points,self.points[1:])) if len(self.points)>1 else ((self.points[0],self.points[0]),))
         for h in self.holes:self.edges+=tuple(zip(h,h[1:]+h[:1]))
 
 
@@ -69,7 +70,7 @@ def _pairs(shapes,reach):
         active.append(i)
 
 
-def shapes_from_board(bd):
+def shapes_from_board(bd,nets=None):
     layers=bd.config['layers'];all_layers=(1<<len(layers))-1;shapes=[]
     def add(net,mask,points,radius,closed,holes,role,parent,clearance=0.):
         shapes.append(Shape(net,mask,tuple(map(tuple,points)),radius,closed,
@@ -81,6 +82,7 @@ def shapes_from_board(bd):
     for part in bd.parts.values():
         if not part.placed:continue
         for pi,p in enumerate(part.pads()):
+            if nets is not None and p['net'] not in nets:continue
             parent=('pad',p['ref'],p['num'],pi);net=p['net'];mask=all_layers if p['layers']=='all' else 1<<(0 if p['layers']=='F' else len(layers)-1)
             if not p['npth']:
                 if p['shape']=='polygon':
@@ -94,21 +96,25 @@ def shapes_from_board(bd):
             if p['drill']:
                 capsule(net,all_layers,p['x'],p['y'],p.get('drill_w',p['drill']),p.get('drill_h',p['drill']),p.get('angle',0.),'hole',parent)
     for ti,t in enumerate(bd.tracks):
+        if nets is not None and t['net'] not in nets:continue
         for a,b in zip(t['pts'],t['pts'][1:]):add(t['net'],1<<layers.index(t['layer']),[a,b],t['width']/2,False,(),'track',('track',ti))
     for vi,v in enumerate(bd.vias):
+        if nets is not None and v['net'] not in nets:continue
         parent=('via',vi);xy=[(v['x'],v['y'])]
         add(v['net'],all_layers,xy,v['d']/2,False,(),'via',parent)
         add(v['net'],all_layers,xy,v['drill']/2,False,(),'hole',parent)
     return shapes
 
 
-def check(bd,clearances=True):
+def check(bd,clearances=True,include_components=False,nets=None):
     """Return pad connectivity and new-copper standard clearance findings.
 
     Static pad/pad defects are not emitted. The findings are a subset of DRC,
     never a claim that arbitrary CAD constraints passed. Counters expose cost.
     """
-    started=time.perf_counter();shapes=shapes_from_board(bd);copper=[s for s in shapes if s.role!='hole'];parents=list(range(len(copper)))
+    if nets is not None and clearances:raise ValueError('A connectivity net filter cannot be used for clearance checks')
+    started=time.perf_counter();shapes=shapes_from_board(bd,nets=nets)
+    copper=[s for s in shapes if s.role!='hole'];parents=list(range(len(copper)))
     def root(i):
         while parents[i]!=i:parents[i]=parents[parents[i]];i=parents[i]
         return i
@@ -131,10 +137,12 @@ def check(bd,clearances=True):
             connectivity_pairs+=1
             if distance(scene[a],scene[b])<=EPS:union(ia,ib)
     # A plane net's vias and plated holes all reach its plane layer (not modelled as copper here).
+    plane_roots={}
     for net in bd.config.get('planes',{}):
         anchors=[i for i in grouped.get(net,()) if copper[i].role=='via' or
                  (copper[i].role=='pad' and copper[i].layers==(1<<len(bd.config['layers']))-1)]
         for i in anchors[1:]:union(anchors[0],i)
+        if anchors:plane_roots[net]=root(anchors[0])
     components={};copper_components={};missing=[]
     for net,ids in grouped.items():
         if net is None or str(net).startswith('unconnected-'):continue
@@ -165,10 +173,19 @@ def check(bd,clearances=True):
                 required=max(net_clear(a),net_clear(b),a.clearance,b.clearance,floor);kind='clearance'
             clearance_pairs+=1;actual=distance(a,b)
             if actual+EPS<required:violations.append(dict(kind=kind,a=a.parent,b=b.parent,required=required,actual=actual,nets=[a.net,b.net]))
-    return dict(missing_nets=sorted(missing),pad_components=components,copper_components=copper_components,violations=violations,
+    plane_connected_pads={net:sorted({copper[i].parent[1:3] for i in grouped.get(net,()) if copper[i].role=='pad' and root(i)==r}) for net,r in plane_roots.items()}
+    result=dict(missing_nets=sorted(missing),pad_components=components,copper_components=copper_components,plane_connected_pads=plane_connected_pads,violations=violations,
                 seconds=time.perf_counter()-started,primitives=len(shapes),connectivity_pairs=connectivity_pairs,
                 clearance_pairs=clearance_pairs,coverage=['continuous_pad_connectivity','copper_clearance','hole_clearance','hole_to_hole'],
                 requires_final_native_validation=True)
+    if include_components:
+        physical={}
+        for net,ids in grouped.items():
+            groups=defaultdict(list)
+            for i in ids:groups[root(i)].append(copper[i])
+            physical[net]=list(groups.values())
+        result['component_shapes']=physical
+    return result
 
 
 def repair_connectivity(source,factory,options=None,pitches=(.025,.0125),deadline_seconds=30.,max_repair_nets=4):
