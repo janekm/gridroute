@@ -111,6 +111,26 @@ and copper-layer aliases. Invalid open/disjoint outlines fail explicitly. Legacy
 nil object UUIDs receive deterministic IDs because KiCad otherwise resolves DRC
 items to arbitrary footprints. This changes identity metadata, not geometry.
 
+To import a native KiCad project without replacing its project settings:
+
+```sh
+/path/to/kicad-python bench/pcb/kicad_io.py prepare FTDI_JTAG_c33005e \
+  --native-source /path/to/ftdi-jtag-programmer/JTAGProgrammer/JTAGProgrammer.kicad_pcb
+kicad-cli pcb drc --format json --severity-all --all-track-errors \
+  -o bench/pcb/cases/FTDI_JTAG_c33005e/baseline-drc.json \
+  bench/pcb/cases/FTDI_JTAG_c33005e/unrouted.kicad_pcb
+```
+
+This mode copies the original `.kicad_pro` and optional `.kicad_dru` verbatim,
+retains native class identities, and passes the project's edge and hole
+clearances to the routing model. The adapter still rejects rule areas and does
+not interpret arbitrary custom expressions or route coupled differential pairs.
+Its initial routing widths are the classes' preferred track widths, which KiCad
+does not necessarily enforce as minimums. The separately named FTDI source-width
+profile uses the source designer's 0.25 mm tracks on three POWER nets; create it
+with `make_ftdi_width_profile.py --source /path/to/JTAGProgrammer.kicad_pcb` under
+KiCad's Python. Both FTDI profiles are opt-in (`--cases`) in the manifest.
+
 The supplied AMOLED model preserves its exact project and custom rules, rule
 areas, layer minimums and allowed pad neck-downs. RF's local courtyard clearance
 relaxation is conservatively unused. Cold routing removes all copper zones; a
@@ -118,6 +138,12 @@ separate plane profile retains the four original zone definitions and refills th
 in KiCad. Neither is equivalent to preserving the supplied routed copper.
 
 ## Policy and performance
+
+The separate experimental continuous router and Metal solver are documented in
+[SPRING.md](SPRING.md), with a [cold-routing comparison and complete images](results/2026-11-03-cold-topology/comparison-13/REPORT.md).
+That router uses global penalized width states and per-net layer/via policies;
+the raster controller and regional neck-down behavior below describe the
+existing router.
 
 `gridroute.router.RoutingController` starts with the normal grid and retries failed
 nets at the configured finer pitches. Physical rules remain constant while the

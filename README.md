@@ -61,6 +61,26 @@ These are lessons from the board above:
 - **Relax at the end.** Mark the op index before the router stage (`k = len(bd.ops)`), route, then `bd.relax(since=k)` and `bd.pull_tight(since=k)`. Pass `layers=` to keep a class (for example power) on its layers. `connect(..., layers=..., strict=True)` keeps the wide-window retry of a failed connection on those layers too (by default it retries on every layer); `relax(layers=...)` is always strict, so a board whose bottom layer is a plane never gets tracks on it from either.
 - **Stress the script by varying the search budget.** It is a cheap way to push the router into other configurations.
 
+### Power-net narrowing
+
+`gridroute.necks` shows where a supply net narrows. A pour can look wide and still be pinched to a sliver by the
+antipads of the vias and holes passing through it, and a trunk can meet its pour through less copper than either
+has; a clearance check sees neither, since the copper is all connected. For each pad of the net the module finds the
+widest path from the source: the largest width such that a disc of that diameter can slide from the source to the pad
+without leaving the copper, across layers through the net's vias.
+
+```python
+from gridroute import necks
+r = necks.analyse(bd, '+5V_DUT', source=['C1059', 'C1060'], layers=CU, planes={'+3V3': 'In4.Cu'}, outline=poly)
+print(necks.report(r, below=1.0, loads=['U703', 'U803']))   # pads grouped by their neck, narrowest first
+necks.render(r, 'dut5.png', layers=['In4.Cu'])              # copper coloured by local width, necks ringed
+```
+
+Widths come in steps (`necks.STEPS`), so a result reads "at least this wide". A via counts as a conductor as wide as
+its barrel's circumference; `via_width=` overrides that to judge the pours alone. `reach=` (1.5 mm) stops the short
+drop from a pour to each pad from hiding the pours' own widths. It is a raster estimate (one pixel per edge) of the
+zone fill with solid connections; the board's DRC still decides clearances. Needs numpy, scipy and Pillow.
+
 ## Kernels (Python binding)
 
 ```python

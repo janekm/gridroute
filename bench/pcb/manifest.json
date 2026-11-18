@@ -808,6 +808,41 @@
       "copper_pads": 300,
       "layers": 2,
       "routable_nets": 56
+    },
+    {
+      "id": "FTDI_JTAG_c33005e",
+      "source": "Anthony Bernaert / Zap public benchmark",
+      "path": "cases/FTDI_JTAG_c33005e",
+      "placement": "fixed",
+      "enabled": false,
+      "source_revision": "c33005ef528526c137ba8fd1e9cf4e8ceab63a1f",
+      "source_url": "https://github.com/anthony-bernaert/ftdi-jtag-programmer",
+      "source_sha256": "b71e7121af5eded491ccd9112c8ce47b608663373abefad86b19205dba11adf6",
+      "project_sha256": "8e8bfe12e31b3009971231eb6b60a72ac2fe4b7fcf14afce39a9d6565c249cf7",
+      "licence": "CERN-OHL-P-2.0",
+      "footprints": 122,
+      "copper_pads": 363,
+      "layers": 4,
+      "routable_nets": 63,
+      "profile_note": "Native project preserved; tracks, vias and pours removed. Class preferred widths used as routing widths; differential pairs not coupled."
+    },
+    {
+      "id": "FTDI_JTAG_c33005e_source_widths",
+      "source": "Anthony Bernaert / Zap public benchmark",
+      "path": "cases/FTDI_JTAG_c33005e_source_widths",
+      "placement": "fixed",
+      "enabled": false,
+      "source_revision": "c33005ef528526c137ba8fd1e9cf4e8ceab63a1f",
+      "source_url": "https://github.com/anthony-bernaert/ftdi-jtag-programmer",
+      "source_sha256": "b71e7121af5eded491ccd9112c8ce47b608663373abefad86b19205dba11adf6",
+      "project_sha256": "8e8bfe12e31b3009971231eb6b60a72ac2fe4b7fcf14afce39a9d6565c249cf7",
+      "licence": "CERN-OHL-P-2.0",
+      "footprints": 122,
+      "copper_pads": 363,
+      "layers": 4,
+      "routable_nets": 63,
+      "profile_note": "0.25 mm chosen width on +3V3, VPHY and VPLL, as used in the source copper. Native project/rules and placement unchanged; differential pairs not coupled.",
+      "parent_case": "FTDI_JTAG_c33005e"
     }
   ],
   "acceptance": {
